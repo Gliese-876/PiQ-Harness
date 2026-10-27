@@ -1,8 +1,10 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { createConnection } from 'node:net';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { OneBotClient } from './onebot-client.ts';
 import { defaultMessagesRoot } from './cli.ts';
 import { loadConfig, type GroupConfig } from './config.ts';
@@ -175,7 +177,64 @@ export async function probeSnowLuma(cwd: string, options: SnowLumaServiceOptions
   } finally { clearTimeout(timeout); client.close(); }
 }
 
+/** A real hidden console remains available for a runtime's own child processes to inherit. */
+async function launchHiddenWindows(specification: SnowLumaLaunch): Promise<void> {
+  if (specification.args.length !== 1) throw new Error('SnowLuma 隐藏启动参数无效。');
+  const root = await realpath(specification.cwd);
+  const logs = join(root, 'logs');
+  await mkdir(logs, { recursive: true });
+  const actualLogs = await realpath(logs);
+  if ((await lstat(logs)).isSymbolicLink() || actualLogs.toLowerCase() !== logs.toLowerCase()) {
+    throw new Error('SnowLuma 启动日志须保存在安装目录内的普通 logs 目录。');
+  }
+  const logBase = join(logs, `piq-launch-${Date.now()}-${randomUUID()}`);
+  const systemRoot = specification.env.SystemRoot ?? specification.env.SYSTEMROOT ?? process.env.SystemRoot ?? 'C:\\Windows';
+  const shell = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const script = fileURLToPath(new URL('../scripts/start-hidden-process.ps1', import.meta.url));
+  await new Promise<void>((resolveLaunch, reject) => {
+    const child = spawn(shell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script], {
+      cwd: root, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...specification.env, PIQ_HIDDEN_NODE: specification.command, PIQ_HIDDEN_ENTRY: specification.args[0],
+        PIQ_HIDDEN_DIRECTORY: root, PIQ_HIDDEN_STDOUT: `${logBase}.stdout.log`, PIQ_HIDDEN_STDERR: `${logBase}.stderr.log` },
+    });
+    let output = '', settled = false, acknowledged = false, exited = false, outputEnded = false;
+    const finish = (success: boolean) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      child.stdout.destroy(); child.stderr.destroy();
+      if (success) resolveLaunch();
+      else reject(new Error('SnowLuma 隐藏启动未完成，请检查安装目录 logs 下的启动日志或使用手动入口。'));
+    };
+    const timer = setTimeout(() => { if (child.exitCode === null) child.kill(); finish(false); }, 10_000);
+    const inspectReceipt = () => {
+      try {
+        const receipt: unknown = JSON.parse(output.trim());
+        acknowledged = Boolean(receipt && typeof receipt === 'object' && 'pid' in receipt
+          && Number.isSafeInteger(receipt.pid) && Number(receipt.pid) > 0);
+      } catch { /* Wait for the complete acknowledgement rather than parsing a partial pipe read. */ }
+      if (exited && acknowledged) finish(true);
+      else if (exited && outputEnded) finish(false);
+    };
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      if (output.length < 4_096) output += String(chunk).slice(0, 4_096 - output.length);
+      inspectReceipt();
+    });
+    child.stdout.once('end', () => { outputEnded = true; inspectReceipt(); });
+    // Do not forward diagnostics that could contain paths or runtime credentials to the WebUI.
+    child.stderr.on('data', () => {});
+    child.once('error', () => finish(false));
+    // Windows descendants can retain inherited copies of the helper's pipe handles.
+    // Its exit and PID receipt confirm startup; waiting for pipe close would wait for the service.
+    child.once('exit', code => {
+      if (code !== 0) { finish(false); return; }
+      exited = true; inspectReceipt();
+    });
+  });
+}
+
 async function launch(specification: SnowLumaLaunch): Promise<void> {
+  if (process.platform === 'win32' && !specification.visible) return launchHiddenWindows(specification);
   await new Promise<void>((resolveLaunch, reject) => {
     const child = spawn(specification.command, specification.args, {
       cwd: specification.cwd, env: specification.env, shell: false,

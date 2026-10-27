@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
@@ -165,4 +165,88 @@ test('remote endpoints never offer a local automatic or manual startup', async t
   const state = await probeSnowLuma(f.cwd, { installDir: f.installDir, timeoutMs: 50 });
   assert.equal(state.canStart, false); assert.equal(state.canOpenManual, false); assert.equal(state.manualUrl, undefined);
   await assert.rejects(openSnowLumaManual(f.cwd, { installDir: f.installDir }), /远程/);
+});
+
+test('Windows automatic startup keeps descendant processes in a hidden console after the helper exits', {
+  skip: process.platform !== 'win32', timeout: 30_000,
+}, async t => {
+  const f = await fixture(t);
+  const probeScript = resolve('tests/helpers/console-state.ps1');
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? 'C:\\Windows';
+  const shell = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const stop = join(f.installDir, 'stop');
+  const done = join(f.installDir, 'done');
+  const report = join(f.installDir, 'child.json');
+  // Independent mock: a launcher starts a console child using default Windows
+  // spawn options. No QQ connection, real installation, or copied backend code.
+  await writeFile(join(f.installDir, 'index.mjs'), `
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const childMode = process.argv[2] === 'child';
+const report = join(process.cwd(), childMode ? 'child.json' : 'parent.json');
+const watchdog = setTimeout(() => process.exit(99), 20000);
+const probe = spawnSync(${JSON.stringify(shell)}, ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+  ${JSON.stringify(probeScript)}, report], { stdio: 'inherit' });
+if (probe.status !== 0) process.exit(98);
+console.log(childMode ? 'mock child ready' : 'mock launcher ready');
+console.error(childMode ? 'mock child diagnostic' : 'mock launcher diagnostic');
+if (childMode) {
+  const poll = setInterval(() => {
+    if (!existsSync(${JSON.stringify(stop)})) return;
+    clearInterval(poll); clearTimeout(watchdog);
+  }, 50);
+} else {
+  const child = spawn(process.execPath, [process.argv[1], 'child'], { stdio: 'inherit' });
+  child.once('exit', code => {
+    clearTimeout(watchdog); writeFileSync(${JSON.stringify(done)}, String(code));
+    process.exitCode = code;
+  });
+}
+`);
+  let readySeen = false;
+  try {
+    const result = await ensureSnowLuma(f.cwd, {
+      installDir: f.installDir, timeoutMs: 10_000,
+      env: { ...process.env, PSExecutionPolicyPreference: 'Restricted' },
+      probe: async () => {
+        try { await readFile(report); readySeen = true; return ready(); }
+        catch { return down(); }
+      },
+    });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.started, true);
+    const parent = JSON.parse(await readFile(join(f.installDir, 'parent.json'), 'utf8'));
+    const child = JSON.parse(await readFile(report, 'utf8'));
+    assert.notEqual(parent.window, 0, 'launcher needs a console that its children can inherit');
+    assert.equal(parent.visible, false, 'launcher console must stay hidden');
+    assert.equal(child.window, parent.window, 'descendants must inherit the existing hidden console');
+    assert.equal(child.visible, false, 'descendants must not create a visible terminal');
+  } finally {
+    await writeFile(stop, 'stop');
+    const deadline = Date.now() + (readySeen ? 5_000 : 20_000);
+    while (Date.now() < deadline) {
+      try { await readFile(done); break; } catch { await delay(50); }
+    }
+  }
+  assert.equal(await readFile(done, 'utf8'), '0');
+  const logs = await readdir(join(f.installDir, 'logs'));
+  const stdout = logs.find(name => name.startsWith('piq-launch-') && name.endsWith('.stdout.log'));
+  const stderr = logs.find(name => name.startsWith('piq-launch-') && name.endsWith('.stderr.log'));
+  assert.ok(stdout); assert.ok(stderr);
+  assert.match(await readFile(join(f.installDir, 'logs', stdout), 'utf8'), /mock launcher ready[\s\S]*mock child ready/);
+  assert.match(await readFile(join(f.installDir, 'logs', stderr), 'utf8'), /mock launcher diagnostic[\s\S]*mock child diagnostic/);
+});
+
+test('Windows automatic startup reports failure when the hidden helper cannot launch the runtime', {
+  skip: process.platform !== 'win32', timeout: 15_000,
+}, async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.installDir, 'node.exe'), 'not an executable');
+  const result = await ensureSnowLuma(f.cwd, {
+    installDir: f.installDir, timeoutMs: 10_000, probe: async () => down(),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.started, false);
+  assert.match(result.message, /自动启动 SnowLuma 失败/);
 });
