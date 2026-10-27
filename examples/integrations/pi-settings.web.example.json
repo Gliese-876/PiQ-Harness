@@ -1,0 +1,18 @@
+{
+  "packages": [
+    "C:/tools/PiQ-Harness",
+    "npm:@gotgenes/pi-permission-system@40.3.0",
+    "npm:@yuru7/pi-sandbox@0.4.1",
+    "npm:pi-web-access@0.45.0"
+  ],
+  "extensions": [
+    "C:/tools/PiQ-Harness/examples/integrations/no-escalation.ts"
+  ],
+  "skills": [
+    "~/.agents/skills/mimo-v2-5-tts"
+  ],
+  "defaultTools": [
+    "+powershell",
+    "-bash"
+  ]
+}
