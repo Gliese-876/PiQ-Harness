@@ -41,7 +41,6 @@
     "qq_voice": "allow",
     "qq_group_files": "allow",
     "qq_album": "allow",
-    "qq_read_history": "allow",
     "qq_read_forward": "allow",
     "qq_forward": "allow"
   }

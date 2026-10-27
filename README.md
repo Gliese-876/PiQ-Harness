@@ -176,7 +176,8 @@ PiQ-Messages/
 | 能力 | 工具 |
 | --- | --- |
 | 发送文字和图片 | `qq_send` |
-| 读取本地聊天、读取合并转发、显式转发记录 | `qq_read_history`、`qq_read_forward`、`qq_forward` |
+| 读取本地聊天 | Pi 原生 `read`、`grep` 等文件工具，按通知中的日志路径和序号定位 |
+| 读取合并转发、显式转发记录 | `qq_read_forward`、`qq_forward` |
 | 发送本地或 QQ AI 语音、语音转写 | `qq_voice` |
 | 戳一戳、表情回应、撤回本账号消息 | `qq_poke`、`qq_react`、`qq_recall` |
 | 收藏表情、群文件、群相册 | `qq_sticker`、`qq_group_files`、`qq_album` |

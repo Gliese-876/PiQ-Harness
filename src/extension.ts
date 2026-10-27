@@ -15,7 +15,6 @@ import { RunController, type ConnectionState } from './run-control.ts';
 import { ensureSnowLuma } from './snowluma-service.ts';
 import { registerGroupFileTool } from './group-files.ts';
 import { registerAlbumTool } from './albums.ts';
-import { registerChatHistoryTool } from './chat-history.ts';
 import { registerForwardMessageTool } from './forward-messages.ts';
 import { registerForwardSendTool } from './forward-send.ts';
 import { manageSticker } from './sticker-management.ts';
@@ -502,7 +501,6 @@ export default function piq(pi: ExtensionAPI): void {
   });
   registerGroupFileTool(pi, resourceContext);
   registerAlbumTool(pi, resourceContext);
-  registerChatHistoryTool(pi, resourceContext);
   registerForwardMessageTool(pi, resourceContext);
   registerForwardSendTool(pi, resourceContext, async (ctx, target, result) => {
     const current = binding;

@@ -948,13 +948,27 @@ test('local voice sending rejects outside files and cannot dispatch while paused
   assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
 });
 
-test('real Pi reads history and received forwards, explicitly forwards selected records, then reads its saved send', async t => {
+test('real Pi reads lossless JSONL with native read, forwards selected records, then reads its saved send', async t => {
   const f = await fixture(t);
   const groupId = '444021', peerId = '444022';
   const source = `group:${groupId}`, target = `private:${peerId}`;
-  const ordinary = groupMessage(groupId, -301, 'HISTORY_SOURCE_BODY');
+  const mixedSegments = [
+    { type: 'text', data: { text: 'HISTORY_SOURCE_BODY' } },
+    { type: 'image', data: { file: 'mock-image.png', url: 'https://qpic.cn/image?rkey=MOCK_IMAGE_KEY', summary: '[图片]' } },
+    { type: 'face', data: { id: '14' } },
+    { type: 'record', data: { file: 'mock-voice.silk', duration: 3 } },
+    { type: 'video', data: { file: 'mock-video.mp4', thumbnail: 'mock-cover.jpg' } },
+    { type: 'reply', data: { id: '-299' } },
+    { type: 'at', data: { qq: 'all' } },
+    { type: 'file', data: { id: 'mock-file', name: '资料.txt', size: 12 } },
+    { type: 'custom_face', data: { emoji_id: 'mock-sticker' } },
+    { type: 'future_segment', data: { nested: { enabled: false, count: 0, labels: ['first', 'second'] } } },
+  ];
+  const ordinary = { ...groupMessage(groupId, -301, 'HISTORY_SOURCE_BODY'), message: mixedSegments };
   const received = { ...groupMessage(groupId, -302, '[合并转发]'),
     message: [{ type: 'forward', data: { id: 'received-forward' } }] };
+  const cqText = 'CQ_SOURCE_BODY[CQ:image,file=mock&#44;image.png][CQ:at,qq=all][CQ:reply,id=-299]';
+  const cqMessage = { ...groupMessage(groupId, -303, cqText), message: cqText };
   LocalSocket.messages.set(-301, ordinary);
   LocalSocket.messages.set(-302, received);
   LocalSocket.forwards.set('received-forward', [{
@@ -963,8 +977,13 @@ test('real Pi reads history and received forwards, explicitly forwards selected 
       { type: 'image', data: { url: 'https://qpic.cn/image?signature=PRIVATE_FORWARD_SIGNATURE' } }],
   }]);
   let host: Awaited<ReturnType<typeof f.host>>;
+  const readJournal = async (conversation: Conversation) => {
+    const files = (await readdir(messagesDirectory(host.cwd, conversation))).filter(file => file.endsWith('.jsonl'));
+    assert.equal(files.length, 1);
+    return fauxAssistantMessage(fauxToolCall('read', { path: join('messages', conversation.type, conversation.id, files[0]!) }), { stopReason: 'toolUse' });
+  };
   host = await f.host('history-forward-flow', 'HISTORY_FORWARD_RULES', [
-    fauxAssistantMessage(fauxToolCall('qq_read_history', { conversation: source, limit: 10 }), { stopReason: 'toolUse' }),
+    () => readJournal({ type: 'group', id: groupId }),
     () => {
       assert.equal(host.socket.sent.filter(packet => packet.action.startsWith('send_')).length, 0);
       return fauxAssistantMessage(fauxToolCall('qq_read_forward', { conversation: source, messageId: -302 }), { stopReason: 'toolUse' });
@@ -975,27 +994,36 @@ test('real Pi reads history and received forwards, explicitly forwards selected 
         sourceConversation: source, messageIds: [-301, -302], targetConversation: target,
       }), { stopReason: 'toolUse' });
     },
-    fauxAssistantMessage(fauxToolCall('qq_read_history', { conversation: target, messageId: -900 }), { stopReason: 'toolUse' }),
+    () => readJournal({ type: 'private', id: peerId }),
     fauxAssistantMessage(fauxToolCall('qq_read_forward', { conversation: target, messageId: -900 }), { stopReason: 'toolUse' }),
     fauxAssistantMessage('This ordinary response remains only in the Pi session.'),
   ], undefined, [{ type: 'group', id: groupId }, { type: 'private', id: peerId }]);
-  for (const tool of ['qq_read_history', 'qq_read_forward', 'qq_forward']) assert.ok(host.session.getActiveToolNames().includes(tool));
-  host.socket.receive(ordinary); host.socket.receive(received);
+  for (const tool of ['read', 'qq_read_forward', 'qq_forward']) assert.ok(host.session.getActiveToolNames().includes(tool));
+  assert.equal(host.session.getActiveToolNames().includes('qq_read_history'), false);
+  host.socket.receive(ordinary); host.socket.receive(received); host.socket.receive(cqMessage);
   await eventually(() => host.faux.state.callCount === 6 && host.session.isIdle, 'the history and explicit forward workflow to settle');
   const results = host.session.messages.filter(message => message.role === 'toolResult');
   assert.equal(results.length, 5);
   assert.ok(results.every(result => result.role === 'toolResult' && !result.isError), JSON.stringify(results));
-  const parsed = (index: number) => {
+  const textResult = (index: number) => {
     const block = results[index]!.content.find(item => item.type === 'text');
     assert.ok(block && block.type === 'text');
-    return JSON.parse(block.text) as { records: Array<Record<string, any>> };
+    return block.text;
   };
-  assert.deepEqual(parsed(0).records.map(record => record.messageId), [-301, -302]);
+  const parsed = (index: number) => JSON.parse(textResult(index)) as { records: Array<Record<string, any>> };
+  const rawRecords = (index: number) => textResult(index).trimEnd().split('\n').map(line => JSON.parse(line) as Record<string, any>);
+  assert.equal(results[0]!.toolName, 'read');
+  assert.deepEqual(rawRecords(0).map(record => record.messageId), ['-301', '-302', '-303']);
+  assert.deepEqual(rawRecords(0)[0]!.segments, mixedSegments, 'native reading preserves ordered media, references and unknown segment data');
+  assert.deepEqual(rawRecords(0)[1]!.segments, received.message);
+  assert.equal(rawRecords(0)[2]!.rawText, cqText, 'CQ-only messages preserve their original encoded text');
+  assert.deepEqual(rawRecords(0)[2]!.segments, [], 'raw log reading needs no extra CQ parser');
   assert.equal(parsed(1).records[0]!.text, 'INNER_FORWARDED_TEXT');
   assert.ok(parsed(1).records[0]!.segments.some((segment: { hasImage?: boolean }) => segment.hasImage));
-  assert.equal(parsed(3).records.length, 1);
-  assert.equal(parsed(3).records[0]!.messageId, -900);
-  assert.equal(parsed(3).records[0]!.outgoing, true);
+  assert.equal(results[3]!.toolName, 'read');
+  assert.equal(rawRecords(3).length, 1);
+  assert.equal(rawRecords(3)[0]!.messageId, '-900');
+  assert.equal(rawRecords(3)[0]!.outgoing, true);
   assert.equal(parsed(4).records[0]!.text, 'HISTORY_SOURCE_BODY');
   assert.equal(parsed(4).records.length, 2);
   assert.doesNotMatch(JSON.stringify(results), /PRIVATE_FORWARD_SIGNATURE/);
@@ -1013,36 +1041,55 @@ test('real Pi reads history and received forwards, explicitly forwards selected 
   assert.equal(sentRecords[0]!.messageId, '-900');
   assert.equal(sentRecords[0]!.outgoing, true);
   assert.deepEqual(sentRecords[0]!.segments, [{ type: 'forward', data: { id: 'sent-forward-900' } }]);
-  assert.equal((await conversationRecords(host.cwd, { type: 'group', id: groupId })).length, 2);
+  assert.equal((await conversationRecords(host.cwd, { type: 'group', id: groupId })).length, 3);
+  const signals = host.session.messages.filter(message => message.role === 'custom' && message.customType === 'piq:messages');
+  assert.equal(signals.length, 1);
+  assert.match(JSON.stringify(signals), new RegExp(`messages/group/${groupId}/`));
+  assert.doesNotMatch(JSON.stringify(signals), /HISTORY_SOURCE_BODY|CQ_SOURCE_BODY|MOCK_IMAGE_KEY|future_segment/);
   assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
 });
 
-test('real Pi refuses foreign history and forward targets, and all three tools honor pause', async t => {
+test('real Pi scopes and pauses forward tools while native log reading remains available', async t => {
   const f = await fixture(t);
   const groupId = '444023', peerId = '444024';
   const source = `group:${groupId}`, target = `private:${peerId}`, foreign = 'group:555999';
-  const host = await f.host('history-forward-boundaries', 'HISTORY_FORWARD_BOUNDARIES', [
-    fauxAssistantMessage(fauxToolCall('qq_read_history', { conversation: foreign }), { stopReason: 'toolUse' }),
+  const conversations: Conversation[] = [{ type: 'group', id: groupId }, { type: 'private', id: peerId }];
+  const original = groupMessage(groupId, -310, 'PAUSED_LOCAL_LOG_BODY');
+  LocalSocket.history.set(source, [original]);
+  let host: Awaited<ReturnType<typeof f.host>>;
+  host = await f.host('history-forward-boundaries', 'HISTORY_FORWARD_BOUNDARIES', [
     fauxAssistantMessage(fauxToolCall('qq_read_forward', { conversation: foreign, messageId: -310 }), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('qq_forward', { sourceConversation: foreign, messageIds: [-310], targetConversation: target }), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('qq_forward', { sourceConversation: source, messageIds: [-310], targetConversation: foreign }), { stopReason: 'toolUse' }),
     fauxAssistantMessage('Foreign conversations were refused.'),
-    fauxAssistantMessage(fauxToolCall('qq_read_history', { conversation: source }), { stopReason: 'toolUse' }),
+    async () => {
+      const files = (await readdir(messagesDirectory(host.cwd, { type: 'group', id: groupId }))).filter(file => file.endsWith('.jsonl'));
+      assert.equal(files.length, 1);
+      return fauxAssistantMessage(fauxToolCall('read', { path: join('messages', 'group', groupId, files[0]!) }), { stopReason: 'toolUse' });
+    },
     fauxAssistantMessage(fauxToolCall('qq_read_forward', { conversation: source, messageId: -310 }), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('qq_forward', { sourceConversation: source, messageIds: [-310], targetConversation: target }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage('Paused tools were refused.'),
-  ], undefined, [{ type: 'group', id: groupId }, { type: 'private', id: peerId }]);
-  await host.session.prompt('Check the history source and forwarding target boundaries.');
+    fauxAssistantMessage('Native reading succeeded and paused forward tools were refused.'),
+  ], async cwd => {
+    const store = await GroupStore.open(cwd, { id: 'history-forward-boundaries', conversations });
+    try { await store.append(normalizeMessageEvent(original)!); await store.acknowledge(1); }
+    finally { await store.close(); }
+  }, conversations);
+  assert.equal(host.session.getActiveToolNames().includes('qq_read_history'), false);
+  await host.session.prompt('Check the forward source and target boundaries.');
   let results = host.session.messages.filter(message => message.role === 'toolResult');
-  assert.equal(results.length, 4);
+  assert.equal(results.length, 3);
   assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
   assert.match(JSON.stringify(results), /不属于当前对话组/);
   const pause = await requestRunAction(host.cwd, 'pause');
   await eventually(async () => (await readRuntimeStatus(host.cwd))?.requestId === pause.requestId, 'history and forward pause receipt');
-  await host.session.prompt('Try history reading, forward reading, and forwarding while paused.');
+  await host.session.prompt('Read the saved log with the native read tool, then try forward reading and forwarding while paused.');
   results = host.session.messages.filter(message => message.role === 'toolResult');
-  assert.equal(results.length, 7);
-  assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
+  assert.equal(results.length, 6);
+  assert.equal(results[3]!.toolName, 'read');
+  assert.equal(results[3]!.isError, false);
+  assert.match(JSON.stringify(results[3]), /PAUSED_LOCAL_LOG_BODY/);
+  assert.ok(results.slice(4).every(result => result.role === 'toolResult' && result.isError));
   assert.match(JSON.stringify(results.slice(4)), /PiQ 已暂停/);
   assert.equal(host.socket.sent.filter(packet => packet.action === 'get_forward_msg' || packet.action.startsWith('send_')).length, 0);
   assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);

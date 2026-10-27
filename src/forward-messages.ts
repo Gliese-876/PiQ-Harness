@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { conversationKey } from './conversations.ts';
-import { HistoryError, lookupStoredMessages, redactChatText } from './chat-history.ts';
+import { HistoryError, lookupStoredMessages, redactChatText } from './message-records.ts';
 import type { ResourceContext, ResolveResourceContext } from './resource-tools.ts';
 
 class ForwardError extends Error {}

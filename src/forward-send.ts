@@ -2,7 +2,7 @@ import { resolve as resolvePath } from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { conversationKey, validateConversation, type Conversation } from './conversations.ts';
-import { lookupStoredMessages } from './chat-history.ts';
+import { lookupStoredMessages } from './message-records.ts';
 import { OneBotApiError } from './onebot-client.ts';
 import type { ResourceContext, ResolveResourceContext } from './resource-tools.ts';
 
