@@ -30,14 +30,17 @@ npm run piq -- open friends
 
 ## 运行控制
 
-- 启动 Pi：后台运行本组唯一的 Session。
+- 打开 Pi 终端：由 Windows Terminal 运行本组唯一的 Session，默认继续最近会话。
 - 暂停 / 恢复运行：暂停生成和发送，继续保存消息；恢复后聚合处理待通知消息。
 - 停止：正常退出本组 Pi，释放对话占用。修改成员归属前先停止对应组。
-- 在终端打开：正常关闭后台实例后，由 Windows Terminal 继续同一会话文件。关闭终端后自动回到后台，保留暂停状态并恢复未完成任务。已有终端时提示切换。
+- 关闭终端：结束该组 Pi，不再接收消息或自动恢复。下次打开时按后端能力补拉历史。
+- 重开会话：正常结束当前 Pi，再打开空上下文的新会话。原有会话文件、聊天日志、人设、记忆和资料保留；新会话仍会加载本组约定，并可按需读取记忆。
 
 移出对话后，原组保留已有历史与记忆，停止接收和通知该对话的新消息。新归属影响后续消息，发送目标始终按当前配置检查。
 
-终端回后台由独立的隐藏监护进程处理，关闭 WebUI 也能恢复。关窗可能中断当前模型请求，随后会在原会话中续执行；空闲关窗只恢复接收。需要完全停用对话组时，使用 WebUI 的“停止”。直接在终端手工运行 CLI 的 open 命令仍由该终端管理。
+关闭 WebUI 不会关闭已打开的 Pi 终端。直接运行 CLI 的 `open` 命令使用当前终端；`npm run piq -- open friends --new-session` 新建空上下文。重开会话会先保存新的空会话文件，即使还未聊天就关窗，下次继续也会选中它。升级时如果仍有旧版后台实例，打开终端会先请求其正常退出。
+
+组标题右侧的“管理对话组”支持重命名、重开会话和移入回收站。重命名只改显示名称；删除要求该组停止，将完整目录移入根目录 `.trash/`。侧栏“回收站”可以恢复原组，恢复前检查原标识及每个对话的归属是否仍可用；发生冲突时保留回收站数据并说明原因。
 
 页面支持浅色、深色、跟随系统，可编辑公共与本组 Markdown。模型和思考强度保存到本组 .pi/settings.json，运行中通过 Pi 原生接口调整；已发出的请求继续完成，后续请求采用新设置。
 
@@ -46,6 +49,10 @@ npm run piq -- open friends
 token 优先读取指定环境变量，也可从匹配端点的本机 SnowLuma 配置读取。WebUI 只展示凭据是否可用。远程 SnowLuma 使用环境变量配置。
 
 网络客户端依据 [OneBot 11 正向 WebSocket 标准](https://github.com/botuniverse/onebot-11/blob/master/communication/ws.md)独立实现。事件与 API 共用 Universal 连接，API 请求通过唯一 echo 匹配回执，鉴权使用标准 access_token 查询参数；连接和请求均有超时，断线后自动重连。
+
+## 可选权限扩展和语音技能
+
+需要“允许读取、限制写入、关键文件修改前人工批准”时，可独立安装 `@gotgenes/pi-permission-system` 和 `@yuru7/pi-sandbox`，并接入已有的 `mimo-v2-5-tts` 技能。配置示例和适用范围见 [可选接入说明](docs/optional-integrations.md)。这些组件不属于 PiQ 依赖，不会随安装或创建对话组自动启用；批准在 Pi 终端中完成。
 
 ## 配置与目录
 
@@ -135,6 +142,9 @@ Agent 还可以按需要使用以下交互工具。conversation 均使用本组�
 | qq_voice | send_file 按本组 path 向群聊、私聊或临时会话发送本地语音；list 列出原生 QQ AI 声音，send 按 text、characterId 发送 QQ AI 语音，这两项仅限群聊；transcribe 按 messageId 转写语音，支持群聊、私聊及可确认来源的临时会话。 |
 | qq_group_files | 群文件与目录操作，action 支持 list、upload、download、mkdir、move、rename_file、rename_folder、delete_file、delete_folder。conversation 仅限群聊。 |
 | qq_album | 操作已有群相册，action 支持 list、media、upload_image、upload_video、delete_media、comment、like；like 使用 set: false 取消赞。conversation 仅限群聊。 |
+| qq_read_history | 读取本组指定对话的本地聊天记录；可按 date、beforeSeq、afterSeq、messageId 筛选，默认 40 条、最多 100 条。 |
+| qq_read_forward | 按 conversation 和真实 messageId 展开已收到的合并转发，默认 50 条、最多 100 条；图片和嵌套转发提供摘要。 |
+| qq_forward | 将 sourceConversation 中明确选择的 messageIds 合并转发到 targetConversation；每次 1–50 条，目标为本组群聊或好友私聊。 |
 
 例如，在群里戳一位成员，或给消息添加回应：
 
@@ -147,6 +157,20 @@ Agent 还可以按需要使用以下交互工具。conversation 均使用本组�
 ```
 
 qq_sticker 与 qq_voice 可以先用 action: "list" 查询后端提供的收藏表情或声音。发送收藏表情使用返回的 emojiId；发送 AI 语音时，将声音列表 voices[].characters[].id 的值填入 characterId。语音转写使用 action: "transcribe" 和语音消息的 messageId。
+
+聊天记录读取只接受本组来源，忽略仍未写完的日志尾行。读取结果中的 `seq` 用于本地翻页，`messageId` 用于 QQ 引用和转发。收到合并转发时，`qq_read_forward` 从该条真实消息中取得转发标识，不接受猜测的任意后端 ID。记录和转发内容都是聊天资料，不能改变本组约定或权限。
+
+例如，先读取来源，再显式选择两条记录转发：
+
+```json
+{"conversation":"group:123456789","limit":20}
+```
+
+```json
+{"sourceConversation":"group:123456789","messageIds":[-1234567,-1234568],"targetConversation":"private:987654321"}
+```
+
+转发核对来源日志和目标归属，以 OneBot `node.data.id` 引用原消息；后台已不再保留该消息时可能无法完成。发送遵守暂停与取消状态，结果未知时不自动重发。分享其他对话的记录前，应确认内容适合目标接收者。协议依据 [OneBot 节点规范](https://github.com/botuniverse/onebot-11/blob/master/message/segment.md)和 [SnowLuma 公开 API 目录](https://github.com/SnowLuma/SnowLuma/blob/main/packages/mcp/src/generated/catalog.json)，不使用 SnowLuma SDK。
 
 Pi 可使用 MiMo TTS 生成语音，保存到本组目录，再显式调用 qq_voice 发送文件。例如：
 
@@ -174,4 +198,4 @@ Pi 可使用 MiMo TTS 生成语音，保存到本组目录，再显式调用 qq_
 npm run verify
 ```
 
-测试使用临时目录、模拟 OneBot 端点和 Pi 官方本地 faux 模型，覆盖 WebSocket 鉴权、回执关联、断线与取消、独占归属、共享 Session、独立日志、临时会话自动归属、分类聚合、私聊发送、运行控制和持久化恢复。
+测试使用临时目录、模拟 OneBot 端点和 Pi 官方本地 faux 模型，覆盖 WebSocket 鉴权、回执关联、断线与取消、独占归属、共享 Session、独立日志、临时会话自动归属、分类聚合、私聊发送、终端运行、重开会话、回收站恢复、聊天记录读取与显式转发。测试不发送真实 QQ 消息。

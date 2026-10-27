@@ -85,6 +85,8 @@ test('CLI requires named conversation groups and accepts explicit conversation k
   assert.throws(() => parseArgs(['init', 'visitors', '--name', '临时会话', '--conversation', 'temporary:234567']));
   const opened = parseArgs(['open', 'friends', '--root', 'C:/A Folder', '--', '--model', 'some/model', 'literal $() `text`']);
   assert.equal(opened.id, 'friends'); assert.deepEqual(opened.piArgs, ['--model', 'some/model', 'literal $() `text`']);
+  assert.equal(parseArgs(['open', 'friends', '--new-session']).freshSession, true);
+  assert.throws(() => parseArgs(['path', 'friends', '--new-session']));
   assert.throws(() => parseArgs(['init', 'friends']));
   assert.throws(() => parseArgs(['init', 'friends', '--name', '朋友', '--root']));
   assert.throws(() => parseArgs(['open', 'friends', '--url', 'ws://localhost:3001']));

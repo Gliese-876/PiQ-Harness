@@ -11,7 +11,7 @@ import { initializeGroup } from '../src/config.ts';
 import { GroupStore } from '../src/store.ts';
 import { normalizeMessageEvent } from '../src/transport.ts';
 import { readRuntimeStatus, requestRunAction } from '../src/run-control.ts';
-import { cancelTerminalReturn, prepareTerminalReturn, runTerminalMonitor } from '../src/terminal-monitor.ts';
+import { cancelTerminalReturn, prepareTerminalReturn } from '../src/terminal-monitor.ts';
 
 function message(id: number, text = 'The same text is allowed twice') {
   return { post_type: 'message', message_type: 'group', self_id: 99999, group_id: 123455,
@@ -64,23 +64,14 @@ async function fixture(t: TestContext, responses: FauxResponseStep[], options: {
   const terminalEnvironment = ['PIQ_TERMINAL_RETURN_TOKEN', 'PIQ_TERMINAL_WRAPPER_PID', 'PIQ_RUN_MODE'] as const;
   const savedEnvironment = Object.fromEntries(terminalEnvironment.map(key => [key, process.env[key]]));
   for (const key of terminalEnvironment) delete process.env[key];
-  const monitorTasks: Promise<void>[] = [];
   if (options.managedTerminal) {
-    const prepared = await prepareTerminalReturn(cwd, {
-      readyTimeoutMs: 2_000,
-      launch: async specification => {
-        monitorTasks.push(runTerminalMonitor(cwd, { token: specification.env.PIQ_TERMINAL_RETURN_TOKEN,
-          pollMs: 5, registrationTimeoutMs: 5_000, start: async () => { assert.fail('A live test session must not recover.'); } }));
-        return { pid: process.pid };
-      },
-    });
+    const prepared = await prepareTerminalReturn(cwd);
     process.env.PIQ_TERMINAL_RETURN_TOKEN = prepared.token;
     process.env.PIQ_TERMINAL_WRAPPER_PID = String(process.ppid);
   }
   if (options.background) process.env.PIQ_RUN_MODE = 'background';
   t.after(async () => {
-    if (monitorTasks.length) await cancelTerminalReturn(cwd);
-    await Promise.all(monitorTasks);
+    if (options.managedTerminal) await cancelTerminalReturn(cwd);
     for (const key of terminalEnvironment) {
       const value = savedEnvironment[key];
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -197,7 +188,7 @@ test('pausing an active Pi run aborts it and resume continues even without new g
   } finally { release(); }
 });
 
-test('an unfinished handoff continues the same Pi session after restart with no pending QQ message', async t => {
+test('an explicit handoff can continue its existing Pi session when manually reopened', async t => {
   let release = () => {};
   const gate = new Promise<void>(resolve => { release = resolve; });
   let markedBeforeModel = false;
@@ -207,7 +198,7 @@ test('an unfinished handoff continues the same Pi session after restart with no 
       await gate;
       return fauxAssistantMessage('Interrupted by closing the terminal.');
     },
-    fauxAssistantMessage('Continuing the existing work in the background.'),
+    fauxAssistantMessage('Continuing the existing work after manual reopening.'),
   ]);
   try {
     const sessionId = f.session.sessionManager.getSessionId();

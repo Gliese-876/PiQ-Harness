@@ -1,0 +1,111 @@
+# 可选 Pi 扩展与 MiMo TTS
+
+PiQ 只提供 QQ 通道和对话组管理。以下包由用户独立安装到 Pi，不是 PiQ 的依赖，也不会随 `npm ci`、创建对话组或启动工作台自动安装。PiQ 可以在没有它们的情况下运行。
+
+本文按 2026-10-27 的 npm 发布包核对：
+
+| 可选组件 | 示例固定版本 | 用途 |
+| --- | --- | --- |
+| `@gotgenes/pi-permission-system` | `40.3.0` | 文件和工具的允许、拒绝、人工批准规则 |
+| `@yuru7/pi-sandbox` | `0.4.1` | 标准文件工具的写入检查，以及受限命令进程 |
+| `mimo-v2-5-tts` 技能 | 使用主人已安装的技能 | 合成音频后由 `qq_voice` 显式发送 |
+
+两个包声明的 Pi 版本范围包含 PiQ 使用的 Pi 1.4.0。更新包之前应重新核对配置与行为；npm 固定版本和上游 GitHub `main` 可能不同。
+
+## 配置范围
+
+在每个需要启用的对话组中独立配置。Pi 的工作目录必须是该组目录，例如 `文档/PiQ-Messages/friends`，不能是整个 `PiQ-Messages`。同一组终端里的人工审批由本机操作者作出；普通 QQ 发言不能充当批准。
+
+示例配置采用以下规则：
+
+- 文件读取允许，组外读取也允许。
+- 标准文件工具可以写本组普通文件，组外写入拒绝。
+- 标准工具写入 `PERSONA.md`、`AGENTS.md`、`PIQ.md` 前询问。
+- 标准工具写入 `.pi/` 配置、`.piq/` 运行状态和 `messages/` 日志时拒绝；这些目录仍由可信 Pi/PiQ 代码正常维护。
+- Windows 的 `powershell` 每次执行前询问，`bash` 禁用。未知扩展工具默认询问。PiQ 已明确限制本地路径的 QQ 工具可以正常使用。
+- 关闭模型自动审批和目录扩权，配套可选 hook 拒绝 Agent 的无沙箱重试。
+
+审批时选择 **Yes / 本次允许**。`Yes, allow ... for this session` 会允许后续匹配操作跳过询问；需要每次确认保护文件或命令时，不要选择会话放行。
+
+## 安装与示例文件
+
+先停止该对话组，在普通本机终端进入该组目录，执行：
+
+```powershell
+pi install -l npm:@gotgenes/pi-permission-system@40.3.0
+pi install -l npm:@yuru7/pi-sandbox@0.4.1
+```
+
+`-l` 将包声明写入本组 `.pi/settings.json`，不会为所有普通 Pi 会话开启权限规则。Pi 负责获取包及其运行依赖。首次打开时需要由主人确认项目资源可信。不要在模型生成的命令中自动确认这个信任决定。
+
+将仓库内的示例分别放到以下位置；修改已有文件前先备份，并保留原有模型、包和技能设置：
+
+| 示例 | 放置位置 |
+| --- | --- |
+| [`permissions.json`](../examples/integrations/permissions.json) | `<组目录>/.pi/extensions/pi-permission-system/config.json` |
+| [`pi-sandbox.json`](../examples/integrations/pi-sandbox.json) | `<组目录>/.pi/pi-sandbox.json` |
+| [`pi-settings.example.json`](../examples/integrations/pi-settings.example.json) | 将需要的字段合并进 `<组目录>/.pi/settings.json` |
+
+`pi-settings.example.json` 中的 `C:/tools/PiQ-Harness` 是占位安装目录，必须换成本机真实路径。保留已有的 PiQ 包声明，不要重复添加。`defaultTools` 的 `+powershell` 与 `-bash` 分别增加和移除内置工具；其他已有选择也应保留。
+
+### 禁止 Agent 提权的可选 hook
+
+[`no-escalation.ts`](../examples/integrations/no-escalation.ts) 是独立的配置配套示例，不在 PiQ 的 `package.json` 资源清单中。只有主人在 Pi 的 `extensions` 中明确配置它时才会加载。
+
+它拒绝 `sandbox_grant_write`，以及任何工具携带的 `sandbox_permissions: "danger-full-access"`。Pi 在实际执行工具之前触发 `tool_call`，因此拒绝会阻止 yuru7 的无沙箱重试。Windows 下它还在 `session_start` 将当前 Pi 进程的临时目录设为本组真实目录，以适配下述 yuru7 临时目录限制；其余调用交给两个外部包处理。
+
+可以按 settings 示例直接引用仓库中的这个文件，也可以把它复制到主人维护的受信任目录并引用绝对路径。不要让 Agent 修改其代码、包声明或权限配置。主人主动在终端输入的 `!` 命令、`/permission` 等操作仍属于人工操作；不要通过这些入口解除本来要保留的边界。
+
+### Windows 临时目录
+
+yuru7 的 Windows 沙箱默认允许写入进程的 `%TEMP%`，但 `0.4.1` 的原生运行器拒绝该目录位于工作区的子目录中。把 `TEMP` 设置为 `<组目录>/.tmp` 会导致受限命令在执行前报错。
+
+配套 `no-escalation.ts` 在 Windows 的 `session_start` 中把 `TEMP`、`TMP`、`TMPDIR` 设为 `realpath(ctx.cwd)`，即**本组根目录本身**。这与工作区是同一个可写根，不会额外开放组外目录。实际 Pi 1.4.0 与这两个发布版本已在隔离临时会话中验证：该 hook 生效后，获批 PowerShell 可写本组文件，尝试写同级组外文件仍被 Windows ACL 拒绝。
+
+此设置只影响加载了这个可选 hook 的 Pi 进程及其后续子进程，不修改系统、用户或启动它的外部终端环境。会话关闭时会恢复尚未被其他组件改动的原值。其他操作系统不调整环境变量。PiQ 通用启动方式仍可使用本组 `.tmp`；仅启用这个外部集成时由 hook 应用上述兼容设置。
+
+受限命令生成的临时文件可能出现在组根目录；Python 的正常音频输出仍应显式指定为 `assets/voices/...`。需要手工复现同一环境时，在专用终端中使用：
+
+```powershell
+$piqGroup = 'C:\Users\你的用户名\Documents\PiQ-Messages\friends'
+$piqTemp = (Resolve-Path -LiteralPath $piqGroup).Path
+$env:TEMP = $piqTemp
+$env:TMP = $piqTemp
+$env:TMPDIR = $piqTemp
+Set-Location -LiteralPath $piqGroup
+pi --continue
+```
+
+手工命令的环境变量只针对该终端进程及其子进程设置，不要把某一组目录设置为系统全局临时目录。工作目录不能使用指向组外的目录联接或符号链接。yuru7 在 Linux/macOS 还会允许 `/tmp`，本文示例按 Windows 配置。
+
+## MiMo TTS
+
+沿用主人安装的 `mimo-v2-5-tts` 技能，在本组 settings 的 `skills` 中登记它的真实目录。示例使用 `~/.agents/skills/mimo-v2-5-tts`。读取不限，因此技能脚本可以放在组外；脚本和 Python 依赖仍由主人安装和维护。
+
+- `MIMO_API_KEY` 通过启动 Pi 的环境提供，不写入 `PIQ.md`、技能文档或仓库。
+- 音色克隆样本建议放在本组 `assets/voices/`。
+- 生成结果显式指定本组相对路径，例如 `--output assets/voices/reply.wav`。
+- Windows 下通过 `powershell` 调用 Python，执行前在 Pi 终端批准该次命令。生成后由 `qq_voice` 的 `send_file` 按本组路径显式发送。
+
+MiMo API 和 QQ 后端需要网络连接。这个 yuru7 版本不限制网络。读取不限也意味着这套配置没有阻止 Agent 读取当前用户可访问的数据；文件写入规则不承担数据外发控制。
+
+## 实际保护范围
+
+gotgenes 对标准文件路径进行规则检查，yuru7 对自己接管的 `write`、`edit` 和受限 PowerShell 提供写入约束。PiQ 的群文件、图片和本地语音工具另有本组路径校验。其他扩展直接执行的文件或网络操作使用它们自己的实现；审批一个未知工具前，应了解它会访问哪些资源。
+
+`PERSONA.md` 的保护分两种情况：标准 `write/edit` 命中路径规则后询问；任意 PowerShell/Python 脚本则在整个命令执行前询问。两个包不会准确推导任意脚本将修改哪些文件。因此，批准脚本前需要确认它不会私自修改保护文件或权限配置。若需要“即使批准任意脚本也绝不能修改 PERSONA”的强约束，还需要操作系统级文件只读策略及批准后的受控写入机制；此配置没有宣称提供这项能力。
+
+yuru7 将 Windows 后端标为部分隔离，并注明硬链接等限制；配置配套 hook 也不能改变这些底层限制。不要把工具批准与底层写入隔离视为同一个保证。
+
+## 验证与退出
+
+先用不加载 PiQ QQ 通道的临时测试目录验证这些外部扩展，确认以下行为再应用到实际对话组：读取组外普通测试文件允许；组内普通文件可写；组外测试文件不可写；保护文件修改弹出人工批准；拒绝后原内容保留；PowerShell 每次询问；无沙箱重试和目录扩权被拒。验证只使用临时文件，不能发送真实 QQ 消息。
+
+实际对话组通过 PiQ 的终端入口运行，关闭终端即停止。配置修改后关闭旧终端再打开，使新的权限规则从启动时生效。停止使用时，从本组 settings 移除两个包和 `no-escalation.ts` 声明即可；保留配置备份便于以后恢复。
+
+## 上游资料
+
+- [gotgenes 配置与能力边界](https://github.com/gotgenes/pi-packages/tree/main/packages/pi-permission-system)
+- [yuru7 沙箱配置与 Windows 限制](https://github.com/yuru7/my-pi-extensions/tree/main/pi-sandbox)
+- [Pi 包的项目作用域](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md)
+- [Pi 的安全模型](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/security.md)

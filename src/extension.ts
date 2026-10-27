@@ -15,6 +15,9 @@ import { RunController, type ConnectionState } from './run-control.ts';
 import { ensureSnowLuma } from './snowluma-service.ts';
 import { registerGroupFileTool } from './group-files.ts';
 import { registerAlbumTool } from './albums.ts';
+import { registerChatHistoryTool } from './chat-history.ts';
+import { registerForwardMessageTool } from './forward-messages.ts';
+import { registerForwardSendTool } from './forward-send.ts';
 import { manageSticker } from './sticker-management.ts';
 import { workspaceFile } from './workspace-files.ts';
 import { registerTerminal } from './terminal-monitor.ts';
@@ -466,5 +469,13 @@ export default function piq(pi: ExtensionAPI): void {
   });
   registerGroupFileTool(pi, resourceContext);
   registerAlbumTool(pi, resourceContext);
+  registerChatHistoryTool(pi, resourceContext);
+  registerForwardMessageTool(pi, resourceContext);
+  registerForwardSendTool(pi, resourceContext, async (ctx, target, result) => {
+    const current = binding;
+    if (!current || current.closed || resolve(ctx.cwd) !== resolve(current.cwd)) throw new Error('发送后原会话已关闭。');
+    return rememberSend(current, target, result.messageId, `[合并转发 ${result.count} 条聊天记录]`,
+      [{ type: 'forward', data: { id: result.forwardId } }]);
+  });
   registerModelControl(pi);
 }

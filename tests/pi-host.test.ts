@@ -17,12 +17,13 @@ import { normalizeMessageEvent } from '../src/transport.ts';
 import { conversationKey, type Conversation } from '../src/conversations.ts';
 import { readRuntimeStatus, requestRunAction } from '../src/run-control.ts';
 
-/** Fake only the network boundary: Pi and SnowLuma both run their real implementations. */
+/** Fake only the network boundary: Pi and PiQ's independent transport run their real implementations. */
 class LocalSocket extends EventTarget {
   static instances: LocalSocket[] = [];
   static autoOpen = true;
   static history = new Map<string, Array<Record<string, unknown>>>();
   static messages = new Map<number, Record<string, unknown>>();
+  static forwards = new Map<string, Array<Record<string, unknown>>>();
   static transcripts = new Map<number, string>();
   static stickers = [{ emoji_id: 'sticker-001', md5: 'fake-sticker-md5', desc: 'Local test sticker' }];
   static voices = [{ type: 'default', characters: [{ character_id: 'voice-001', character_name: 'Local test voice' }] }];
@@ -54,6 +55,19 @@ class LocalSocket extends EventTarget {
     if (packet.action === 'get_login_info') result = { user_id: 99999, nickname: 'Test bot' };
     else if (['get_group_msg_history', 'get_friend_msg_history'].includes(packet.action)) result = { messages };
     else if (packet.action === 'get_msg') result = LocalSocket.messages.get(packet.params.message_id) ?? null;
+    else if (packet.action === 'get_forward_msg') result = { messages: LocalSocket.forwards.get(packet.params.id) ?? [] };
+    else if (['send_group_forward_msg', 'send_private_forward_msg'].includes(packet.action)) {
+      const messageId = LocalSocket.nextMessageId--;
+      const forwardId = `sent-forward-${Math.abs(messageId)}`;
+      const nodes = (packet.params.messages as Array<{ type: string; data: { id: string } }>).map(node => {
+        assert.equal(node.type, 'node');
+        const message = LocalSocket.messages.get(Number(node.data.id));
+        assert.ok(message, 'simulated backend only resolves known original message ids');
+        return message;
+      });
+      LocalSocket.forwards.set(forwardId, nodes);
+      result = { message_id: messageId, res_id: forwardId, forward_id: forwardId };
+    }
     else if (packet.action === 'fetch_custom_face_detail') result = LocalSocket.stickers;
     else if (packet.action === 'get_ai_characters') result = LocalSocket.voices;
     else if (packet.action === 'fetch_ptt_text') result = { text: LocalSocket.transcripts.get(packet.params.message_id) ?? '' };
@@ -135,7 +149,7 @@ async function fixture(t: TestContext) {
   t.after(() => { if (oldAutostart === undefined) delete process.env.PIQ_SNOWLUMA_AUTOSTART; else process.env.PIQ_SNOWLUMA_AUTOSTART = oldAutostart; });
   LocalSocket.history.clear();
   LocalSocket.autoOpen = true;
-  LocalSocket.messages.clear(); LocalSocket.transcripts.clear(); LocalSocket.nextMessageId = -900;
+  LocalSocket.messages.clear(); LocalSocket.forwards.clear(); LocalSocket.transcripts.clear(); LocalSocket.nextMessageId = -900;
   // Windows Codex's virtualized OS temp denies rename; the channel uses atomic rename for receipts.
   const tempRoot = join(process.cwd(), '.test-tmp');
   await mkdir(tempRoot, { recursive: true });
@@ -931,5 +945,105 @@ test('local voice sending rejects outside files and cannot dispatch while paused
   const sockets = [host.socket, ...LocalSocket.instances.slice(socketsBefore)];
   assert.equal(sockets.flatMap(socket => socket.sent).filter(packet => ['send_group_msg', 'send_private_msg'].includes(packet.action)).length, 0);
   assert.doesNotMatch(JSON.stringify(sockets.flatMap(socket => socket.sent)), /OTHER_GROUP_AUDIO_BYTES|LOCAL_CANCELLABLE_AUDIO/);
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('real Pi reads history and received forwards, explicitly forwards selected records, then reads its saved send', async t => {
+  const f = await fixture(t);
+  const groupId = '444021', peerId = '444022';
+  const source = `group:${groupId}`, target = `private:${peerId}`;
+  const ordinary = groupMessage(groupId, -301, 'HISTORY_SOURCE_BODY');
+  const received = { ...groupMessage(groupId, -302, '[合并转发]'),
+    message: [{ type: 'forward', data: { id: 'received-forward' } }] };
+  LocalSocket.messages.set(-301, ordinary);
+  LocalSocket.messages.set(-302, received);
+  LocalSocket.forwards.set('received-forward', [{
+    sender: { user_id: 77777, nickname: 'Original member' }, time: 1_700_000_000,
+    message: [{ type: 'text', data: { text: 'INNER_FORWARDED_TEXT' } },
+      { type: 'image', data: { url: 'https://qpic.cn/image?signature=PRIVATE_FORWARD_SIGNATURE' } }],
+  }]);
+  let host: Awaited<ReturnType<typeof f.host>>;
+  host = await f.host('history-forward-flow', 'HISTORY_FORWARD_RULES', [
+    fauxAssistantMessage(fauxToolCall('qq_read_history', { conversation: source, limit: 10 }), { stopReason: 'toolUse' }),
+    () => {
+      assert.equal(host.socket.sent.filter(packet => packet.action.startsWith('send_')).length, 0);
+      return fauxAssistantMessage(fauxToolCall('qq_read_forward', { conversation: source, messageId: -302 }), { stopReason: 'toolUse' });
+    },
+    () => {
+      assert.equal(host.socket.sent.filter(packet => packet.action.startsWith('send_')).length, 0);
+      return fauxAssistantMessage(fauxToolCall('qq_forward', {
+        sourceConversation: source, messageIds: [-301, -302], targetConversation: target,
+      }), { stopReason: 'toolUse' });
+    },
+    fauxAssistantMessage(fauxToolCall('qq_read_history', { conversation: target, messageId: -900 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_read_forward', { conversation: target, messageId: -900 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('This ordinary response remains only in the Pi session.'),
+  ], undefined, [{ type: 'group', id: groupId }, { type: 'private', id: peerId }]);
+  for (const tool of ['qq_read_history', 'qq_read_forward', 'qq_forward']) assert.ok(host.session.getActiveToolNames().includes(tool));
+  host.socket.receive(ordinary); host.socket.receive(received);
+  await eventually(() => host.faux.state.callCount === 6 && host.session.isIdle, 'the history and explicit forward workflow to settle');
+  const results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 5);
+  assert.ok(results.every(result => result.role === 'toolResult' && !result.isError), JSON.stringify(results));
+  const parsed = (index: number) => {
+    const block = results[index]!.content.find(item => item.type === 'text');
+    assert.ok(block && block.type === 'text');
+    return JSON.parse(block.text) as { records: Array<Record<string, any>> };
+  };
+  assert.deepEqual(parsed(0).records.map(record => record.messageId), [-301, -302]);
+  assert.equal(parsed(1).records[0]!.text, 'INNER_FORWARDED_TEXT');
+  assert.ok(parsed(1).records[0]!.segments.some((segment: { hasImage?: boolean }) => segment.hasImage));
+  assert.equal(parsed(3).records.length, 1);
+  assert.equal(parsed(3).records[0]!.messageId, -900);
+  assert.equal(parsed(3).records[0]!.outgoing, true);
+  assert.equal(parsed(4).records[0]!.text, 'HISTORY_SOURCE_BODY');
+  assert.equal(parsed(4).records.length, 2);
+  assert.doesNotMatch(JSON.stringify(results), /PRIVATE_FORWARD_SIGNATURE/);
+  assert.deepEqual(host.socket.sent.filter(packet => packet.action === 'get_forward_msg').map(packet => packet.params), [
+    { id: 'received-forward' }, { id: 'sent-forward-900' },
+  ]);
+  const sends = host.socket.sent.filter(packet => packet.action.startsWith('send_'));
+  assert.equal(sends.length, 1, 'only the explicit forward tool sends anything');
+  assert.equal(sends[0]!.action, 'send_private_forward_msg');
+  assert.deepEqual(sends[0]!.params, { user_id: Number(peerId), messages: [
+    { type: 'node', data: { id: '-301' } }, { type: 'node', data: { id: '-302' } },
+  ] });
+  const sentRecords = await conversationRecords(host.cwd, { type: 'private', id: peerId });
+  assert.equal(sentRecords.length, 1);
+  assert.equal(sentRecords[0]!.messageId, '-900');
+  assert.equal(sentRecords[0]!.outgoing, true);
+  assert.deepEqual(sentRecords[0]!.segments, [{ type: 'forward', data: { id: 'sent-forward-900' } }]);
+  assert.equal((await conversationRecords(host.cwd, { type: 'group', id: groupId })).length, 2);
+  assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
+});
+
+test('real Pi refuses foreign history and forward targets, and all three tools honor pause', async t => {
+  const f = await fixture(t);
+  const groupId = '444023', peerId = '444024';
+  const source = `group:${groupId}`, target = `private:${peerId}`, foreign = 'group:555999';
+  const host = await f.host('history-forward-boundaries', 'HISTORY_FORWARD_BOUNDARIES', [
+    fauxAssistantMessage(fauxToolCall('qq_read_history', { conversation: foreign }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_read_forward', { conversation: foreign, messageId: -310 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_forward', { sourceConversation: foreign, messageIds: [-310], targetConversation: target }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_forward', { sourceConversation: source, messageIds: [-310], targetConversation: foreign }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('Foreign conversations were refused.'),
+    fauxAssistantMessage(fauxToolCall('qq_read_history', { conversation: source }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_read_forward', { conversation: source, messageId: -310 }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_forward', { sourceConversation: source, messageIds: [-310], targetConversation: target }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('Paused tools were refused.'),
+  ], undefined, [{ type: 'group', id: groupId }, { type: 'private', id: peerId }]);
+  await host.session.prompt('Check the history source and forwarding target boundaries.');
+  let results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 4);
+  assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
+  assert.match(JSON.stringify(results), /不属于当前对话组/);
+  const pause = await requestRunAction(host.cwd, 'pause');
+  await eventually(async () => (await readRuntimeStatus(host.cwd))?.requestId === pause.requestId, 'history and forward pause receipt');
+  await host.session.prompt('Try history reading, forward reading, and forwarding while paused.');
+  results = host.session.messages.filter(message => message.role === 'toolResult');
+  assert.equal(results.length, 7);
+  assert.ok(results.every(result => result.role === 'toolResult' && result.isError));
+  assert.match(JSON.stringify(results.slice(4)), /PiQ 已暂停/);
+  assert.equal(host.socket.sent.filter(packet => packet.action === 'get_forward_msg' || packet.action.startsWith('send_')).length, 0);
   assert.deepEqual(host.errors, []); assert.deepEqual(host.notifications, []);
 });
