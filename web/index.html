@@ -19,6 +19,7 @@
       <div class="sidebar-heading"><span>对话组</span><span id="group-count" class="count">0</span></div>
       <nav id="group-list" class="group-list" aria-label="选择对话组"><p class="sidebar-empty">正在读取对话组目录…</p></nav>
       <button id="add-group" class="add-group" type="button"><span aria-hidden="true">＋</span> 新建对话组</button>
+      <button id="open-trash" class="trash-link" type="button">回收站</button>
       <div class="sidebar-bottom">
         <span class="local-label"><span class="status-dot" aria-hidden="true"></span>本地运行</span>
         <p id="root-path" class="root-path" title="对话组目录位置">文档 / PiQ-Messages</p>
@@ -44,13 +45,22 @@
             <div id="pending-dialogs" class="pending-dialogs" aria-label="按对话分类的待处理消息" hidden></div>
           </div>
           <div class="run-actions">
-            <button id="run-action" class="button primary run-button" type="button" disabled>启动 Pi</button>
+            <button id="run-action" class="button primary run-button" type="button" disabled>打开 Pi 终端</button>
             <button id="stop-run" class="button subtle stop-button" type="button" hidden>停止</button>
             <button id="open-terminal" class="button terminal-button" type="button">
               <svg aria-hidden="true" width="18" height="18" viewBox="0 0 20 20" fill="none"><path d="m5 6 4 4-4 4M11 14h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              <span>在终端打开</span>
+              <span>查看终端</span>
               <span class="arrow" aria-hidden="true">↗</span>
             </button>
+            <details id="group-menu" class="group-menu">
+              <summary class="button subtle">管理对话组</summary>
+              <div class="group-menu-panel" role="group" aria-label="管理当前对话组">
+                <button id="new-session" type="button" aria-label="重开 Pi 会话">重开 Pi 会话</button>
+                <button id="rename-group" type="button" aria-label="重命名对话组">重命名</button>
+                <button id="delete-group" class="danger-action" type="button" aria-label="将对话组移入回收站">移入回收站</button>
+                <p id="group-menu-help">删除前请先停止本组 Pi。</p>
+              </div>
+            </details>
           </div>
         </header>
 
@@ -74,7 +84,7 @@
           <form id="membership-form" class="settings-card">
             <div class="settings-section">
               <div class="field"><label for="group-name">对话组名称</label><input id="group-name" name="name" type="text" maxlength="80" required autocomplete="off" disabled></div>
-              <p id="membership-lock" class="membership-lock" role="status" hidden>请先停止本对话组的 Pi，再调整名称或对话归属；暂停时仍会接收消息。</p>
+              <p id="membership-lock" class="membership-lock" role="status" hidden>请先停止本对话组的 Pi，再调整对话归属；运行时可通过“管理对话组”重命名。</p>
               <div id="conversation-rows" class="conversation-rows" aria-label="本组对话"></div>
               <button id="add-conversation" class="button subtle" type="button" disabled>添加对话</button>
               <p class="field-help membership-help">群聊填写群号，私聊填写对方 QQ 号；群临时私聊还包含来源群号。同组群聊产生的临时私聊会自动归入本组。移除对话会停止接收它的新消息，已有记录与记忆仍保留在本组。</p>
@@ -161,6 +171,16 @@
       <p id="add-error" class="inline-error" role="alert" hidden></p>
       <div class="dialog-actions"><button id="cancel-add" class="button subtle" type="button">取消</button><button id="confirm-add" class="button primary" type="submit">创建对话组</button></div>
     </form>
+  </dialog>
+
+  <dialog id="trash-dialog" class="add-dialog trash-dialog" aria-labelledby="trash-title">
+    <div class="dialog-heading"><h2 id="trash-title">回收站</h2><button id="close-trash" class="icon-button" type="button" aria-label="关闭回收站">×</button></div>
+    <p class="dialog-description">移入回收站的对话组保留文档、聊天记录和 Pi 会话历史。恢复时会检查目录标识和对话归属是否冲突。</p>
+    <div class="trash-toolbar"><span id="trash-status" class="muted" role="status" aria-live="polite"></span><button id="refresh-trash" class="button subtle" type="button">刷新</button></div>
+    <p id="trash-error" class="inline-error" role="alert" hidden></p>
+    <p id="trash-empty" class="trash-empty" hidden>回收站为空。</p>
+    <div id="trash-list" class="trash-list" aria-label="已删除的对话组"></div>
+    <div class="dialog-actions"><button id="done-trash" class="button subtle" type="button">关闭</button></div>
   </dialog>
 </body>
 </html>

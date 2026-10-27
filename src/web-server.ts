@@ -6,13 +6,14 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { defaultMessagesRoot } from './cli.ts';
 import { initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, validateConfig, validateGroupId, type GroupConfig } from './config.ts';
+import { deleteGroup, listDeletedGroups, restoreGroup } from './group-management.ts';
 import { conversationKey, conversationDirectory, parseConversationKey, type Conversation } from './conversations.ts';
 import { credentialStatus, getRunningOwner, openGroupTerminal } from './web-terminal.ts';
 import { getModelPreference, listModels, saveModelPreference, type ModelCatalog } from './web-models.ts';
 import { readModelStatus, requestModelChange } from './model-control.ts';
 import { clearInterruptedWork, readRuntimeStatus, requestRunAction } from './run-control.ts';
-import { cancelTerminalReturn } from './terminal-monitor.ts';
-import { getProcessStatus, handoffToTerminal, startGroup } from './process-manager.ts';
+import { cancelTerminalReturn, disableTerminalRecovery } from './terminal-monitor.ts';
+import { getProcessStatus } from './process-manager.ts';
 import { ensureSnowLuma, openSnowLumaManual, type SnowLumaServiceResult } from './snowluma-service.ts';
 import { parseStoredRecord } from './store.ts';
 
@@ -77,7 +78,6 @@ export interface WebOptions {
   openTerminal?: typeof openGroupTerminal;
   credentials?: typeof credentialStatus;
   models?: () => Promise<ModelCatalog>;
-  start?: typeof startGroup;
   action?: typeof requestRunAction;
   ensure?: typeof ensureSnowLuma;
   manual?: typeof openSnowLumaManual;
@@ -90,7 +90,6 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
   const launch = options.openTerminal ?? openGroupTerminal;
   const credentials = options.credentials ?? credentialStatus;
   const models = options.models ?? (() => listModels());
-  const start = options.start ?? startGroup;
   const action = options.action ?? requestRunAction;
   const ensure = options.ensure ?? ensureSnowLuma;
   const manual = options.manual ?? openSnowLumaManual;
@@ -125,6 +124,50 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
     const current = previous.catch(() => {}).then(work);
     operations.set(key, current);
     try { return await current; } finally { if (operations.get(key) === current) operations.delete(key); }
+  }
+
+  async function stopSession(cwd: string, preserveContext = false): Promise<{ requestId?: string }> {
+    // Disable legacy recovery but retain live terminal PIDs until they exit.
+    const terminalToken = await disableTerminalRecovery(cwd);
+    const deadline = Date.now() + 10_000;
+    while (!(await getRunningOwner(cwd)).running && (await getProcessStatus(cwd)).starting) {
+      if (Date.now() >= deadline) throw new HttpError(409, 'Pi 仍在启动，请稍后重试停止。');
+      await delay(100);
+    }
+    if (!(await getRunningOwner(cwd)).running) {
+      const status = await getProcessStatus(cwd);
+      if (status.running || status.starting) throw new HttpError(409, 'Pi 终端进程仍在运行但尚未取得本组运行锁，请关闭原终端后重试。');
+      if (terminalToken) await cancelTerminalReturn(cwd, terminalToken);
+      if (!preserveContext) await clearInterruptedWork(cwd);
+      return {};
+    }
+    const result = await action(cwd, preserveContext ? 'handoff' : 'shutdown');
+    while ((await getRunningOwner(cwd)).running || (await getProcessStatus(cwd)).running || (await getProcessStatus(cwd)).starting) {
+      if (Date.now() >= deadline) throw new HttpError(409, 'Pi 尚未退出，请在原终端结束会话后重试。');
+      await delay(100);
+    }
+    if (terminalToken) await cancelTerminalReturn(cwd, terminalToken);
+    if (!preserveContext) await clearInterruptedWork(cwd);
+    return result;
+  }
+
+  async function openSession(id: string, freshSession: boolean) {
+    const cwd = await groupPath(id);
+    if (!(await loadConfig(cwd))!.conversations.length) throw new HttpError(400, '请先添加至少一个对话。');
+    if ((launching.get(id) ?? 0) > Date.now()) {
+      if (freshSession) throw new HttpError(409, '终端正在打开，请等启动完成后重开会话。');
+      return { alreadyRunning: true, message: '终端正在打开，请稍候。' };
+    }
+    const process = await getProcessStatus(cwd);
+    if (!freshSession && process.running && process.mode !== 'background') {
+      return { alreadyRunning: true, message: `本组 Pi 已在终端运行（PID ${process.pid}），请切换到原终端。` };
+    }
+    if (process.starting) throw new HttpError(409, 'Pi 正在启动，请等启动完成后重试。');
+    const service = await ensureService(cwd);
+    if (freshSession || process.running) await stopSession(cwd, !freshSession);
+    const result = await launch(cwd, { freshSession });
+    if (!result.alreadyRunning) launching.set(id, Date.now() + 10_000);
+    return { ...result, service, ...(freshSession ? { freshSession: true } : {}) };
   }
 
   async function save(cwd: string, filename: string, content: unknown, expected: unknown): Promise<string> {
@@ -204,6 +247,13 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
         json(response, { root, csrfToken, groups: list, defaultWsUrl }); return;
       }
       if (method === 'GET' && url.pathname === '/api/models') { json(response, await models()); return; }
+      if (method === 'GET' && url.pathname === '/api/trash') {
+        json(response, { entries: await listDeletedGroups(root) }); return;
+      }
+      if (method === 'POST' && parts.length === 4 && parts[1] === 'trash' && parts[3] === 'restore') {
+        await readBody(request);
+        json(response, await restoreGroup(root, parts[2]!)); return;
+      }
       if (url.pathname === '/api/root/agents') {
         if (method === 'GET') {
           const content = await textFile(await safeFile(root, 'AGENTS.md', true), true);
@@ -229,6 +279,16 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       }
       if (parts[1] !== 'groups' || !parts[2]) throw new HttpError(404, '未找到接口。');
       const id = validateGroupId(parts[2]);
+      if (method === 'DELETE' && parts.length === 3) {
+        await exclusive(`run:${id}`, async () => {
+          if ((launching.get(id) ?? 0) > Date.now()) throw new HttpError(409, '终端正在打开，请等启动完成并停止后重试。');
+          const result = await deleteGroup(join(root, id));
+          services.delete(join(root, id));
+          launching.delete(id);
+          json(response, result);
+        });
+        return;
+      }
       const cwd = await groupPath(id);
       if (parts[3] === 'model' && parts.length === 4) {
         const runtimeState = async () => {
@@ -305,21 +365,12 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
         if (config.id !== id) throw new HttpError(400, '此处不能更改对话组标识。');
         json(response, await saveGroupConfig(cwd,config,body.revision as string)); return;
       }
-      if (method === 'POST' && parts[3] === 'open' && parts.length === 4) {
-        await readBody(request);
-        if (!(await loadConfig(cwd))!.conversations.length) throw new HttpError(400,'请先添加至少一个对话。');
-        await exclusive(`open:${id}`, async () => {
-          const owner = await getRunningOwner(cwd);
-          const process = await getProcessStatus(cwd);
-          if (owner.running && process.mode !== 'background') { json(response, { alreadyRunning: true, message: `本群 Pi 已在终端运行（PID ${owner.pid}），请切换到原终端。` }); return; }
-          if ((launching.get(id) ?? 0) > Date.now()) { json(response, { alreadyRunning: true, message: '终端正在打开，请稍候。' }); return; }
-          const service = await ensureService(cwd);
-          const result = process.mode === 'background'
-            ? await handoffToTerminal(cwd, { openTerminal: launch, shutdown: path => action(path, 'handoff') })
-            : await launch(cwd);
-          launching.set(id, Date.now() + 10_000);
-          json(response, { ...result, service });
-        });
+      if (method === 'POST' && parts.length === 4 && ['open', 'start', 'new-session'].includes(parts[3]!)) {
+        const body = await readBody(request);
+        if (Object.keys(body).some(key => key !== 'freshSession')
+          || (body.freshSession !== undefined && typeof body.freshSession !== 'boolean')) throw new HttpError(400, '终端参数无效。');
+        const fresh = parts[3] === 'new-session' || body.freshSession === true;
+        await exclusive(`run:${id}`, async () => { json(response, await openSession(id, fresh)); });
         return;
       }
       if (method === 'POST' && parts.length === 4 && ['recover', 'snowluma'].includes(parts[3]!)) {
@@ -328,33 +379,13 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
         else json(response, await manual(cwd));
         return;
       }
-      if (method === 'POST' && parts.length === 4 && ['start', 'pause', 'resume', 'stop'].includes(parts[3]!)) {
+      if (method === 'POST' && parts.length === 4 && ['pause', 'resume', 'stop'].includes(parts[3]!)) {
         await readBody(request);
         await exclusive(`run:${id}`, async () => {
-          if (parts[3] === 'start') {
-            if (!(await loadConfig(cwd))!.conversations.length) throw new HttpError(400,'请先添加至少一个对话。');
-            const service = await ensureService(cwd);
-            if (!service.ok) { json(response, { error: service.message, service }, 503); return; }
-            const result = await start(cwd);
-            const state = await runtime(cwd);
-            if (state.running && state.runtime?.paused) {
-              json(response, { ...result, ...await action(cwd, 'resume'), message: '已请求恢复本群 Pi。' });
-            } else json(response, result);
-          } else if (parts[3] === 'stop') {
-            await cancelTerminalReturn(cwd);
-            const startupDeadline = Date.now() + 10_000;
-            while (!(await getRunningOwner(cwd)).running && (await getProcessStatus(cwd)).starting) {
-              if (Date.now() >= startupDeadline) throw new HttpError(409, '后台仍在启动，尚未完成停止，请稍后重试。');
-              await delay(100);
-            }
-            if (!(await getRunningOwner(cwd)).running) {
-              await clearInterruptedWork(cwd);
-              json(response,{message:'对话组已停止。'}); return;
-            }
-            const result = await action(cwd,'shutdown');
-            const deadline = Date.now()+10_000;
-            while ((await getRunningOwner(cwd)).running && Date.now()<deadline) await delay(100);
-            json(response,{...result,message:(await getRunningOwner(cwd)).running ? '正在停止对话组，请稍候。' : '对话组已停止。'});
+          if (parts[3] === 'stop') {
+            const result = await stopSession(cwd);
+            launching.delete(id);
+            json(response, { ...result, message: '对话组已停止。' });
           } else {
             const requested = parts[3] as 'pause' | 'resume';
             const state = await runtime(cwd);

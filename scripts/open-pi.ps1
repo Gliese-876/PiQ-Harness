@@ -12,3 +12,4 @@ Set-Location -LiteralPath $GroupDirectory
 if ($LASTEXITCODE -ne 0) {
   Write-Host ('PiQ exited with code ' + $LASTEXITCODE) -ForegroundColor Yellow
 }
+exit $LASTEXITCODE

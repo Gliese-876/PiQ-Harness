@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { link, lstat, mkdir, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -8,6 +7,7 @@ import { loadConfig } from './config.ts';
 
 interface Lease {
   version: 1;
+  kind?: 'terminal-only';
   token: string;
   createdAt: number;
   launcherPid: number;
@@ -15,6 +15,7 @@ interface Lease {
   wrapperPid?: number;
   piPid?: number;
   ownerToken?: string;
+  recoveryDisabled?: boolean;
   state: 'starting' | 'watching' | 'recovering' | 'error';
 }
 
@@ -42,7 +43,8 @@ export interface TerminalMonitorOptions {
 
 const LEASE = 'terminal-return.json';
 const LOCK = 'terminal-return.lock';
-const SAFE_ERROR = '终端关闭后的后台恢复失败，请在 WebUI 重新启动本对话组。';
+const SAFE_ERROR = '终端启动记录无效，请检查 .piq/terminal-return.json。';
+export const TERMINAL_START_TIMEOUT_MS = 30_000;
 const missing = (error: unknown) => (error as NodeJS.ErrnoException)?.code === 'ENOENT';
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const pid = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0;
@@ -61,13 +63,13 @@ async function directoryFor(cwd: string, create = false): Promise<string> {
   const resolved = await realpath(directory);
   const part = relative(root, resolved);
   if (!entry.isDirectory() || entry.isSymbolicLink() || part === '..' || part.startsWith('../') || part.startsWith('..\\') || isAbsolute(part)) {
-    throw new Error('终端恢复记录必须位于本对话组的普通 .piq 目录。');
+    throw new Error('终端启动记录必须位于本对话组的普通 .piq 目录。');
   }
   return directory;
 }
 
 async function ordinaryFile(path: string): Promise<void> {
-  try { const entry = await lstat(path); if (!entry.isFile() || entry.isSymbolicLink()) throw new Error('终端恢复记录必须使用普通文件。'); }
+  try { const entry = await lstat(path); if (!entry.isFile() || entry.isSymbolicLink()) throw new Error('终端启动记录必须使用普通文件。'); }
   catch (error) { if (!missing(error)) throw error; }
 }
 
@@ -84,7 +86,7 @@ async function fileTransition<T>(operation: () => Promise<T>): Promise<T> {
 async function json(path: string): Promise<unknown | null> {
   return fileTransition(async () => {
     await ordinaryFile(path);
-    try { if ((await lstat(path)).size > 16_384) throw new Error('终端恢复记录过大。'); return JSON.parse(await readFile(path, 'utf8')); }
+    try { if ((await lstat(path)).size > 16_384) throw new Error('终端启动记录过大。'); return JSON.parse(await readFile(path, 'utf8')); }
     catch (error) { if (missing(error)) return null; throw error; }
   });
 }
@@ -111,50 +113,38 @@ async function leaseAt(directory: string): Promise<Lease | null> {
   if (value === null) return null;
   if (!object(value) || value.version !== 1 || typeof value.token !== 'string' || !value.token
     || !pid(value.launcherPid) || typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt)
+    || (value.kind !== undefined && value.kind !== 'terminal-only')
+    || (value.recoveryDisabled !== undefined && typeof value.recoveryDisabled !== 'boolean')
     || !['starting', 'watching', 'recovering', 'error'].includes(String(value.state))
-    || [value.monitorPid, value.wrapperPid, value.piPid].some(value => value !== undefined && !pid(value))
-    || (value.ownerToken !== undefined && typeof value.ownerToken !== 'string')) throw new Error('终端恢复记录无效，请检查 .piq/terminal-return.json。');
+    || [value.monitorPid, value.wrapperPid, value.piPid].some(value => value !== undefined && !pid(value))) {
+    throw new Error(SAFE_ERROR);
+  }
   return value as unknown as Lease;
 }
 
 async function lockAt(path: string): Promise<Lock | null> {
   const value = await json(path);
   if (value === null) return null;
-  if (!object(value) || !pid(value.pid) || typeof value.token !== 'string' || !value.token) throw new Error('终端恢复锁无效。');
+  if (!object(value) || !pid(value.pid) || typeof value.token !== 'string' || !value.token) throw new Error('终端启动锁无效。');
   return value as unknown as Lock;
 }
 
-// Publish a complete immutable lock atomically; readers never see a partially written JSON file.
 async function claim(path: string, owner: Lock): Promise<void> {
-  await fileTransition(() => ordinaryFile(path));
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  let claimed = false;
-  try {
-    const handle = await open(temporary, 'wx', 0o600);
-    try { await handle.writeFile(JSON.stringify(owner)); await handle.sync(); }
-    finally { await handle.close(); }
-    await fileTransition(() => link(temporary, path));
-    claimed = true;
-  } finally {
-    try { await fileTransition(() => unlink(temporary)); }
-    catch (error) {
-      if (!missing(error)) {
-        // A cleanup failure must not leave a lock that the caller thinks it never acquired.
-        if (claimed) await fileTransition(() => unlink(path));
-        throw error;
-      }
-    }
-  }
+  await ordinaryFile(path);
+  const file = await open(path, 'wx', 0o600);
+  try { await file.writeFile(JSON.stringify(owner)); await file.sync(); }
+  finally { await file.close(); }
 }
 
-async function withLeaseLock<T>(directory: string, operation: () => Promise<T>): Promise<T> {
-  const filename = join(directory, LOCK);
+async function withLock<T>(filename: string, operation: () => Promise<T>): Promise<T> {
   const owner = { pid: process.pid, token: randomUUID() };
-  const deadline = Date.now() + 45_000;
+  const deadline = Date.now() + 5_000;
   while (true) {
     try { await claim(filename, owner); break; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-    const existing = await lockAt(filename);
+    let existing: Lock | null;
+    try { existing = await lockAt(filename); }
+    catch (error) { if (!(error instanceof SyntaxError)) throw error; existing = null; }
     if (existing && !alive(existing.pid)) {
       const recovery = `${filename}.recover`;
       let recovered = false;
@@ -168,158 +158,110 @@ async function withLeaseLock<T>(directory: string, operation: () => Promise<T>):
         continue;
       }
     }
-    if (Date.now() >= deadline) throw new Error('终端恢复操作仍在进行，请稍后重试。');
+    if (Date.now() >= deadline) throw new Error('本组正在启动或进行管理操作，请稍后重试。');
     await delay(20);
   }
   try { return await operation(); }
   finally { if ((await lockAt(filename))?.token === owner.token) await fileTransition(() => unlink(filename)); }
 }
 
-async function launchMonitor(specification: TerminalMonitorLaunch): Promise<{ pid: number }> {
-  return new Promise((resolveLaunch, reject) => {
-    const child = spawn(specification.command, specification.args, { cwd: specification.cwd, env: specification.env,
-      detached: true, windowsHide: true, stdio: 'ignore', shell: false });
-    child.once('error', () => reject(new Error('无法启动终端后台恢复监控。')));
-    child.once('spawn', () => { if (!child.pid) { reject(new Error('终端恢复监控未返回进程标识。')); return; } child.unref(); resolveLaunch({ pid: child.pid }); });
-  });
+export async function withTerminalStartupLock<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+  return withLock(join(await directoryFor(cwd, true), 'start.lock'), operation);
 }
 
-export async function prepareTerminalReturn(cwd: string, options: TerminalReturnOptions = {}): Promise<{ token: string; alreadyRunning?: boolean }> {
+function status(lease: Lease | null): { running: boolean; starting: boolean; pid: number | null } {
+  if (!lease) return { running: false, starting: false, pid: null };
+  if (alive(lease.piPid)) return { running: true, starting: false, pid: lease.piPid! };
+  if (alive(lease.wrapperPid)) return { running: false, starting: true, pid: lease.wrapperPid! };
+  const starting = lease.kind === 'terminal-only'
+    ? lease.state === 'starting' && Date.now() - lease.createdAt < TERMINAL_START_TIMEOUT_MS && alive(lease.launcherPid)
+    : lease.state !== 'error' && (alive(lease.monitorPid) || alive(lease.launcherPid));
+  return { running: false, starting, pid: starting ? lease.monitorPid ?? lease.launcherPid : null };
+}
+
+/** A launch lease only. No detached monitor or background recovery is created. */
+export async function prepareTerminalReturn(cwd: string, _options: TerminalReturnOptions = {}): Promise<{ token: string; alreadyRunning?: boolean }> {
   const root = await realpath(resolve(cwd));
   const config = await loadConfig(root);
   if (!config?.conversations.length) throw new Error('请先配置本对话组的对话，再打开终端。');
   const directory = await directoryFor(root, true);
-  const prepared = await withLeaseLock(directory, async () => {
+  return withLock(join(directory, LOCK), async () => {
     const existing = await leaseAt(directory);
-    if (existing && existing.state !== 'error' && (alive(existing.monitorPid) || alive(existing.wrapperPid) || alive(existing.piPid))) {
-      return { token: existing.token, alreadyRunning: true };
-    }
-    const lease: Lease = { version: 1, token: randomUUID(), createdAt: Date.now(), launcherPid: process.pid, state: 'starting' };
+    const current = status(existing);
+    if (existing && (current.running || current.starting)) return { token: existing.token, alreadyRunning: true };
+    const lease: Lease = { version: 1, kind: 'terminal-only', token: randomUUID(), createdAt: Date.now(), launcherPid: process.pid, state: 'starting' };
     await write(join(directory, LEASE), lease);
-    try {
-      const child = await (options.launch ?? launchMonitor)({ command: process.execPath,
-        args: [fileURLToPath(import.meta.url), root], cwd: root,
-        env: { ...(options.env ?? process.env), PIQ_TERMINAL_RETURN_TOKEN: lease.token } });
-      if (!pid(child.pid)) throw new Error('Invalid monitor PID.');
-      lease.monitorPid = child.pid;
-      await write(join(directory, LEASE), lease);
-    } catch { await write(join(directory, LEASE), { ...lease, state: 'error' }); throw new Error('无法启动终端后台恢复监控。'); }
-    return { token: lease.token, alreadyRunning: false };
+    return { token: lease.token };
   });
-  if (prepared.alreadyRunning) return prepared;
-  const deadline = Date.now() + (options.readyTimeoutMs ?? 5_000);
-  while (true) {
-    const current = await withLeaseLock(directory, () => leaseAt(directory));
-    if (current?.token !== prepared.token || current.state === 'error') throw new Error('终端后台恢复监控未能启动。');
-    if (current.state === 'watching' && alive(current.monitorPid)) return { token: prepared.token };
-    if (!alive(current.monitorPid) || Date.now() >= deadline) {
-      await withLeaseLock(directory, async () => { const lease = await leaseAt(directory); if (lease?.token === prepared.token) await write(join(directory, LEASE), { ...lease, state: 'error' }); });
-      throw new Error('终端后台恢复监控未能启动。');
-    }
-    await delay(20);
-  }
 }
 
 export async function registerTerminal(cwd: string, token: string, wrapperPid = process.pid, piPid?: number): Promise<void> {
   if (!token || !pid(wrapperPid) || (piPid !== undefined && !pid(piPid))) throw new Error('终端进程登记无效。');
   const directory = await directoryFor(cwd);
-  await withLeaseLock(directory, async () => {
+  await withLock(join(directory, LOCK), async () => {
     const lease = await leaseAt(directory);
-    if (!lease || lease.token !== token || !['starting', 'watching'].includes(lease.state)) throw new Error('终端恢复登记已失效，请从 WebUI 重新打开。');
+    if (!lease || lease.token !== token || !['starting', 'watching'].includes(lease.state)
+      || (lease.kind === 'terminal-only' && lease.state === 'starting' && Date.now() - lease.createdAt >= TERMINAL_START_TIMEOUT_MS)
+      || (lease.kind === 'terminal-only' && lease.state === 'watching' && !alive(lease.wrapperPid) && !alive(lease.piPid))) {
+      throw new Error('终端启动登记已失效，请从 WebUI 重新打开。');
+    }
     if (lease.wrapperPid !== undefined && lease.wrapperPid !== wrapperPid) throw new Error('本次终端已由另一进程接管。');
     if (lease.piPid !== undefined && piPid !== undefined && lease.piPid !== piPid) throw new Error('本次终端的 Pi 进程已登记。');
-    await write(join(directory, LEASE), { ...lease, wrapperPid, ...(piPid === undefined ? {} : { piPid }) });
+    await write(join(directory, LEASE), { ...lease, state: 'watching', wrapperPid, ...(piPid === undefined ? {} : { piPid }) });
   });
 }
 
 export async function cancelTerminalReturn(cwd: string, expectedToken?: string): Promise<void> {
   let directory: string;
   try { directory = await directoryFor(cwd); } catch (error) { if (missing(error)) return; throw error; }
-  await withLeaseLock(directory, async () => {
+  await withLock(join(directory, LOCK), async () => {
     const lease = await leaseAt(directory);
     if (lease && (expectedToken === undefined || lease.token === expectedToken)) await fileTransition(() => unlink(join(directory, LEASE)));
   });
 }
 
+/** Stop old recovery and late registration while retaining every PID until it exits. */
+export async function disableTerminalRecovery(cwd: string, expectedToken?: string): Promise<string | undefined> {
+  let directory: string;
+  try { directory = await directoryFor(cwd); } catch (error) { if (missing(error)) return; throw error; }
+  return withLock(join(directory, LOCK), async () => {
+    const lease = await leaseAt(directory);
+    if (!lease || (expectedToken !== undefined && lease.token !== expectedToken)) return;
+    await write(join(directory, LEASE), { ...lease, state: 'error', recoveryDisabled: true });
+    return lease.token;
+  });
+}
+
+/** A wrapper may exit before a custom launcher child; keep that actual Pi trace alive. */
+export async function finishTerminal(cwd: string, expectedToken: string): Promise<void> {
+  let directory: string;
+  try { directory = await directoryFor(cwd); } catch (error) { if (missing(error)) return; throw error; }
+  await withLock(join(directory, LOCK), async () => {
+    const lease = await leaseAt(directory);
+    if (!lease || lease.token !== expectedToken) return;
+    if (alive(lease.piPid)) {
+      await write(join(directory, LEASE), { ...lease, state: 'error', recoveryDisabled: true });
+    } else await fileTransition(() => unlink(join(directory, LEASE)));
+  });
+}
+
+export async function getTerminalLaunchStatus(cwd: string): Promise<{ running: boolean; starting: boolean; pid: number | null }> {
+  try { return status(await leaseAt(await directoryFor(cwd))); }
+  catch (error) { if (missing(error)) return { running: false, starting: false, pid: null }; throw error; }
+}
+
 export async function getTerminalReturnError(cwd: string): Promise<string | undefined> {
-  // Status reads may run inside recovery's lock through startGroup/getProcessStatus.
-  try { const lease = await leaseAt(await directoryFor(cwd)); return lease?.state === 'error' ? SAFE_ERROR : undefined; }
+  try { const lease = await leaseAt(await directoryFor(cwd)); return lease?.state === 'error' && !lease.recoveryDisabled ? SAFE_ERROR : undefined; }
   catch (error) { if (missing(error)) return undefined; return SAFE_ERROR; }
 }
 
-async function ownerAt(directory: string): Promise<{ pid: number; token: string } | null> {
-  let value: unknown;
-  for (let attempt = 0; ; attempt++) {
-    try { value = await json(join(directory, 'owner.lock')); break; }
-    catch (error) { if (!(error instanceof SyntaxError) || attempt >= 3) throw error; await delay(20); }
-  }
-  if (value === null) return null;
-  if (!object(value) || value.version !== 1 || !pid(value.pid) || typeof value.token !== 'string') throw new Error('Pi 运行锁无效。');
-  return alive(value.pid) ? { pid: value.pid, token: value.token } : null;
-}
-
+/** Compatibility for an old launcher: retiring its marker can never restart Pi. */
 export async function runTerminalMonitor(cwd: string, options: TerminalMonitorOptions = {}): Promise<void> {
   const token = options.token ?? process.env.PIQ_TERMINAL_RETURN_TOKEN;
-  if (!token) throw new Error('终端恢复监控缺少登记标识。');
-  const root = await realpath(resolve(cwd));
-  const config = await loadConfig(root);
-  if (!config?.conversations.length) throw new Error('终端恢复监控的对话组配置无效。');
-  const directory = await directoryFor(root);
-  const interval = options.pollMs ?? 250;
-  const registrationTimeout = options.registrationTimeoutMs ?? 30_000;
-  if (!Number.isSafeInteger(interval) || interval < 1 || !Number.isSafeInteger(registrationTimeout) || registrationTimeout < 1) throw new Error('终端恢复监控的等待时间无效。');
-  const ready = await withLeaseLock(directory, async () => {
-    const lease = await leaseAt(directory);
-    if (!lease || lease.token !== token || lease.state === 'error' || (lease.monitorPid !== undefined && lease.monitorPid !== process.pid)) return false;
-    await write(join(directory, LEASE), { ...lease, monitorPid: process.pid, state: 'watching' });
-    return true;
-  });
-  if (!ready) return;
-  let unregisteredOwnerSince: number | undefined;
-  const ownerRegistrationGrace = Math.min(registrationTimeout, 3_000);
-  try {
-    while (true) {
-      const lease = await withLeaseLock(directory, () => leaseAt(directory));
-      if (!lease || lease.token !== token || lease.state === 'error') return;
-      if (lease.wrapperPid === undefined) {
-        if (Date.now() - lease.createdAt >= registrationTimeout) { await cancelTerminalReturn(root, token); return; }
-        await delay(interval); continue;
-      }
-      const owner = await ownerAt(directory);
-      const wrapperAlive = alive(lease.wrapperPid);
-      const differentPi = owner && lease.piPid !== undefined && owner.pid !== lease.piPid;
-      const unknownOwner = owner && lease.piPid === undefined && !wrapperAlive;
-      const replacedAfterExit = owner && lease.ownerToken !== undefined && lease.ownerToken !== owner.token && !wrapperAlive;
-      if (differentPi || replacedAfterExit) {
-        await cancelTerminalReturn(root, token); return;
-      }
-      if (unknownOwner) {
-        // The console can disappear between Pi acquiring its owner and registering its real PID.
-        unregisteredOwnerSince ??= Date.now();
-        if (Date.now() - unregisteredOwnerSince >= ownerRegistrationGrace) { await cancelTerminalReturn(root, token); return; }
-        await delay(interval); continue;
-      }
-      unregisteredOwnerSince = undefined;
-      if (owner && lease.piPid === owner.pid && lease.ownerToken !== owner.token) {
-        await withLeaseLock(directory, async () => { const current = await leaseAt(directory); if (current?.token === token) await write(join(directory, LEASE), { ...current, ownerToken: owner.token }); });
-      }
-      if (wrapperAlive || alive(lease.piPid) || owner) { await delay(interval); continue; }
-      await withLeaseLock(directory, async () => {
-        const current = await leaseAt(directory);
-        if (!current || current.token !== token || current.state === 'error') return;
-        if (await ownerAt(directory)) { await fileTransition(() => unlink(join(directory, LEASE))); return; }
-        await write(join(directory, LEASE), { ...current, state: 'recovering' });
-        try {
-          const start = options.start ?? (async path => { const { startGroup } = await import('./process-manager.ts'); return startGroup(path, { preserveRunState: true }); });
-          await start(root);
-          await fileTransition(() => unlink(join(directory, LEASE)));
-        } catch { await write(join(directory, LEASE), { ...current, state: 'error' }); }
-      });
-      return;
-    }
-  } catch {
-    await withLeaseLock(directory, async () => { const lease = await leaseAt(directory); if (lease?.token === token) await write(join(directory, LEASE), { ...lease, state: 'error' }); });
-  }
+  if (!token) throw new Error('终端启动缺少登记标识。');
+  const disabled = await disableTerminalRecovery(cwd, token);
+  const current = await getTerminalLaunchStatus(cwd);
+  if (disabled && !current.running && !current.starting) await cancelTerminalReturn(cwd, token);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

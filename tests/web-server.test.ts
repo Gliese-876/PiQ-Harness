@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
 import { mkdir, mkdtemp, readFile, writeFile, rm, symlink, realpath, unlink } from 'node:fs/promises';
 import { join, relative, isAbsolute } from 'node:path';
@@ -8,6 +9,8 @@ import { test, type TestContext } from 'node:test';
 import { initializeGroup, loadConfig, type GroupConfig } from '../src/config.ts';
 import { startWebServer } from '../src/web-server.ts';
 import type { ModelCatalog } from '../src/web-models.ts';
+import { getProcessStatus } from '../src/process-manager.ts';
+import { prepareTerminalReturn, registerTerminal } from '../src/terminal-monitor.ts';
 
 interface State {
   root: string;
@@ -51,19 +54,32 @@ async function fixture(t: TestContext, catalog: ModelCatalog = { models: [] }) {
   const messageDir = join(cwd, 'messages', 'group', '123456');
   await mkdir(messageDir, { recursive: true });
   const launched: string[] = [];
-  const started: string[] = [];
+  const launchOptions: Array<{ freshSession?: boolean }> = [];
   const actions: string[] = [];
   const app = await startWebServer({
     root, port: 0,
-    openTerminal: async path => { launched.push(path); return { message: '已请求打开测试终端。' }; },
+    openTerminal: async (path, options) => { launched.push(path); launchOptions.push({ freshSession: options?.freshSession }); return { message: '已请求打开测试终端。' }; },
     credentials: async () => ({ available: true, source: '测试凭据来源' }),
     models: async () => catalog,
     ensure: async () => ({ ok: true, started: false, message: '模拟服务已连接', diagnostic: 'ready', canStart: false, canOpenManual: true }),
     manual: async () => ({ message: '已请求打开模拟恢复入口' }),
-    start: async path => { started.push(path); return { message: 'Started mock group' }; },
     action: async (path, action) => {
       actions.push(action);
-      if (action === 'shutdown' || action === 'handoff') await unlink(join(path, '.piq', 'owner.lock'));
+      if (action === 'shutdown' || action === 'handoff') {
+        await unlink(join(path, '.piq', 'owner.lock'));
+        // A legacy worker publishes its stopped state before exiting. Keep the
+        // mock's own PID alive without pretending its launch is still pending.
+        const workerPath = join(path, '.piq', 'worker.json');
+        const worker = await readFile(workerPath, 'utf8').then(JSON.parse).catch(error => {
+          if (error.code === 'ENOENT') return null; throw error;
+        });
+        const launch = await readFile(join(path, '.piq', 'worker-launch.json'), 'utf8').then(JSON.parse).catch(error => {
+          if (error.code === 'ENOENT') return null; throw error;
+        });
+        if (worker || launch) await writeFile(workerPath, JSON.stringify({
+          ...(worker ?? launch), version: 1, mode: 'background', state: 'stopped',
+        }));
+      }
       return { requestId: `mock-${action}` };
     },
   });
@@ -90,7 +106,7 @@ async function fixture(t: TestContext, catalog: ModelCatalog = { models: [] }) {
     assert.equal(response.status, 200, await response.clone().text());
     return response.json() as Promise<T>;
   }
-  return { root, cwd, messageDir, app, state, headers, launched, started, actions, call, get };
+  return { root, cwd, messageDir, app, state, headers, launched, launchOptions, actions, call, get };
 }
 
 test('WebUI exposes only local group metadata and serves its frontend with restrictive headers', async t => {
@@ -398,7 +414,7 @@ test('empty groups can be created for setup, and stop releases a live owner befo
   const { id } = await created.json() as { id: string };
   assert.match(id, /^[a-z0-9][a-z0-9_-]*$/);
   assert.equal((await f.call(`/api/groups/${id}/start`, 'POST', {})).status, 400);
-  assert.deepEqual(f.started, []);
+  assert.deepEqual(f.launched, []);
   assert.equal((await f.call(`/api/groups/${id}/stop`, 'POST', {})).status, 200);
   await mkdir(join(f.cwd, '.piq'), { recursive: true });
   await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'stop-owner' }));
@@ -475,6 +491,147 @@ test('terminal requests are deduplicated and an existing group owner is respecte
   assert.equal(active.status, 200);
   assert.equal((await active.json() as { alreadyRunning: boolean }).alreadyRunning, true);
   assert.equal(f.launched.length, 1);
+});
+
+test('start and open share one terminal launch without creating a background worker', async t => {
+  const f = await fixture(t);
+  const responses = await Promise.all([
+    f.call('/api/groups/123456/start', 'POST', {}),
+    f.call('/api/groups/123456/open', 'POST', {}),
+  ]);
+  assert.deepEqual(responses.map(response => response.status), [200, 200]);
+  assert.equal(f.launched.length, 1);
+  assert.deepEqual(f.launchOptions, [{ freshSession: false }]);
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'worker.json')), { code: 'ENOENT' });
+  assert.equal((await f.call('/api/groups/123456', 'DELETE')).status, 409, 'a pending launch cannot be moved to trash');
+});
+
+test('stop retains a live terminal without an owner lock and prevents deletion or replacement', async t => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+  await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  try {
+    assert.ok(child.pid);
+    const lease = await prepareTerminalReturn(f.cwd);
+    await registerTerminal(f.cwd, lease.token, child.pid, child.pid);
+    assert.equal((await getProcessStatus(f.cwd)).running, true);
+    const stop = await f.call('/api/groups/123456/stop', 'POST', {});
+    assert.equal(stop.status, 409, await stop.clone().text());
+    assert.equal((await getProcessStatus(f.cwd)).running, true);
+    assert.ok(await readFile(join(f.cwd, '.piq', 'terminal-return.json'), 'utf8'));
+    assert.equal((await f.call('/api/groups/123456', 'DELETE')).status, 409);
+    assert.equal((await f.call('/api/groups/123456/new-session', 'POST', {})).status, 409);
+    assert.deepEqual(f.launched, []);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise<void>(resolve => { child.once('exit', () => resolve()); });
+      child.kill();
+      await exited;
+    }
+  }
+  assert.equal((await f.call('/api/groups/123456/stop', 'POST', {})).status, 200);
+  assert.equal((await getProcessStatus(f.cwd)).running, false);
+});
+
+test('stop waits for the tracked Pi process after its owner lock is released', async t => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+  await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  try {
+    assert.ok(child.pid);
+    const lease = await prepareTerminalReturn(f.cwd);
+    await registerTerminal(f.cwd, lease.token, child.pid, child.pid);
+    await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: child.pid, token: 'exiting-owner' }));
+    let settled = false;
+    const stopping = f.call('/api/groups/123456/stop', 'POST', {}).then(response => { settled = true; return response; });
+    const deadline = Date.now() + 2_000;
+    while (!f.actions.includes('shutdown')) {
+      assert.ok(Date.now() < deadline, 'shutdown request should be issued');
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(settled, false, 'releasing owner.lock alone is not process exit');
+    assert.equal((await getProcessStatus(f.cwd)).running, true);
+    const exited = new Promise<void>(resolve => { child.once('exit', () => resolve()); });
+    child.kill(); await exited;
+    const response = await stopping;
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal((await getProcessStatus(f.cwd)).running, false);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise<void>(resolve => { child.once('exit', () => resolve()); });
+      child.kill(); await exited;
+    }
+  }
+});
+
+test('a new session stops its owner and requests fresh context while preserving local records', async t => {
+  const f = await fixture(t);
+  const directory = join(f.cwd, '.piq');
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'old-session-owner' }));
+  await writeFile(join(directory, 'run-preferences.json'), JSON.stringify({ version: 1, paused: true, interrupted: true }));
+  await mkdir(join(f.cwd, '.pi', 'sessions'), { recursive: true });
+  const previous = join(f.cwd, '.pi', 'sessions', 'previous.jsonl');
+  await writeFile(previous, 'PREVIOUS_CONTEXT');
+  await writeFile(join(f.cwd, 'MEMORY.md'), 'RETAINED_MEMORY');
+  const journal = join(f.messageDir, '2026-10-26.jsonl');
+  const contents = logLine(logRecord(1));
+  await writeFile(journal, contents);
+  const response = await f.call('/api/groups/123456/new-session', 'POST', {});
+  assert.equal(response.status, 200, await response.clone().text());
+  assert.equal((await response.json() as { freshSession: boolean }).freshSession, true);
+  assert.deepEqual(f.actions, ['shutdown']);
+  assert.deepEqual(f.launchOptions, [{ freshSession: true }]);
+  assert.equal(await readFile(previous, 'utf8'), 'PREVIOUS_CONTEXT');
+  assert.equal(await readFile(join(f.cwd, 'MEMORY.md'), 'utf8'), 'RETAINED_MEMORY');
+  assert.equal(await readFile(journal, 'utf8'), contents);
+  assert.equal(JSON.parse(await readFile(join(directory, 'run-preferences.json'), 'utf8')).interrupted, false);
+  assert.equal((await f.call('/api/groups/123456/new-session', 'POST', {})).status, 409, 'cannot replace a session still launching');
+});
+
+test('recycle bin endpoints preserve the whole group and restore it with its original identity', async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.cwd, 'MEMORY.md'), 'KEEP_MEMORY');
+  const journal = join(f.messageDir, '2026-10-26.jsonl');
+  const contents = logLine(logRecord(1));
+  await writeFile(journal, contents);
+  const deletedResponse = await f.call('/api/groups/123456', 'DELETE');
+  assert.equal(deletedResponse.status, 200, await deletedResponse.clone().text());
+  const deleted = await deletedResponse.json() as { token: string; recoveryPath: string; id: string };
+  assert.equal(deleted.id, '123456');
+  assert.equal((await f.get<State>('/api/state')).groups.length, 0);
+  const trash = await f.get<{ entries: Array<{ token: string; id: string; name: string; deletedAt: number }> }>('/api/trash');
+  assert.equal(trash.entries.length, 1);
+  assert.equal(trash.entries[0]!.token, deleted.token);
+  assert.equal(trash.entries[0]!.name, 'Test conversation group');
+  assert.equal(await readFile(join(deleted.recoveryPath, 'MEMORY.md'), 'utf8'), 'KEEP_MEMORY');
+  const restored = await f.call(`/api/trash/${encodeURIComponent(deleted.token)}/restore`, 'POST', {});
+  assert.equal(restored.status, 200, await restored.clone().text());
+  assert.equal((await restored.json() as { id: string }).id, '123456');
+  assert.equal(await readFile(join(f.cwd, 'MEMORY.md'), 'utf8'), 'KEEP_MEMORY');
+  assert.equal(await readFile(journal, 'utf8'), contents);
+  assert.deepEqual(await f.get('/api/trash'), { entries: [] });
+});
+
+test('trash mutations require local authorization and restoration refuses assignment conflicts', async t => {
+  const f = await fixture(t);
+  const unauthorized = await fetch(`${f.app.url}/api/groups/123456`, { method: 'DELETE' });
+  assert.equal(unauthorized.status, 403);
+  await mkdir(join(f.cwd, '.piq'), { recursive: true });
+  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'live-owner' }));
+  assert.equal((await f.call('/api/groups/123456', 'DELETE')).status, 409);
+  await unlink(join(f.cwd, '.piq', 'owner.lock'));
+  const deleted = await (await f.call('/api/groups/123456', 'DELETE')).json() as { token: string; recoveryPath: string };
+  const endpoint = `/api/trash/${encodeURIComponent(deleted.token)}/restore`;
+  assert.equal((await fetch(f.app.url + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403);
+  for (const token of ['..', '..%2F123456', '..%5C123456', 'invalid']) {
+    assert.ok([400, 404].includes((await f.call(`/api/trash/${token}/restore`, 'POST', {})).status));
+  }
+  await initializeGroup(f.root, 'replacement', { name: 'New owner', conversations: [{ type: 'group', id: '123456' }] });
+  assert.equal((await f.call(endpoint, 'POST', {})).status, 409);
+  assert.equal((await f.get<{ entries: unknown[] }>('/api/trash')).entries.length, 1);
+  assert.ok(await readFile(join(deleted.recoveryPath, 'PIQ.md'), 'utf8'));
 });
 
 test('foreign origins, missing CSRF tokens, spoofed hosts and escaped paths are rejected', async t => {

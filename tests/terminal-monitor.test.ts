@@ -2,283 +2,233 @@ import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { initializeGroup } from '../src/config.ts';
-import { cancelTerminalReturn, getTerminalReturnError, prepareTerminalReturn, registerTerminal, runTerminalMonitor,
-  type TerminalMonitorLaunch, type TerminalMonitorOptions } from '../src/terminal-monitor.ts';
-
-const moduleUrl = new URL('../src/terminal-monitor.ts', import.meta.url).href;
-
-async function eventually(check: () => boolean | Promise<boolean>, timeout = 5_000): Promise<void> {
-  const deadline = Date.now() + timeout;
-  while (!await check()) { if (Date.now() > deadline) assert.fail('Timed out waiting for terminal monitor.'); await delay(10); }
-}
-
-async function fixture(t: TestContext) {
-  const parent = resolve('.test-tmp'); await mkdir(parent, { recursive: true });
-  const root = await mkdtemp(join(parent, 'terminal-monitor-'));
-  const cwd = await initializeGroup(root, 'friends', { name: 'Friends', conversations: [{ type: 'group', id: '123456' }] });
-  await mkdir(join(cwd, '.piq'), { recursive: true });
-  const stateFile = join(cwd, '.piq', 'terminal-return.json');
-  const tasks: Promise<void>[] = [];
-  const children: ChildProcess[] = [];
-  let starts = 0;
-  const launches: TerminalMonitorLaunch[] = [];
-  const prepare = async (options: TerminalMonitorOptions = {}) => prepareTerminalReturn(cwd, {
-    env: { SNOWLUMA_ACCESS_TOKEN: 'fake-private-token' }, readyTimeoutMs: 2_000,
-    launch: async specification => {
-      launches.push(specification);
-      const task = runTerminalMonitor(cwd, { token: specification.env.PIQ_TERMINAL_RETURN_TOKEN,
-        pollMs: 5, registrationTimeoutMs: 2_000, start: async () => { starts++; }, ...options });
-      tasks.push(task);
-      return { pid: process.pid };
-    },
-  });
-  const state = async () => { try { return JSON.parse(await readFile(stateFile, 'utf8')); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; } };
-  const child = async () => {
-    const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
-    children.push(child);
-    await new Promise<void>((resolveChild, reject) => { child.once('spawn', resolveChild); child.once('error', reject); });
-    return child;
-  };
-  t.after(async () => {
-    await cancelTerminalReturn(cwd).catch(() => {});
-    for (const child of children) { if (child.exitCode === null) child.kill(); }
-    await Promise.all(tasks);
-    await rm(root, { recursive: true, force: true });
-  });
-  return { cwd, root, stateFile, state, prepare, child, launches, tasks, starts: () => starts };
-}
+import { cancelTerminalReturn, disableTerminalRecovery, getTerminalLaunchStatus, getTerminalReturnError, prepareTerminalReturn,
+  registerTerminal, runTerminalMonitor, TERMINAL_START_TIMEOUT_MS } from '../src/terminal-monitor.ts';
 
 async function stopChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   await new Promise<void>(resolveStop => { child.once('exit', () => resolveStop()); child.kill(); });
 }
 
-test('prepares one monitor per group and keeps credentials and lease identifiers out of arguments', async t => {
+async function fixture(t: TestContext) {
+  const parent = resolve('.test-tmp'); await mkdir(parent, { recursive: true });
+  const root = await mkdtemp(join(parent, 'terminal-lease-'));
+  const cwd = await initializeGroup(root, 'friends', { name: 'Friends', conversations: [{ type: 'group', id: '123456' }] });
+  await mkdir(join(cwd, '.piq'), { recursive: true });
+  const stateFile = join(cwd, '.piq', 'terminal-return.json');
+  const children: ChildProcess[] = [];
+  const child = async () => {
+    const processChild = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
+    children.push(processChild);
+    await new Promise<void>((resolveChild, reject) => { processChild.once('spawn', resolveChild); processChild.once('error', reject); });
+    return processChild;
+  };
+  const state = async () => JSON.parse(await readFile(stateFile, 'utf8'));
+  t.after(async () => {
+    await Promise.all(children.map(stopChild));
+    await rm(root, { recursive: true, force: true });
+  });
+  return { root, cwd, stateFile, state, child };
+}
+
+test('preparing concurrent terminals publishes one lease without launching a monitor', async t => {
   const f = await fixture(t);
-  const results = await Promise.all([f.prepare(), f.prepare()]);
-  assert.equal(f.launches.length, 1);
-  assert.equal(results[0].token, results[1].token);
-  assert.equal(results.filter(result => result.alreadyRunning).length, 1);
-  const specification = f.launches[0]!;
-  assert.equal(specification.env.SNOWLUMA_ACCESS_TOKEN, 'fake-private-token');
-  assert.equal(specification.env.PIQ_TERMINAL_RETURN_TOKEN, results[0].token);
-  assert.doesNotMatch(JSON.stringify(specification.args), /fake-private-token/);
-  assert.equal(specification.args.includes(results[0].token), false);
-  assert.doesNotMatch(await readFile(f.stateFile, 'utf8'), /fake-private-token/);
-  assert.equal((await f.state()).state, 'watching');
+  let monitorLaunches = 0;
+  const prepare = () => prepareTerminalReturn(f.cwd, {
+    env: { SNOWLUMA_ACCESS_TOKEN: 'private-test-token' },
+    launch: async () => { monitorLaunches++; return { pid: process.pid }; },
+  });
+  const prepared = await Promise.all([prepare(), prepare()]);
+  assert.equal(prepared[0].token, prepared[1].token);
+  assert.equal(prepared.filter(item => item.alreadyRunning).length, 1);
+  assert.equal(monitorLaunches, 0);
+  const stored = await f.state();
+  assert.equal(stored.kind, 'terminal-only'); assert.equal(stored.state, 'starting');
+  assert.equal(stored.monitorPid, undefined);
+  assert.doesNotMatch(await readFile(f.stateFile, 'utf8'), /private-test-token|SNOWLUMA_ACCESS_TOKEN/);
+  assert.deepEqual(await getTerminalLaunchStatus(f.cwd), { running: false, starting: true, pid: process.pid });
 });
 
-test('a terminal exits before acquiring a Pi owner and returns to the background once', async t => {
+test('closing a terminal before Pi registers does not start a background process', async t => {
   const f = await fixture(t);
-  const prepared = await f.prepare();
+  const prepared = await prepareTerminalReturn(f.cwd);
   const wrapper = await f.child();
   await registerTerminal(f.cwd, prepared.token, wrapper.pid);
-  await delay(25);
-  assert.equal(f.starts(), 0);
+  const active = await getTerminalLaunchStatus(f.cwd);
+  assert.equal(active.running || active.starting, true);
+  assert.equal(active.pid, wrapper.pid);
   await stopChild(wrapper);
-  await Promise.all(f.tasks);
-  assert.equal(f.starts(), 1);
-  assert.equal(await f.state(), null);
+  assert.deepEqual(await getTerminalLaunchStatus(f.cwd), { running: false, starting: false, pid: null });
+  assert.equal((await f.state()).launcherPid, process.pid, 'a still-open WebUI must not keep the closed terminal running');
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'worker.json')), { code: 'ENOENT' });
+  const next = await prepareTerminalReturn(f.cwd);
+  assert.notEqual(next.token, prepared.token);
+  assert.notEqual(next.alreadyRunning, true);
 });
 
-test('recovery waits for both the terminal wrapper and its Pi process to exit', async t => {
+test('terminal status tracks both wrapper and real Pi without any automatic restart', async t => {
   const f = await fixture(t);
-  const prepared = await f.prepare();
+  const prepared = await prepareTerminalReturn(f.cwd);
   const wrapper = await f.child(); const pi = await f.child();
   await registerTerminal(f.cwd, prepared.token, wrapper.pid, pi.pid);
   await stopChild(wrapper);
-  await delay(40);
-  assert.equal(f.starts(), 0);
+  assert.deepEqual(await getTerminalLaunchStatus(f.cwd), { running: true, starting: false, pid: pi.pid });
   await stopChild(pi);
-  await Promise.all(f.tasks);
-  assert.equal(f.starts(), 1);
+  assert.deepEqual(await getTerminalLaunchStatus(f.cwd), { running: false, starting: false, pid: null });
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'worker-launch.json')), { code: 'ENOENT' });
 });
 
-test('closing before real Pi PID registration waits for owner cleanup then recovers once', async t => {
+test('an unopened terminal lease expires and cannot register after its deadline', async t => {
   const f = await fixture(t);
-  const prepared = await f.prepare();
-  const wrapper = await f.child(); const pi = await f.child();
-  await registerTerminal(f.cwd, prepared.token, wrapper.pid);
-  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: pi.pid, token: 'registering-owner' }));
-  await stopChild(wrapper);
-  await delay(60);
-  assert.equal(f.starts(), 0);
-  assert.equal((await f.state()).state, 'watching');
-  await stopChild(pi);
-  await Promise.all(f.tasks);
-  assert.equal(f.starts(), 1);
-  assert.equal(await f.state(), null);
+  const prepared = await prepareTerminalReturn(f.cwd);
+  await writeFile(f.stateFile, JSON.stringify({ ...await f.state(), createdAt: Date.now() - TERMINAL_START_TIMEOUT_MS - 1 }));
+  assert.deepEqual(await getTerminalLaunchStatus(f.cwd), { running: false, starting: false, pid: null });
+  await assert.rejects(registerTerminal(f.cwd, prepared.token), /失效/);
+  const retry = await prepareTerminalReturn(f.cwd);
+  assert.notEqual(retry.token, prepared.token);
 });
 
-test('a still-unregistered live owner outlasting the short grace makes the monitor yield', async t => {
+test('registration preserves process identity across reload and rejects another owner', async t => {
   const f = await fixture(t);
-  const prepared = await f.prepare({ registrationTimeoutMs: 1_000 });
-  const wrapper = await f.child(); const unrelatedPi = await f.child();
-  await registerTerminal(f.cwd, prepared.token, wrapper.pid);
-  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: unrelatedPi.pid, token: 'unregistered-owner' }));
-  await stopChild(wrapper);
-  await Promise.all(f.tasks);
-  assert.equal(f.starts(), 0);
-  assert.equal(await f.state(), null);
-  assert.equal(unrelatedPi.exitCode, null);
-  assert.equal(unrelatedPi.signalCode, null);
-});
-
-test('explicit cancellation suppresses recovery and stale tokens cannot affect a replacement', async t => {
-  const f = await fixture(t);
-  const first = await f.prepare();
-  await registerTerminal(f.cwd, first.token);
-  await cancelTerminalReturn(f.cwd);
-  await f.tasks[0];
-  assert.equal(f.starts(), 0);
-  const second = await f.prepare();
-  assert.notEqual(second.token, first.token);
-  await cancelTerminalReturn(f.cwd, first.token);
-  assert.equal((await f.state()).token, second.token);
-  await assert.rejects(registerTerminal(f.cwd, first.token), /失效/);
-  await registerTerminal(f.cwd, second.token);
-  await cancelTerminalReturn(f.cwd, second.token);
-  await Promise.all(f.tasks);
-  assert.equal(f.starts(), 0);
-});
-
-test('rapid concurrent open, registration and cancellation tolerate file lock transitions', async t => {
-  const f = await fixture(t);
-  for (let round = 0; round < 20; round++) {
-    const prepared = await f.prepare();
-    const results = await Promise.all([
-      registerTerminal(f.cwd, prepared.token), f.prepare(), f.prepare(),
-      getTerminalReturnError(f.cwd), getTerminalReturnError(f.cwd),
-    ]);
-    assert.equal(results[1]!.token, prepared.token);
-    assert.equal(results[2]!.alreadyRunning, true);
-    assert.equal(results[3], undefined);
-    assert.equal(results[4], undefined);
-    await Promise.all([cancelTerminalReturn(f.cwd, prepared.token), cancelTerminalReturn(f.cwd, prepared.token), getTerminalReturnError(f.cwd)]);
-    await f.tasks[round];
-  }
-  assert.equal(f.launches.length, 20);
-  assert.equal(f.starts(), 0);
-  assert.equal(await f.state(), null);
-});
-
-test('cancellation waits for an in-progress recovery so its caller can stop the new owner', async t => {
-  const f = await fixture(t);
-  let entered = false; let release!: () => void;
-  const gate = new Promise<void>(resolveGate => { release = resolveGate; });
-  const prepared = await f.prepare({ start: async () => { assert.equal(await getTerminalReturnError(f.cwd), undefined); entered = true; await gate; } });
-  const wrapper = await f.child();
-  await registerTerminal(f.cwd, prepared.token, wrapper.pid);
-  await stopChild(wrapper);
-  await eventually(() => entered);
-  let cancelled = false;
-  const cancelling = cancelTerminalReturn(f.cwd).then(() => { cancelled = true; });
-  await delay(35);
-  assert.equal(cancelled, false);
-  release();
-  await cancelling;
-  await Promise.all(f.tasks);
-  assert.equal(cancelled, true);
-  assert.equal(await f.state(), null);
-});
-
-test('a different live Pi owner makes an old monitor yield without restarting or stopping it', async t => {
-  const f = await fixture(t);
-  const prepared = await f.prepare();
-  const wrapper = await f.child(); const oldPi = await f.child();
-  await stopChild(oldPi);
-  await registerTerminal(f.cwd, prepared.token, wrapper.pid, oldPi.pid);
-  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'different-owner' }));
-  await Promise.all(f.tasks);
-  assert.equal(f.starts(), 0);
-  assert.equal(await f.state(), null);
-  assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'owner.lock'), 'utf8')).token, 'different-owner');
-});
-
-test('an owner lock being written does not permanently fail the monitor', async t => {
-  const f = await fixture(t);
-  const prepared = await f.prepare();
-  const wrapper = await f.child();
-  await registerTerminal(f.cwd, prepared.token, wrapper.pid, wrapper.pid);
-  const ownerFile = join(f.cwd, '.piq', 'owner.lock');
-  await writeFile(ownerFile, '');
-  await delay(20);
-  await writeFile(ownerFile, JSON.stringify({ version: 1, pid: wrapper.pid, token: 'new-owner' }));
-  await delay(80);
-  assert.equal(await getTerminalReturnError(f.cwd), undefined);
-  assert.equal((await f.state()).state, 'watching');
-  await stopChild(wrapper);
-  await Promise.all(f.tasks);
-  assert.equal(f.starts(), 1);
-});
-
-test('native reloads can replace the owner token in the same Pi process without losing background return', async t => {
-  const f = await fixture(t);
-  const prepared = await f.prepare();
-  const wrapper = await f.child(); const pi = await f.child();
+  const prepared = await prepareTerminalReturn(f.cwd);
+  const wrapper = await f.child(); const pi = await f.child(); const other = await f.child();
   await registerTerminal(f.cwd, prepared.token, wrapper.pid, pi.pid);
-  const ownerFile = join(f.cwd, '.piq', 'owner.lock');
-  await writeFile(ownerFile, JSON.stringify({ version: 1, pid: pi.pid, token: 'before-reload' }));
-  await eventually(async () => (await f.state())?.ownerToken === 'before-reload');
-  await writeFile(ownerFile, JSON.stringify({ version: 1, pid: pi.pid, token: 'after-reload' }));
-  await eventually(async () => (await f.state())?.ownerToken === 'after-reload');
-  assert.equal(await getTerminalReturnError(f.cwd), undefined);
-  await stopChild(wrapper); await stopChild(pi);
-  await Promise.all(f.tasks);
-  assert.equal(f.starts(), 1);
-  assert.equal(await f.state(), null);
-});
-
-test('failed background startup is bounded and exposes only a safe generic diagnostic', async t => {
-  const f = await fixture(t);
-  let attempts = 0;
-  const prepared = await f.prepare({ start: async () => { attempts++; throw new Error('private-token https://private.example/?secret=private'); } });
-  const wrapper = await f.child();
-  await registerTerminal(f.cwd, prepared.token, wrapper.pid);
-  await stopChild(wrapper);
-  await Promise.all(f.tasks);
-  assert.equal(attempts, 1);
-  await delay(35);
-  assert.equal(attempts, 1);
-  assert.equal((await f.state()).state, 'error');
-  const diagnostic = await getTerminalReturnError(f.cwd);
-  assert.match(diagnostic!, /后台恢复失败/);
-  assert.doesNotMatch(diagnostic!, /private|token|secret/);
-  assert.doesNotMatch(await readFile(f.stateFile, 'utf8'), /private\.example|private-token/);
-});
-
-test('an unopened terminal registration expires without creating a background instance', async t => {
-  const f = await fixture(t);
-  await f.prepare({ registrationTimeoutMs: 1_000 });
-  await Promise.all(f.tasks);
-  assert.equal(f.starts(), 0);
-  assert.equal(await f.state(), null);
-});
-
-test('a dead monitor fails readiness visibly and an abandoned lock can be recovered', async t => {
-  const f = await fixture(t);
-  const dead = await f.child(); await stopChild(dead);
-  await writeFile(join(f.cwd, '.piq', 'terminal-return.lock'), JSON.stringify({ pid: dead.pid, token: 'dead-lock' }));
-  await assert.rejects(prepareTerminalReturn(f.cwd, { readyTimeoutMs: 30, launch: async () => ({ pid: dead.pid! }) }), /未能启动/);
-  assert.match((await getTerminalReturnError(f.cwd))!, /后台恢复失败/);
-  const retry = await f.prepare();
-  assert.equal((await f.state()).token, retry.token);
-});
-
-test('registration validates process identity and rejects changes to a registered Pi', async t => {
-  const f = await fixture(t);
-  const prepared = await f.prepare();
-  const wrapper = await f.child(); const other = await f.child();
-  await registerTerminal(f.cwd, prepared.token, wrapper.pid, wrapper.pid);
+  await registerTerminal(f.cwd, prepared.token, wrapper.pid, pi.pid);
+  assert.equal((await f.state()).piPid, pi.pid);
   await assert.rejects(registerTerminal(f.cwd, prepared.token, other.pid), /另一进程/);
   await assert.rejects(registerTerminal(f.cwd, prepared.token, wrapper.pid, other.pid), /已登记/);
+  await assert.rejects(registerTerminal(f.cwd, 'stale-token', wrapper.pid), /失效/);
   await assert.rejects(registerTerminal(f.cwd, prepared.token, 0), /无效/);
 });
 
-test('monitor metadata refuses links outside the group', async t => {
+test('cancellation is idempotent and stale tokens cannot remove a newer lease', async t => {
+  const f = await fixture(t);
+  const first = await prepareTerminalReturn(f.cwd);
+  await cancelTerminalReturn(f.cwd, first.token);
+  const second = await prepareTerminalReturn(f.cwd);
+  await cancelTerminalReturn(f.cwd, first.token);
+  assert.equal((await f.state()).token, second.token);
+  await Promise.all([cancelTerminalReturn(f.cwd, second.token), cancelTerminalReturn(f.cwd, second.token)]);
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' });
+});
+
+test('disabling recovery keeps live Pi and wrapper tracking until both have exited', async t => {
+  const f = await fixture(t);
+  const prepared = await prepareTerminalReturn(f.cwd);
+  const wrapper = await f.child(); const pi = await f.child();
+  await registerTerminal(f.cwd, prepared.token, wrapper.pid, pi.pid);
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'owner.lock')), { code: 'ENOENT' });
+  const token = await disableTerminalRecovery(f.cwd);
+  assert.equal(token, prepared.token);
+  const retained = await f.state();
+  assert.equal(retained.state, 'error'); assert.equal(retained.recoveryDisabled, true);
+  assert.equal(retained.wrapperPid, wrapper.pid); assert.equal(retained.piPid, pi.pid);
+  assert.equal(await getTerminalReturnError(f.cwd), undefined, 'a deliberate stop is not a startup error');
+  assert.deepEqual(await getTerminalLaunchStatus(f.cwd), { running: true, starting: false, pid: pi.pid });
+  assert.deepEqual(await prepareTerminalReturn(f.cwd), { token, alreadyRunning: true });
+  await assert.rejects(registerTerminal(f.cwd, prepared.token, wrapper.pid, pi.pid), /失效/);
+
+  await stopChild(pi);
+  const wrapperOnly = await getTerminalLaunchStatus(f.cwd);
+  assert.equal(wrapperOnly.running || wrapperOnly.starting, true);
+  assert.equal(wrapperOnly.pid, wrapper.pid);
+  assert.deepEqual(await prepareTerminalReturn(f.cwd), { token, alreadyRunning: true });
+  await stopChild(wrapper);
+  assert.deepEqual(await getTerminalLaunchStatus(f.cwd), { running: false, starting: false, pid: null });
+  await cancelTerminalReturn(f.cwd, token);
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' });
+});
+
+test('disabling a wrapper before Pi registration blocks its late registration and duplicate launch', async t => {
+  const f = await fixture(t);
+  const prepared = await prepareTerminalReturn(f.cwd);
+  const wrapper = await f.child(); const latePi = await f.child();
+  await registerTerminal(f.cwd, prepared.token, wrapper.pid);
+  const token = await disableTerminalRecovery(f.cwd);
+  assert.equal(await disableTerminalRecovery(f.cwd), token, 'repeated stop requests keep the same launch identity');
+  const active = await getTerminalLaunchStatus(f.cwd);
+  assert.equal(active.running || active.starting, true); assert.equal(active.pid, wrapper.pid);
+  assert.equal((await f.state()).piPid, undefined);
+  assert.deepEqual(await prepareTerminalReturn(f.cwd), { token, alreadyRunning: true });
+  await assert.rejects(registerTerminal(f.cwd, prepared.token, wrapper.pid, latePi.pid), /失效/);
+  assert.equal((await f.state()).piPid, undefined);
+  await stopChild(wrapper); await stopChild(latePi);
+  await cancelTerminalReturn(f.cwd, token);
+});
+
+test('disabling legacy recovery preserves its monitor identity without scheduling a restart', async t => {
+  const f = await fixture(t);
+  await writeFile(f.stateFile, JSON.stringify({ version: 1, token: 'legacy-stop-token', createdAt: Date.now(),
+    launcherPid: process.pid, monitorPid: process.pid, state: 'watching' }));
+  const token = await disableTerminalRecovery(f.cwd);
+  const retained = await f.state();
+  assert.equal(token, 'legacy-stop-token');
+  assert.equal(retained.state, 'error'); assert.equal(retained.recoveryDisabled, true);
+  assert.equal(retained.monitorPid, process.pid); assert.equal(retained.launcherPid, process.pid);
+  assert.equal(await getTerminalReturnError(f.cwd), undefined);
+  assert.deepEqual(await getTerminalLaunchStatus(f.cwd), { running: false, starting: false, pid: null });
+  let starts = 0;
+  await runTerminalMonitor(f.cwd, { token, start: async () => { starts++; } });
+  assert.equal(starts, 0);
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' });
+});
+
+test('a stop token cannot remove a new launch created after the old launch ends', async t => {
+  const f = await fixture(t);
+  const first = await prepareTerminalReturn(f.cwd);
+  const token = await disableTerminalRecovery(f.cwd);
+  assert.equal(token, first.token);
+  const second = await prepareTerminalReturn(f.cwd);
+  assert.notEqual(second.token, token);
+  await cancelTerminalReturn(f.cwd, token);
+  assert.equal((await f.state()).token, second.token);
+  assert.equal((await f.state()).state, 'starting');
+});
+
+test('disabling recovery without a marker is a no-op', async t => {
+  const f = await fixture(t);
+  assert.equal(await disableTerminalRecovery(f.cwd), undefined);
+  assert.equal(await getTerminalReturnError(f.cwd), undefined);
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'terminal-return.lock')), { code: 'ENOENT' });
+});
+
+test('abandoned lease locks are recovered without starting any process', async t => {
+  const f = await fixture(t);
+  const dead = await f.child(); await stopChild(dead);
+  await writeFile(join(f.cwd, '.piq', 'terminal-return.lock'), JSON.stringify({ pid: dead.pid, token: 'abandoned-lock' }));
+  const prepared = await prepareTerminalReturn(f.cwd);
+  assert.equal((await f.state()).token, prepared.token);
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'terminal-return.lock')), { code: 'ENOENT' });
+  assert.equal(await getTerminalReturnError(f.cwd), undefined);
+});
+
+test('the compatibility monitor entry only retires its marker and never invokes recovery', async t => {
+  const f = await fixture(t);
+  await writeFile(f.stateFile, JSON.stringify({ version: 1, token: 'legacy-token', createdAt: Date.now(),
+    launcherPid: process.pid, monitorPid: process.pid, state: 'watching' }));
+  let starts = 0;
+  await runTerminalMonitor(f.cwd, { token: 'legacy-token', start: async () => { starts++; } });
+  assert.equal(starts, 0);
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' });
+  const fresh = await prepareTerminalReturn(f.cwd);
+  await runTerminalMonitor(f.cwd, { token: 'legacy-token', start: async () => { starts++; } });
+  assert.equal((await f.state()).token, fresh.token);
+  assert.equal(starts, 0);
+});
+
+test('damaged metadata is preserved and reported without exposing arbitrary details', async t => {
+  const f = await fixture(t);
+  await writeFile(f.stateFile, '{bad secret-test-data');
+  await assert.rejects(prepareTerminalReturn(f.cwd));
+  assert.equal(await readFile(f.stateFile, 'utf8'), '{bad secret-test-data');
+  const error = await getTerminalReturnError(f.cwd);
+  assert.match(error!, /终端/); assert.doesNotMatch(error!, /secret-test-data/);
+});
+
+test('terminal metadata refuses directory links outside its group', async t => {
   const f = await fixture(t);
   const outside = join(f.root, 'outside'); await mkdir(outside);
   await rename(join(f.cwd, '.piq'), join(f.cwd, '.piq-original'));
@@ -290,29 +240,4 @@ test('monitor metadata refuses links outside the group', async t => {
   }
   await assert.rejects(prepareTerminalReturn(f.cwd), /普通/);
   assert.equal(await getTerminalReturnError(f.cwd) !== undefined, true);
-});
-
-test('the detached monitor survives its launcher and recovers after a real terminal child is killed', async t => {
-  const f = await fixture(t);
-  const recovered = join(f.root, 'recovered.json');
-  const monitorEntry = join(f.root, 'fake-monitor.mjs');
-  const launcherEntry = join(f.root, 'fake-launcher.mjs');
-  const launcherReady = join(f.root, 'launcher-ready');
-  await writeFile(monitorEntry, `import {writeFile} from 'node:fs/promises';\nimport {runTerminalMonitor} from ${JSON.stringify(moduleUrl)};\nawait runTerminalMonitor(process.argv[2],{pollMs:10,start:async()=>{await writeFile(${JSON.stringify(recovered)},JSON.stringify({pid:process.pid}));}});\n`);
-  await writeFile(launcherEntry, `import {spawn} from 'node:child_process';\nimport {writeFile} from 'node:fs/promises';\nimport {prepareTerminalReturn} from ${JSON.stringify(moduleUrl)};\nawait prepareTerminalReturn(process.argv[2],{launch:async s=>await new Promise((resolveLaunch,reject)=>{const child=spawn(process.execPath,[${JSON.stringify(monitorEntry)},...s.args.slice(1)],{cwd:s.cwd,env:s.env,detached:true,windowsHide:true,stdio:'ignore'});child.once('error',reject);child.once('spawn',()=>{child.unref();resolveLaunch({pid:child.pid});});})});\nawait writeFile(${JSON.stringify(launcherReady)},'ready');\nsetInterval(()=>{},1000);\n`);
-  const launcher = spawn(process.execPath, [launcherEntry, f.cwd], { stdio: 'ignore' });
-  t.after(() => { if (launcher.exitCode === null) launcher.kill(); });
-  await eventually(async () => { try { await readFile(launcherReady); return true; } catch { return false; } });
-  const lease = await f.state();
-  t.after(() => { try { process.kill(lease.monitorPid); } catch { /* already exited */ } });
-  const wrapper = await f.child();
-  await registerTerminal(f.cwd, lease.token, wrapper.pid, wrapper.pid);
-  await stopChild(launcher);
-  assert.equal(launcher.signalCode !== null || launcher.exitCode !== null, true);
-  await stopChild(wrapper);
-  await eventually(async () => { try { await readFile(recovered); return true; } catch { return false; } });
-  const result = JSON.parse(await readFile(recovered, 'utf8'));
-  assert.equal(result.pid, lease.monitorPid);
-  assert.notEqual(result.pid, process.pid);
-  await eventually(async () => (await f.state()) === null);
 });

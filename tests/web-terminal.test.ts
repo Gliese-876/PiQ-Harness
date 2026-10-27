@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -8,7 +8,9 @@ import { test } from 'node:test';
 import { initializeGroup, validateConfig } from '../src/config.ts';
 import { credentialStatus, getRunningOwner, openGroupTerminal, resolveGroupEnvironment, type TerminalLaunch } from '../src/web-terminal.ts';
 import { terminalMain } from '../src/terminal-entry.ts';
-import { openGroup } from '../src/cli.ts';
+import { createFreshSession, openGroup } from '../src/cli.ts';
+import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { finishTerminal, getTerminalLaunchStatus, prepareTerminalReturn, registerTerminal } from '../src/terminal-monitor.ts';
 
 async function fixture() {
   const parent = fileURLToPath(new URL('../.test-tmp/', import.meta.url));
@@ -83,7 +85,9 @@ test('terminal request uses trusted scripts and separate arguments with a scoped
   assert.equal(request!.env.PIQ_GROUP_DIRECTORY, f.cwd);
   assert.equal(request!.env.PIQ_NODE_EXECUTABLE, process.execPath);
   assert.equal(request!.env.PIQ_TERMINAL_RETURN_TOKEN, 'terminal-return-test-token');
-  assert.ok(request!.args.includes('-NoExit'));
+  assert.ok(!request!.args.includes('-NoExit'));
+  assert.equal(request!.env.PIQ_RUN_MODE, 'terminal');
+  assert.equal(request!.env.PIQ_START_RUNNING, '1');
   assert.ok(request!.args.includes('--inheritEnvironment'));
   assert.ok(!request!.args.includes(f.cwd));
   assert.ok(request!.args.some(arg => arg.endsWith(join('scripts', 'open-pi.ps1'))));
@@ -191,7 +195,7 @@ test('an owner appearing after lease preparation prevents the terminal window', 
   const result = await openGroupTerminal(f.cwd, {
     env: { PIQ_PI_ENTRY: fakeEntry, SNOWLUMA_ACCESS_TOKEN: 'test-only' },
     prepareReturn: async () => {
-      await mkdir(join(f.cwd, '.piq'));
+      await mkdir(join(f.cwd, '.piq'), { recursive: true });
       await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'new-owner' }));
       return { token: 'superseded-return-token' };
     },
@@ -220,7 +224,7 @@ test('managed terminal entries register only the wrapper and pass its identity t
   assert.equal(result, 0);
   assert.deepEqual(calls, [[cwd, 'managed-entry-token', process.pid]]);
   assert.equal(await terminalMain([cwd], { env: {}, register: async () => assert.fail('Plain CLI must not register a monitor'), open: async (_cwd, _args, options) => {
-    assert.equal(options, undefined); return 0;
+    assert.equal(options!.env!.PIQ_RUN_MODE, 'terminal'); return 0;
   } }), 0);
   await assert.rejects(terminalMain([cwd], {
     env: { PIQ_TERMINAL_RETURN_TOKEN: 'cancelled-entry-token' },
@@ -271,4 +275,76 @@ test('Pi spawn registration finishes before an exiting child resolves and failur
     if (Date.now() > deadline) assert.fail('The unregistered Pi child is still running');
     await delay(10);
   }
+});
+
+
+test('fresh terminal sessions are persisted before a turn and preserve previous history', async t => {
+  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const old = await createFreshSession(f.cwd);
+  const oldContents = await readFile(old, 'utf8');
+  await writeFile(join(f.cwd, 'MEMORY.md'), 'Remember this');
+  await delay(20);
+  const fakeEntry = join(f.root, 'fake-pi.cjs'); await writeFile(fakeEntry, '');
+  let sessionFile = '';
+  await openGroupTerminal(f.cwd, { freshSession: true, configDirectory: f.configDirectory,
+    env: { PIQ_PI_ENTRY: fakeEntry }, launch: async specification => {
+      sessionFile = specification.env.PIQ_SESSION_FILE!;
+      assert.ok(sessionFile.endsWith('.jsonl'));
+      const rows = (await readFile(sessionFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].type, 'session');
+      assert.equal(rows[0].cwd, f.cwd);
+      assert.equal(specification.env.PIQ_RUN_MODE, 'terminal');
+    } });
+  assert.notEqual(sessionFile, old);
+  assert.equal(SessionManager.continueRecent(f.cwd, join(f.cwd, '.pi', 'sessions')).getSessionFile(), sessionFile);
+  assert.equal(SessionManager.open(sessionFile).getEntries().length, 0);
+  assert.equal(await readFile(old, 'utf8'), oldContents);
+  assert.equal(await readFile(join(f.cwd, 'MEMORY.md'), 'utf8'), 'Remember this');
+});
+
+test('a failed fresh terminal launch preserves the previous session selection', async t => {
+  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const old = await createFreshSession(f.cwd);
+  const fakeEntry = join(f.root, 'fake-pi.cjs'); await writeFile(fakeEntry, '');
+  await assert.rejects(openGroupTerminal(f.cwd, { freshSession: true, configDirectory: f.configDirectory,
+    env: { PIQ_PI_ENTRY: fakeEntry }, launch: async () => { throw new Error('window unavailable'); } }), /window unavailable/);
+  assert.deepEqual(await readdir(join(f.cwd, '.pi', 'sessions')), [old.split(/[\\/]/).pop()]);
+  assert.equal(SessionManager.continueRecent(f.cwd, join(f.cwd, '.pi', 'sessions')).getSessionFile(), old);
+});
+
+test('the terminal entry passes the selected session once and releases its marker on exit', async t => {
+  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const lease = await prepareTerminalReturn(f.cwd);
+  const sessionFile = await createFreshSession(f.cwd);
+  await terminalMain([f.cwd], { env: { PIQ_TERMINAL_RETURN_TOKEN: lease.token, PIQ_SESSION_FILE: sessionFile },
+    open: async (_path, _args, options) => {
+      assert.equal(options!.sessionFile, sessionFile);
+      assert.equal(options!.env!.PIQ_SESSION_FILE, undefined);
+      assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'terminal-return.json'), 'utf8')).wrapperPid, process.pid);
+      return 0;
+    } });
+  await assert.rejects(stat(join(f.cwd, '.piq', 'terminal-return.json')), { code: 'ENOENT' });
+});
+
+test('a terminal wrapper cannot discard a real Pi process that outlives its launcher', async t => {
+  const f = await fixture();
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+  await new Promise<void>((resolveChild, reject) => { child.once('spawn', resolveChild); child.once('error', reject); });
+  const stop = async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise<void>(resolveExit => { child.once('exit', () => resolveExit()); child.kill(); });
+  };
+  t.after(async () => { await stop(); await rm(f.root, { recursive: true, force: true }); });
+  const lease = await prepareTerminalReturn(f.cwd);
+  await terminalMain([f.cwd], { env: { PIQ_TERMINAL_RETURN_TOKEN: lease.token },
+    open: async () => { await registerTerminal(f.cwd, lease.token, process.pid, child.pid); return 0; } });
+  assert.deepEqual(await getTerminalLaunchStatus(f.cwd), { running: true, starting: false, pid: child.pid });
+  assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'terminal-return.json'), 'utf8')).recoveryDisabled, true);
+  assert.equal((await prepareTerminalReturn(f.cwd)).alreadyRunning, true);
+  await finishTerminal(f.cwd, 'stale-token');
+  assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'terminal-return.json'), 'utf8')).token, lease.token);
+  await stop();
+  await finishTerminal(f.cwd, lease.token);
+  await assert.rejects(stat(join(f.cwd, '.piq', 'terminal-return.json')), { code: 'ENOENT' });
 });

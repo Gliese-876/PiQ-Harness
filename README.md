@@ -1,55 +1,155 @@
 # PiQ Harness
 
-把 SnowLuma 的 QQ 对话交给 Pi。**一个对话组对应一个 Pi Agent Session**，组内可包含多个群聊、好友私聊和群临时会话，共用配置、人设、记忆、模型与资料。
+让 Pi 参与 QQ 对话，在本地工作台管理会话、人设、记忆和资料。
 
-每个对话独立保存日志。消息按来源分类后，聚合为一个简短信号交给同组 Agent；Agent 自主读取、回复、整理记忆或保存表情包。发送时明确指定目标对话。
+**一个对话组对应一个 Pi 会话。** 同组可以包含多个 QQ 群聊、好友私聊和群临时会话，共用上下文与记忆，各自保存聊天日志。PiQ 先保存消息，再通知 Pi 哪些对话有更新；Pi 自主决定读取、回应或整理记忆。只有显式调用发送工具，内容才会发到 QQ。
 
-项目源码采用 [AGPL-3.0-only](LICENSE)，第三方组件见 [许可说明](THIRD_PARTY_NOTICES.md)。
+PiQ 通过公开 OneBot 及后端 API 独立接入 SnowLuma，**不使用、不包含 SnowLuma SDK**。SnowLuma 和 Pi 均需单独安装。
 
-## 开始使用
+- **终端运行**：工作台打开 Pi 终端，关闭终端即停止；需要批准的工具调用在终端确认。
+- **对话组管理**：创建、重命名、移入回收站和恢复；可重开空上下文，保留资料与历史文件。
+- **聊天工具**：文字、图片、语音、戳一戳、表情回应、群文件，以及聊天记录读取和合并转发。
+- **按需扩展**：可搭配权限扩展、写入沙箱、`pi-web-access` 和 MiMo TTS，分别配置在需要它们的对话组。
 
-使用 Pi 1.4.0。Node.js 需要 24.22.1+ 的 24 系列或 26.12.1+。SnowLuma 作为独立安装的外部 QQ 后端运行，PiQ 使用 Node 原生 WebSocket 连接其 OneBot 11 接口。
+## 快速开始
+
+### 1. 准备环境和 Pi
+
+| 组件 | 要求 |
+| --- | --- |
+| Node.js | 24 系列至少 `24.22.1`，或 `26.12.1` 及以上；以 [package.json](package.json) 的 engines 为准 |
+| Pi Coding Agent | 本项目使用和验证的版本为 `1.4.0`；先完成模型认证与选择 |
+| SnowLuma | 已安装并登录 QQ，启用 OneBot 11 正向 WebSocket 的 Universal 节点 |
+| Windows Terminal | 工作台的“打开 Pi 终端”需要 `wt.exe`；其他环境可使用 CLI 在现有终端运行 |
+
+Pi 可按[官方 Windows 说明](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/windows.md)安装，也可通过 npm 安装指定版本：
 
 ```powershell
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.4.0
+pi --version
+pi
+```
+
+在 Pi 终端中使用 `/login` 配置模型访问，再用 `/model` 选择可用模型。原生 Windows 的默认 Bash 环境参见上述说明；本文推荐的权限配置使用 PowerShell。
+
+### 2. 启动工作台
+
+```powershell
+git clone https://github.com/Gliese-876/PiQ-Harness.git
+cd PiQ-Harness
 npm ci
 npm run web
 ```
 
-打开 [本地 WebUI](http://127.0.0.1:3210)，创建对话组，在“对话”页添加成员。每个对话只能归属一个组，创建、保存与运行时都会检查重复归属。组标识用于目录名，显示名称可单独修改。
+打开 [http://127.0.0.1:3210](http://127.0.0.1:3210)。工作台只监听本机回环地址。
 
-CLI 示例：
+### 3. 创建第一个对话组
+
+1. 点击“新建对话组”，填写名称；可以先创建空组并准备资料。
+2. 在“对话”页添加 QQ 群聊、好友私聊等成员。每个对话只能属于一个组。
+3. 在“连接设置”填入 SnowLuma 实际启用的 WebSocket 端点。PiQ 默认值是 `ws://127.0.0.1:3001/`，端口以你的后端配置为准。
+4. 在“文档”页填写本组 `PERSONA.md` 和 `AGENTS.md`，在“模型”页选择可用模型与思考强度。
+5. 点击“打开 Pi 终端”。首次运行时由本机操作者确认信任本组资源，使 Pi 加载 `.pi/settings.json` 中声明的 PiQ 扩展。
+
+`wsUrl` 只填写端点地址，`accessTokenEnv` 填环境变量名，默认是 `SNOWLUMA_ACCESS_TOKEN`。令牌优先从该变量取得；本机端点也可读取匹配的本地 SnowLuma 配置，工作台只显示是否可用。远程后端使用环境变量。修改环境变量后，重新启动承载工作台和 Pi 的终端。
+
+## 日常操作
+
+| 操作 | 结果 |
+| --- | --- |
+| 打开 Pi 终端 | 继续本组最近会话；已有实例时提示切换到原终端 |
+| 暂停 / 恢复 | 暂停生成与 PiQ 工具调用，继续保存收到的消息；工作台仍可查看日志 |
+| 停止 / 关闭 Pi 终端 | 结束本组 Pi；下次打开时按后端能力补拉历史 |
+| 重开会话 | 结束当前 Pi，打开空上下文；旧会话、聊天日志、人设、记忆和资料保留 |
+| 重命名 | 修改显示名称，保留组标识和目录名 |
+| 移入回收站 | 停止后将完整目录移到根目录 `.trash/` |
+| 从回收站恢复 | 恢复原组；原标识或对话归属已被占用时提示冲突并保留数据 |
+
+关闭工作台网页不会结束已打开的 Pi 终端。重开会话后，Pi 仍会加载本组约定，并可按需读取 `MEMORY.md` 等资料；这一操作清空的是当前模型上下文。
+
+调整成员归属前先停止相关组。移出的对话在原组留下已有日志与记忆，新消息随后进入新归属组。未单独分配的群临时私聊，会归入来源 QQ 群所在组。
+
+## 推荐配置：从日常聊天逐步扩展
+
+建议先完成一个组的基本连接，再按需要增加能力。模型优先选择工具调用稳定、响应时间合适的选项；日常聊天从工作台提供的默认或较低思考强度开始，复杂任务再提高。下面的外部插件和技能**均为可选项**，不属于 PiQ 依赖，也不会随 `npm ci` 或创建对话组自动安装。
+
+| 使用场景 | 推荐搭配 | 配置重点 |
+| --- | --- | --- |
+| 日常聊天、长期记忆 | PiQ + 一个可用的 Pi 模型 | 明确人设和回应频率，让 Pi 按需读取日志与整理记忆 |
+| 允许读取、约束写入 | `@gotgenes/pi-permission-system` + `@yuru7/pi-sandbox` + 配套本地策略示例 | 普通写入限本组；保护文件编辑和 PowerShell 执行前由人批准 |
+| 查资料、读网页与 PDF | 在前述组合上增加 `pi-web-access` | 配置搜索提供方、抓取缓存；网络工具初期保持询问 |
+| 语音回复 | 增加 `mimo-v2-5-tts` 技能 | 用环境变量提供凭据；音频保存到本组，再由 `qq_voice` 发送 |
+
+可在工作台显示的**本组目录**中安装已核对的版本：
 
 ```powershell
-npm run piq -- init friends --name "朋友" --conversation group:123456789 --conversation private:987654321 --url ws://127.0.0.1:3000/
-npm run piq -- open friends
+pi install -l npm:@gotgenes/pi-permission-system@40.3.0
+pi install -l npm:@yuru7/pi-sandbox@0.4.1
+# 需要联网能力时再添加
+pi install -l npm:pi-web-access@0.45.0
 ```
 
-示例号码请换成实际号码。--conversation 可重复，临时会话使用 temporary:来源群号:QQ号。path <组标识> 显示目录位置；open <组标识> -- <Pi参数> 继续本组最近会话。
+安装后还需要放置权限配置、合并本组 Pi 设置，并重新打开终端。完整步骤、可复制的 JSON 和 Windows 临时目录适配见 **[可选扩展配置指南](docs/optional-integrations.md)**；基础组合从 [Pi 设置示例](examples/integrations/pi-settings.example.json)开始。
 
-默认根目录为“文档/PiQ-Messages”。CLI 和 WebUI 均支持 --root <目录>，WebUI 另支持 --port 3211，只监听本机回环地址。
+`pi-web-access` 提供 `web_search`、`fetch_content`、`get_search_content`、`source_check` 等工具；本文的保守示例只启用前三项。它会自行管理缓存，也提供 GitHub 克隆等功能；这些内部读写不自动经过 yuru7 接管的命令工具。推荐先使用指南中的保守配置，明确缓存位置，按需开启克隆、远程抓取和视频处理。[联网配置](docs/optional-integrations.md#pi-web-access)提供 [Pi 设置示例](examples/integrations/pi-settings.web.example.json)和 [web-search.json 示例](examples/integrations/web-search.example.json)；请先确认它们各自的配置作用域。
 
-## 运行控制
+权限组合提供工具审批和受限命令执行。读取仍按当前用户权限开放；任意脚本以整条命令接受批准，获批后仍可修改组内文件。Windows 沙箱的已知限制，以及保护文件的实际范围，在配置指南中单独说明。
 
-- 启动 Pi：后台运行本组唯一的 Session。
-- 暂停 / 恢复运行：暂停生成和发送，继续保存消息；恢复后聚合处理待通知消息。
-- 停止：正常退出本组 Pi，释放对话占用。修改成员归属前先停止对应组。
-- 在终端打开：正常关闭后台实例后，由 Windows Terminal 继续同一会话文件。关闭终端后自动回到后台，保留暂停状态并恢复未完成任务。已有终端时提示切换。
+## 使用建议
 
-移出对话后，原组保留已有历史与记忆，停止接收和通知该对话的新消息。新归属影响后续消息，发送目标始终按当前配置检查。
+### 按信任关系组织对话
 
-终端回后台由独立的隐藏监护进程处理，关闭 WebUI 也能恢复。关窗可能中断当前模型请求，随后会在原会话中续执行；空闲关窗只恢复接收。需要完全停用对话组时，使用 WebUI 的“停止”。直接在终端手工运行 CLI 的 open 命令仍由该终端管理。
+把适合共享人设和记忆的对话放在同一组，例如一个项目群与该项目的协作私聊。涉及不同客户或不同私人关系时分组管理。目录分组管理的是会话和日志，操作系统访问范围由运行环境及所选权限扩展决定。
 
-页面支持浅色、深色、跟随系统，可编辑公共与本组 Markdown。模型和思考强度保存到本组 .pi/settings.json，运行中通过 Pi 原生接口调整；已发出的请求继续完成，后续请求采用新设置。
+在本组 `AGENTS.md` 写清什么时候回应、什么时候保持沉默、哪些内容适合跨对话分享。转发记录时先确认接收者；同属一个对话组也要尊重各对话原来的可见范围。
 
-启动前检查 SnowLuma 和 QQ 在线状态。本机服务关闭时尝试启动已安装的 SnowLuma；失败显示原因并提供“重试连接”“打开 SnowLuma”。自动恢复沿用已有配置，PIQ_SNOWLUMA_AUTOSTART=0 可关闭扩展内自动拉起。
+### 让上下文和资料各有位置
 
-token 优先读取指定环境变量，也可从匹配端点的本机 SnowLuma 配置读取。WebUI 只展示凭据是否可用。远程 SnowLuma 使用环境变量配置。
+| 内容 | 推荐位置 |
+| --- | --- |
+| 行为约定、回复规则 | 公共或本组 `AGENTS.md` |
+| 人设、语气、稳定偏好 | 本组 `PERSONA.md`；需要每次加载时在 `AGENTS.md` 明确要求读取 |
+| 从真实互动整理的长期信息 | 本组 `MEMORY.md`，注明来源和日期 |
+| 图片、语音、群文件下载 | 本组 `assets/`，例如 `assets/voices/`、`assets/downloads/` |
+| 聊天流水 | PiQ 维护的 `messages/`，使用读取工具查询 |
+| 密钥与令牌 | 环境变量或 Pi 自身的认证机制，不写入聊天、角色和记忆文档 |
 
-网络客户端依据 [OneBot 11 正向 WebSocket 标准](https://github.com/botuniverse/onebot-11/blob/master/communication/ws.md)独立实现。事件与 API 共用 Universal 连接，API 请求通过唯一 echo 匹配回执，鉴权使用标准 access_token 查询参数；连接和请求均有超时，断线后自动重连。
+长会话积累过多临时任务时，可以先让 Pi 整理确有保留价值的信息，再“重开会话”。维护备份时停止本组，整体备份组目录；聊天日志、通知水位和补拉游标一起保留。
 
-## 配置与目录
+### 控制群聊回应频率
 
-本组 PIQ.md 包含一个 JSON 配置块：
+默认参数适合作为起点：静默等待 1.5 秒，连续发言最多聚合 10 秒，两次通知至少间隔 15 秒。活跃群可尝试 `quietMs: 2500`、`maxWaitMs: 15000`、`minIntervalMs: 30000`，减少连续唤醒，再按实际聊天节奏调整。
+
+联网时先把需求整理成简短查询词，按需读取结果，再决定如何回复。网页和转发内容都作为资料处理；搜索提供方会收到查询内容，因此不要自动把整段私人聊天发送给它。
+
+## 工作目录与配置
+
+默认根目录是系统“文档”文件夹下的 `PiQ-Messages`。工作台支持 `--root` 和 `--port`：
+
+```powershell
+npm run web -- --root D:\PiQ-Messages --port 3211
+```
+
+```text
+PiQ-Messages/
+  AGENTS.md                     公共约定
+  .trash/                       可恢复的已删除组
+  friends/
+    PIQ.md                      成员、连接和聚合参数
+    AGENTS.md                   本组约定
+    PERSONA.md                  本组人设
+    MEMORY.md                   按需创建的长期记忆
+    assets/                     资料与媒体
+    messages/
+      group/<群号>/<日期>.jsonl
+      private/<QQ号>/<日期>.jsonl
+      temporary/<来源群>/<QQ号>/<日期>.jsonl
+    .pi/settings.json           Pi 模型、扩展与技能设置
+    .pi/sessions/               Pi 会话历史
+    .piq/                       运行状态、归属和消息水位
+```
+
+`PIQ.md` 中保留一个带 `json` 标签的代码块，例如：
 
 ```json
 {
@@ -59,7 +159,7 @@ token 优先读取指定环境变量，也可从匹配端点的本机 SnowLuma �
     { "type": "group", "id": "123456789", "name": "交流群" },
     { "type": "private", "id": "987654321", "name": "朋友" }
   ],
-  "wsUrl": "ws://127.0.0.1:3000/",
+  "wsUrl": "ws://127.0.0.1:3001/",
   "accessTokenEnv": "SNOWLUMA_ACCESS_TOKEN",
   "quietMs": 1500,
   "maxWaitMs": 10000,
@@ -67,111 +167,53 @@ token 优先读取指定环境变量，也可从匹配端点的本机 SnowLuma �
 }
 ```
 
-实际 PIQ.md 使用 json 语言标签的反引号代码围栏。
+号码和端点请替换为实际配置。扩展各自的设置放在其指定位置，不往 `PIQ.md` JSON 中添加未知字段。连接与聚合参数修改后重启本组；工作台修改模型和思考强度时，会尝试通过 Pi 原生接口应用到后续请求。
 
-```text
-文档/PiQ-Messages/
-  AGENTS.md                          公共约束
-  friends/
-    PIQ.md                           对话、连接与聚合配置
-    AGENTS.md                        本组约定
-    PERSONA.md                       共用人设
-    MEMORY.md                        Agent 自行维护的记忆
-    assets/                          共用资料、表情包
-    messages/
-      group/123456789/2026-10-26.jsonl
-      private/987654321/2026-10-26.jsonl
-      temporary/123456789/112233/2026-10-26.jsonl
-    .pi/settings.json                本组模型设置与扩展
-    .pi/sessions/                    本组唯一活动 Session 的持久历史
-    .piq/                            水位、运行状态与对话占用
-```
+## 工具与 CLI
 
-人设、约束、记忆使用 Markdown。消息使用 JSONL v2，每行包含 conversation、消息标识、发送者、时间、正文与消息段，以换行结束。多行正文保存在 JSON 字符串中。群聊、好友私聊、来源不同的临时私聊分别记录和去重。
-
-Pi 原生加载公共与本组 AGENTS.md，其他 Markdown 由 Agent 自主读取。同一 Session 可以理解多个对话，但成员未必看过其他对话：回复以目标对话的上下文为准，尤其不能自动转述其他私聊内容。
-
-这是工作目录与对话归属的隔离；Pi 文件和命令行工具仍使用当前用户的系统权限。
-
-## 临时会话与分类聚合
-
-收到群临时私聊时，PiQ 按“来源群号＋对方 QQ 号”识别对话。未分配的临时会话自动归入来源群所在组，并更新本组配置；已有明确归属时遵循该归属。此过程不申请或添加好友。
-
-同组共用一套聚合计时：默认静默等待 1.5 秒、连续发言最多聚合 10 秒、通知至少间隔 15 秒。Pi 处理任务或补拉历史时继续落盘。通知按对话列出条数、本地序号范围和独立日志路径，正文按需读取：
-
-```text
-对话组 朋友 有 6 条新消息，来自 2 个对话（至 #20）：
-group:123456789：4 条，#15–#19，日志 messages/group/123456789/2026-10-26.jsonl
-temporary:123456789:112233：2 条，#18–#20，日志 messages/temporary/123456789/112233/2026-10-26.jsonl
-```
-
-WebUI 按对话显示待处理数量，消息页先选择对话，再选择日期。每个日志视图只显示该对话。
-
-## 回复与恢复
-
-发送工具 qq_send 每次明确选择本组对话：
-
-```json
-{"conversation":"group:123456789","text":"收到","images":["assets/收到.png"]}
-```
-
-```json
-{"conversation":"temporary:123456789:112233","text":"可以，把具体情况说一下。","replyTo":-1234567}
-```
-
-引用使用 QQ message_id，可能为负数；本地 seq 用于日志定位。至少提供文字或图片，图片文件位于本组目录内。普通 Pi 回答留在会话中，明确调用发送工具才会发到 QQ。
-
-本地图片读入内存后，通过标准 base64:// 图片消息段发送，适用于后端位于另一台机器的情况。图片与文字放在同一次发送请求中；较大图片受后端 WebSocket 消息大小限制。
-
-Agent 还可以按需要使用以下交互工具。conversation 均使用本组的对话标识，messageId 使用 QQ 消息 ID。
-
-| 工具 | 用途与范围 |
+| 能力 | 工具 |
 | --- | --- |
-| qq_send | 发送文字、图片；replyTo 引用指定消息。支持群聊、私聊与临时会话。 |
-| qq_poke | 戳一戳。群聊须指定 userId，私聊默认戳对方；临时会话不支持。 |
-| qq_react | 给群消息添加或取消表情回应，指定 messageId、emojiId，set 默认 true。 |
-| qq_recall | 撤回本账号发送的消息。撤回前核验消息属于指定对话，且发送者是本账号。 |
-| qq_sticker | action 支持 list、send、add、remove、rename、promote。按 emojiId 发送、删除、改名或置顶；add 从本组 path 添加，rename 使用 name。发送支持群聊与好友私聊，可带 replyTo 引用。收藏由当前 QQ 账号全局共用。 |
-| qq_voice | send_file 按本组 path 向群聊、私聊或临时会话发送本地语音；list 列出原生 QQ AI 声音，send 按 text、characterId 发送 QQ AI 语音，这两项仅限群聊；transcribe 按 messageId 转写语音，支持群聊、私聊及可确认来源的临时会话。 |
-| qq_group_files | 群文件与目录操作，action 支持 list、upload、download、mkdir、move、rename_file、rename_folder、delete_file、delete_folder。conversation 仅限群聊。 |
-| qq_album | 操作已有群相册，action 支持 list、media、upload_image、upload_video、delete_media、comment、like；like 使用 set: false 取消赞。conversation 仅限群聊。 |
+| 发送文字和图片 | `qq_send` |
+| 读取本地聊天、读取合并转发、显式转发记录 | `qq_read_history`、`qq_read_forward`、`qq_forward` |
+| 发送本地或 QQ AI 语音、语音转写 | `qq_voice` |
+| 戳一戳、表情回应、撤回本账号消息 | `qq_poke`、`qq_react`、`qq_recall` |
+| 收藏表情、群文件、群相册 | `qq_sticker`、`qq_group_files`、`qq_album` |
 
-例如，在群里戳一位成员，或给消息添加回应：
+参数、JSON 示例、适用对话类型及大小限制见 **[QQ 工具与消息恢复](docs/qq-tools.md)**。`messageId` 是 QQ 消息 ID，可能为负数；`seq` 是本地日志序号。
 
-```json
-{"conversation":"group:123456789","userId":"987654321"}
+```powershell
+# 创建组；--conversation 可以重复
+npm run piq -- init friends --name "朋友" --conversation group:123456789 --url ws://127.0.0.1:3001/
+# 在当前终端继续最近会话
+npm run piq -- open friends
+# 在当前终端新建空上下文
+npm run piq -- open friends --new-session
+# 查看组目录
+npm run piq -- path friends
 ```
 
-```json
-{"conversation":"group:123456789","messageId":-1234567,"emojiId":"128077","set":true}
-```
+CLI 同样支持 `--root`，`open` 可在 `--` 后传入 Pi 参数。临时私聊标识使用 `temporary:来源群号:QQ号`。Pi 中的 `/piq` 查看通道状态，`/piq sync` 重试补拉，`/piq retry` 重试未确认的通知。
 
-qq_sticker 与 qq_voice 可以先用 action: "list" 查询后端提供的收藏表情或声音。发送收藏表情使用返回的 emojiId；发送 AI 语音时，将声音列表 voices[].characters[].id 的值填入 characterId。语音转写使用 action: "transcribe" 和语音消息的 messageId。
+## 常见问题
 
-Pi 可使用 MiMo TTS 生成语音，保存到本组目录，再显式调用 qq_voice 发送文件。例如：
+**打开了终端，但没有回复。** 先确认 Pi 已信任本组资源、模型可用、QQ 后端在线，并且本组没有暂停。聚合计时、当前任务和历史补拉会推迟通知；Pi 也会根据约定选择保持沉默。
 
-```json
-{"action":"send_file","conversation":"group:123456789","path":"assets/voices/reply.wav"}
-```
+**SnowLuma 没有自动启动。** PiQ 可以尝试启动默认“文档/SnowLuma”位置的本机安装。其他安装位置可手动启动后端，再填写实际端点和令牌环境变量。`PIQ_SNOWLUMA_AUTOSTART=0` 可关闭扩展内自动拉起；连接重试不等于 Pi 关窗后恢复运行。
 
-本地语音文件上限 32 MiB，发送遵守本组成员归属与暂停状态。MiMo 凭据通过本机用户环境变量 MIMO_API_KEY 提供，密钥不写入文档。
+**关闭终端期间的消息能否补回？** 群聊和好友私聊按后端可提供的历史补拉，首次接入取最近 20 条。群临时私聊目前保留已收到的本地日志，完整离线补拉取决于后端能力，不能按好友历史处理。
 
-群文件、收藏表情和相册的本地上传，共用后端暂存：先通过 download_file 的 base64 参数把文件交给后端，再进行上传。本地 path 限于本组目录，单文件上限 32 MiB。群文件下载以流方式写入本组目录，上限 128 MiB，默认保存为 assets/downloads/UUID.bin；可以指定 path 保留文件名，已有文件不会覆盖。操作能否成功取决于当前 QQ 账号的群权限、配额以及后端支持情况。
+**删除后恢复失败。** 检查原组标识是否被新目录占用，以及成员对话是否已归属其他组。解决冲突后再恢复；回收站中的原数据会保留。
 
-戳一戳通知以 notice 来源写入对应对话的日志并参与分类聚合，本地主动戳一戳以 action 来源记录。没有远端事件 ID 时使用本地 UUID，避免把同文或同一秒内的多次交互合并；这些交互不推进聊天历史补拉游标。
+**更换 OneBot 后端是否能直接使用？** WebSocket 通信按 OneBot 11 独立实现；历史补拉、临时会话、群文件和相册等能力还依赖后端公开扩展 API，迁移时需逐项确认。
 
-群聊与好友私聊分别保存补拉游标，恢复连接后分页读取 SnowLuma 可提供的历史；首次接入读取最近 20 条。临时会话已收到并保存的日志可以读取，目前不将好友历史接口当作临时会话的完整离线补拉接口。
-
-历史补拉使用 get_group_msg_history、get_friend_msg_history，临时私聊使用 send_private_msg 的 group_id 参数。这些属于后端扩展，切换到其他 OneBot 实现时需要确认其支持情况。
-
-/piq 查看状态，/piq sync 重试补拉，/piq retry 恢复未确认通知。去重使用对话身份和 QQ 消息标识，保留同文不同标识的消息。发送前等待短暂重连；已派发请求的结果未知时不自动重发。
-
-日志、通知水位和补拉游标应一起备份。消息文件损坏、缺少记录或末尾未写完时，会报错并保留数据供修复。
-
-## 验证
+## 开发、贡献与许可
 
 ```powershell
 npm run verify
 ```
 
-测试使用临时目录、模拟 OneBot 端点和 Pi 官方本地 faux 模型，覆盖 WebSocket 鉴权、回执关联、断线与取消、独占归属、共享 Session、独立日志、临时会话自动归属、分类聚合、私聊发送、运行控制和持久化恢复。
+验证包含 TypeScript 检查和测试。测试使用临时目录、模拟 QQ 端点与 Pi 官方 faux 模型，不发送真实 QQ 消息。网络接入依据 [OneBot 11 标准](https://github.com/botuniverse/onebot-11)及 [SnowLuma 公开 API 目录](https://github.com/SnowLuma/SnowLuma/blob/main/packages/mcp/src/generated/catalog.json)，始终独立实现。
+
+感谢 [方缘（@Fangyuanz06）](https://github.com/Fangyuanz06) 在 [PR #1](https://github.com/Gliese-876/PiQ-Harness/pull/1) 中提供对话组管理和合并转发读取的初始实现。采用其贡献的提交保留共同作者署名。
+
+本项目采用 [AGPL-3.0-only](LICENSE)。SnowLuma、Pi 以及可选插件和技能分别遵循自身许可，详见 [第三方组件说明](THIRD_PARTY_NOTICES.md)。

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
-import { access, readFile } from "node:fs/promises";
+import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
+import { access, lstat, mkdir, open, readFile, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { assertAssignments, initializeGroup, loadConfig, validateGroupId } from "./config.ts";
 import { parseConversationKey, type Conversation } from './conversations.ts';
@@ -29,6 +29,7 @@ export interface CliOptions {
   root?: string;
   wsUrl?: string;
   accessTokenEnv?: string;
+  freshSession?: boolean;
   piArgs: string[];
 }
 
@@ -39,6 +40,11 @@ export function parseArgs(args: string[]): CliOptions {
   const result: CliOptions = { action, id: validateGroupId(args[1]), piArgs: [], ...(action === 'init' ? { conversations: [] } : {}) };
   for (let i = 2; i < args.length; i++) {
     const arg = args[i]!;
+    if (arg === '--new-session') {
+      if (action !== 'open') throw new Error('--new-session 仅用于 open。');
+      result.freshSession = true;
+      continue;
+    }
     if (arg === "--") {
       if (action !== "open") throw new Error("只有 open 命令支持 -- 后的 Pi 参数。");
       result.piArgs = args.slice(i + 1);
@@ -93,6 +99,48 @@ export interface OpenGroupOptions {
   /** The spawned command can be a launcher; this PID is not necessarily the Pi owner. */
   onSpawn?: (pid: number) => void | Promise<void>;
   env?: NodeJS.ProcessEnv;
+  freshSession?: boolean;
+  sessionFile?: string;
+}
+
+/** Keep child-process scratch files in this group without changing the caller's environment. */
+export async function groupTemporaryEnvironment(cwd: string, inherited: NodeJS.ProcessEnv = process.env): Promise<NodeJS.ProcessEnv> {
+  const root = await realpath(resolve(cwd));
+  const directory = join(root, '.tmp');
+  try { await mkdir(directory, { mode: 0o700 }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  const info = await lstat(directory);
+  const actual = await realpath(directory);
+  const part = relative(root, actual);
+  const same = process.platform === 'win32' ? actual.toLowerCase() === directory.toLowerCase() : actual === directory;
+  if (!info.isDirectory() || info.isSymbolicLink() || !same || part === '..' || part.startsWith('../')
+    || part.startsWith('..\\') || isAbsolute(part)) throw new Error('临时目录 .tmp 须为本组内的普通目录，不能使用符号链接或目录联接。');
+  const env = { ...inherited };
+  for (const key of Object.keys(env)) {
+    if (['TEMP', 'TMP', 'TMPDIR'].includes(key.toUpperCase())) delete env[key];
+  }
+  return { ...env, TEMP: directory, TMP: directory, TMPDIR: directory };
+}
+
+/** Persist the empty Pi header immediately, so closing before a first turn still resets context. */
+export async function createFreshSession(cwd: string): Promise<string> {
+  const root = await realpath(cwd);
+  let directory = root;
+  for (const part of ['.pi', 'sessions']) {
+    directory = join(directory, part);
+    await mkdir(directory, { recursive: true });
+    const info = await lstat(directory);
+    const actual = await realpath(directory);
+    const same = process.platform === 'win32' ? actual.toLowerCase() === directory.toLowerCase() : actual === directory;
+    if (!info.isDirectory() || info.isSymbolicLink() || !same) throw new Error('会话目录须为本组内的普通目录。');
+  }
+  const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+  const session = SessionManager.create(root, directory);
+  const path = session.getSessionFile()!;
+  const handle = await open(path, 'wx', 0o600);
+  try { await handle.writeFile(JSON.stringify(session.getHeader()) + '\n'); await handle.sync(); }
+  finally { await handle.close(); }
+  return path;
 }
 
 export async function openGroup(cwd: string, extraArgs: string[] = [], options: OpenGroupOptions = {}): Promise<number> {
@@ -100,11 +148,22 @@ export async function openGroup(cwd: string, extraArgs: string[] = [], options: 
   if (!config) throw new Error("该对话组尚未初始化。请先运行 init <对话组标识> --name <名称>。");
   if (!config.conversations.length) throw new Error('请先向对话组添加至少一个对话。');
   await assertAssignments(cwd, config);
-  const env = { ...process.env, ...options.env };
+  const env = await groupTemporaryEnvironment(cwd, { ...process.env, ...options.env });
   const launcher = await resolvePiCommand(env);
   const selectedModel = await modelArguments(cwd);
+  const sessionFile = options.sessionFile ?? (options.freshSession ? await createFreshSession(cwd) : undefined);
+  if (sessionFile) {
+    const directory = await realpath(join(cwd, '.pi', 'sessions'));
+    const path = await realpath(sessionFile);
+    const part = relative(directory, path);
+    const info = await lstat(sessionFile);
+    if (!part || part.startsWith('..') || isAbsolute(part) || info.isSymbolicLink() || !info.isFile() || info.nlink > 1) {
+      throw new Error('指定会话须为本组 .pi/sessions 内的普通文件。');
+    }
+  }
+  const sessionArgs = sessionFile ? ['--session', sessionFile] : ['--continue'];
   return await new Promise<number>((resolveCode, reject) => {
-    const child = spawn(launcher.command, [...launcher.args, "--continue", "--session-dir", join(cwd, ".pi", "sessions"), ...selectedModel, ...extraArgs], {
+    const child = spawn(launcher.command, [...launcher.args, ...sessionArgs, "--session-dir", join(cwd, ".pi", "sessions"), ...selectedModel, ...extraArgs], {
       cwd, stdio: "inherit", env, shell: false, windowsHide: true,
     });
     let registration: Promise<void> = Promise.resolve();
@@ -128,11 +187,12 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
       "node src/cli.ts init <对话组标识> --name <名称> [--conversation group:群号] [--conversation private:QQ号]",
       "  [--conversation temporary:来源群:QQ号]",
       "  [--root <目录>] [--url <WebSocket地址>] [--token-env <变量名>]",
-      "node src/cli.ts open <对话组标识> [--root <目录>] [-- <Pi参数...>]",
+      "node src/cli.ts open <对话组标识> [--root <目录>] [--new-session] [-- <Pi参数...>]",
       "node src/cli.ts path <对话组标识> [--root <目录>]", "",
       "默认目录：文档/PiQ-Messages/<对话组标识>。每个对话只能属于一个对话组。",
       "--conversation 可以重复使用；未添加对话的空组可先编辑配置。",
       "open 继承当前终端、模型配置和环境变量，并继续本组 .pi/sessions 中的最近会话。",
+      "--new-session 新建空上下文，保留已有会话、聊天日志、记忆与资料；关闭终端即停止运行。",
       "首次启动请在 Pi 中信任本组目录，以加载 .pi/settings.json 声明的扩展。",
     ].join("\n"));
     return 0;
@@ -151,7 +211,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   if (options.action === "path") { console.log(cwd); return 0; }
   const config = await loadConfig(cwd);
   if (config && config.id !== options.id) throw new Error("目录中 PIQ.md 的对话组标识与请求不一致。");
-  return await openGroup(cwd, options.piArgs);
+  return await openGroup(cwd, options.piArgs, { freshSession: options.freshSession });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

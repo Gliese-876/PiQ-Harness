@@ -1,12 +1,8 @@
-import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { mkdir, open, readFile, realpath, lstat, rename, unlink } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { mkdir, readFile, realpath, lstat } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { loadConfig } from './config.ts';
-import { getRunningOwner, openGroupTerminal, resolveGroupEnvironment, type CredentialOptions } from './web-terminal.ts';
-import { getTerminalReturnError } from './terminal-monitor.ts';
+import { getRunningOwner, openGroupTerminal, type TerminalOptions } from './web-terminal.ts';
+import { getTerminalLaunchStatus, getTerminalReturnError } from './terminal-monitor.ts';
 
 interface Worker {
   version: 1;
@@ -89,29 +85,6 @@ async function pendingLaunch(cwd: string): Promise<PendingLaunch | null> {
   } catch (error) { if (missing(error)) return null; throw new Error('后台启动记录无效，请检查本群 .piq/worker-launch.json。'); }
 }
 
-async function savePendingLaunch(cwd: string, launch: PendingLaunch): Promise<void> {
-  const path = await localPath(cwd, 'worker-launch.json', true);
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  try {
-    const handle = await open(temporary, 'wx', 0o600);
-    try { await handle.writeFile(JSON.stringify(launch) + '\n', 'utf8'); await handle.sync(); }
-    finally { await handle.close(); }
-    for (let attempt = 0; ; attempt++) {
-      try { await localPath(cwd, 'worker-launch.json'); await rename(temporary, path); break; }
-      catch (error) {
-        if (process.platform !== 'win32' || attempt >= 5 || !['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
-        await delay(20 * (attempt + 1));
-      }
-    }
-  } finally { await unlink(temporary).catch(error => { if (!missing(error)) throw error; }); }
-}
-
-/** The startup lock is still held, so another launcher cannot replace this record. */
-async function forgetPendingLaunch(cwd: string, launchId: string): Promise<void> {
-  if ((await pendingLaunch(cwd))?.launchId !== launchId) return;
-  await unlink(await localPath(cwd, 'worker-launch.json')).catch(error => { if (!missing(error)) throw error; });
-}
-
 async function ownerToken(cwd: string): Promise<string | undefined> {
   try {
     const value: unknown = JSON.parse(await readFile(await localPath(cwd, 'owner.lock'), 'utf8'));
@@ -138,6 +111,8 @@ export async function getProcessStatus(cwd: string): Promise<ProcessStatus> {
   if (record && record.state === 'starting' && alive(record.pid)) {
     return { running: false, pid: record.pid, mode: 'background', starting: true };
   }
+  const terminal = await getTerminalLaunchStatus(cwd);
+  if (terminal.running || terminal.starting) return { ...terminal, mode: 'terminal' };
   const terminalError = await getTerminalReturnError(cwd);
   return { running: false, pid: null, mode: null, starting: false,
     ...(terminalError ? { error: terminalError }
@@ -151,123 +126,14 @@ async function exclusive<T>(cwd: string, operation: () => Promise<T>): Promise<T
   try { return await task; } finally { if (queues.get(cwd) === task) queues.delete(cwd); }
 }
 
-async function startupLock(cwd: string): Promise<() => Promise<void>> {
-  const filename = await localPath(cwd, 'start.lock', true);
-  const token = randomUUID();
-  const write = async () => {
-    const handle = await open(filename, 'wx', 0o600);
-    try { await handle.writeFile(JSON.stringify({ pid: process.pid, token }), 'utf8'); }
-    finally { await handle.close(); }
-  };
-  try { await write(); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    const existing: unknown = JSON.parse(await readFile(filename, 'utf8'));
-    if (!object(existing) || !Number.isSafeInteger(existing.pid) || Number(existing.pid) <= 0 || alive(Number(existing.pid))) {
-      throw new Error('本群正在启动，请稍候再试。');
-    }
-    // One short-lived recovery lease prevents concurrent stale-lock replacement.
-    const recovery = `${filename}.recover`;
-    const handle = await open(recovery, 'wx', 0o600).catch(() => { throw new Error('本群启动锁正在恢复，请稍候再试。'); });
-    try {
-      const current = JSON.parse(await readFile(filename, 'utf8')) as { pid?: number; token?: string };
-      if (current.token !== existing.token || !current.pid || alive(current.pid)) throw new Error('本群正在启动，请稍候再试。');
-      await unlink(filename);
-      await write();
-    } finally { await handle.close(); await unlink(recovery); }
-  }
-  return async () => {
-    try {
-      const current = JSON.parse(await readFile(filename, 'utf8')) as { token?: string };
-      if (current.token === token) await unlink(filename);
-    } catch (error) { if (!missing(error)) throw error; }
-  };
-}
-
-export interface BackgroundLaunch {
-  command: string;
-  args: string[];
-  cwd: string;
-  env: NodeJS.ProcessEnv;
-}
-
-interface LaunchedProcess { pid: number; exited?: () => boolean }
-
-export interface StartOptions extends CredentialOptions {
-  launch?: (specification: BackgroundLaunch) => Promise<LaunchedProcess>;
-  timeoutMs?: number;
-  /** Automatic terminal return retains paused state and interrupted work. */
-  preserveRunState?: boolean;
-}
-
 export interface ProcessResult { message: string; alreadyRunning?: boolean; starting?: boolean; pid?: number }
 
-async function launchBackground(specification: BackgroundLaunch): Promise<LaunchedProcess> {
-  return await new Promise((resolveLaunch, reject) => {
-    const child = spawn(specification.command, specification.args, {
-      cwd: specification.cwd, env: specification.env, shell: false,
-      detached: true, windowsHide: true, stdio: 'ignore',
-    });
-    child.once('error', () => reject(new Error('无法启动后台 Pi，请检查 Node.js 安装。')));
-    child.once('spawn', () => {
-      if (!child.pid) { reject(new Error('后台 Pi 没有返回进程标识。')); return; }
-      child.unref();
-      resolveLaunch({ pid: child.pid, exited: () => child.exitCode !== null || child.signalCode !== null });
-    });
-  });
-}
-
-/** Start a persistent hidden worker; restarting the WebUI does not own or kill it. */
-export async function startGroup(cwd: string, options: StartOptions = {}): Promise<ProcessResult> {
-  const directory = await realpath(resolve(cwd));
-  return exclusive(directory, async () => {
-    const config = await loadConfig(directory);
-    if (!config) throw new Error('请先初始化本群目录。');
-    if (!config.conversations.length) throw new Error('请先给对话组添加至少一个对话。');
-    const existing = await getProcessStatus(directory);
-    if (existing.running || existing.starting) return { message: existing.starting ? '本群 Pi 正在启动。' : '本群 Pi 已运行。', alreadyRunning: true, starting: existing.starting, pid: existing.pid ?? undefined };
-    const release = await startupLock(directory);
-    try {
-      const afterLock = await getProcessStatus(directory);
-      if (afterLock.running || afterLock.starting) return { message: '本群 Pi 已运行或正在启动。', alreadyRunning: true, starting: afterLock.starting, pid: afterLock.pid ?? undefined };
-      const launchId = randomUUID();
-      const startedAt = Date.now();
-      const { env } = await resolveGroupEnvironment(directory, config, options);
-      const launchEnv: NodeJS.ProcessEnv = { ...env, PIQ_LAUNCH_ID: launchId, PIQ_RUN_MODE: 'background' };
-      if (options.preserveRunState) delete launchEnv.PIQ_START_RUNNING;
-      else launchEnv.PIQ_START_RUNNING = '1';
-      const childProcess = await (options.launch ?? launchBackground)({
-        command: globalThis.process.execPath,
-        args: [fileURLToPath(new URL('./background.ts', import.meta.url)), directory],
-        cwd: directory,
-        env: launchEnv,
-      });
-      if (!Number.isSafeInteger(childProcess.pid) || childProcess.pid <= 0) throw new Error('后台 Pi 没有返回有效进程标识。');
-      await savePendingLaunch(directory, { version: 1, launchId, pid: childProcess.pid, startedAt });
-      const deadline = Date.now() + (options.timeoutMs ?? 8_000);
-      do {
-        const record = await worker(directory);
-        const owner = await getRunningOwner(directory);
-        if (record?.launchId === launchId) {
-          if (record.state === 'error' || record.state === 'stopped') {
-            await forgetPendingLaunch(directory, launchId);
-            throw new Error('后台 Pi 启动失败，请检查本群模型配置与扩展。');
-          }
-          if (record.state === 'running' && owner.running && owner.pid === childProcess.pid && record.ownerToken === await ownerToken(directory)) {
-            await forgetPendingLaunch(directory, launchId);
-            return { message: '本群 Pi 已在后台启动，并继续最近的会话。', pid: childProcess.pid };
-          }
-        }
-        if (childProcess.exited?.()) {
-          await forgetPendingLaunch(directory, launchId);
-          throw new Error('后台 Pi 在启动完成前退出，请检查本群配置。');
-        }
-        if (Date.now() >= deadline) break;
-        await delay(100);
-      } while (true);
-      return { message: '后台 Pi 正在启动，页面会继续更新状态。', starting: true, pid: childProcess.pid };
-    } finally { await release(); }
-  });
+/** Starting a group always opens a user-owned terminal. */
+export async function startGroup(cwd: string, options: TerminalOptions = {}): Promise<ProcessResult> {
+  const status = await getProcessStatus(cwd);
+  if (status.running || status.starting) return { message: status.starting ? '本组 Pi 正在启动。' : '本组 Pi 已运行。',
+    alreadyRunning: true, starting: status.starting, pid: status.pid ?? undefined };
+  return openGroupTerminal(cwd, options);
 }
 
 export interface HandoffOptions {

@@ -8,7 +8,8 @@ const state = {
   membershipSaved: '', membershipLoaded: false, membershipOutdated: false, configLoading: false, logConversation: '',
   models: null, modelCatalogError: '', modelSaved: '', modelRevision: '', modelLoaded: false, modelSequence: 0,
   modelRuntime: null, modelPendingRequestId: null, modelAwaitStarted: 0, modelAwaitTimedOut: false, modelRuntimeLoading: false,
-  busy: false, loadingState: false, poll: null,
+  busy: false, loadingState: false, poll: null, registryVersion: 0,
+  groupPending: new Map(), trashEntries: [], trashLoading: false, trashSequence: 0, trashPending: new Set(), trashError: '',
   runPending: new Map(), runPoll: null, terminalPending: new Set(),
   serviceCache: new Map(), servicePending: new Map(),
 };
@@ -133,7 +134,7 @@ function addConversationRow(container, value = { type: 'group', id: '' }) {
   if (container === 'conversation-rows') updateMembershipState();
 }
 function updateMembershipState() {
-  const dirty = membershipDirty(), locked = membershipLocked(), enabled = state.membershipLoaded && !locked && !state.busy && !state.configLoading;
+  const dirty = membershipDirty(), locked = membershipLocked(), enabled = state.membershipLoaded && !locked && !state.busy && !state.configLoading && !state.groupPending.has(state.selected);
   $('membership-lock').hidden = !locked;
   $('membership-outdated').hidden = !state.membershipOutdated;
   $('reload-config').disabled = !state.detail || state.busy || state.configLoading;
@@ -168,14 +169,14 @@ function updateDocumentState(saved = false) {
   const dirty = documentDirty();
   $('document-state').classList.toggle('dirty', dirty);
   $('document-state').textContent = !state.documentLoaded ? '正在读取…' : dirty ? '有未保存的修改' : saved ? '已保存' : `${$('document-content').value.length.toLocaleString()} 字符 · 已保存`;
-  $('save-document').disabled = !state.documentLoaded || !dirty || state.busy;
+  $('save-document').disabled = !state.documentLoaded || !dirty || state.busy || state.groupPending.has(state.selected);
 }
 
 function updateConfigState() {
   const dirty = configDirty();
   $('config-state').classList.toggle('dirty', dirty);
   $('config-state').textContent = dirty ? '有未保存的修改' : '已保存';
-  $('save-config').disabled = !dirty || state.busy || state.configLoading;
+  $('save-config').disabled = !dirty || state.busy || state.configLoading || state.groupPending.has(state.selected);
 }
 
 function renderGroups() {
@@ -194,7 +195,7 @@ function renderGroups() {
     const text = document.createElement('span'); text.className = 'group-item-text';
     const title = document.createElement('span'); title.className = 'group-item-title'; title.textContent = group.name || group.id;
     const sub = document.createElement('span'); sub.className = 'group-item-subtitle';
-    sub.textContent = !group.running ? `${group.conversations?.length ?? 0} 个对话` : group.runtime?.paused ? 'Pi 已暂停' : group.runtime?.mode === 'background' ? 'Pi 后台运行' : 'Pi 正在运行';
+    sub.textContent = !group.running ? `${group.conversations?.length ?? 0} 个对话` : group.runtime?.paused ? 'Pi 已暂停' : 'Pi 正在运行';
     text.append(title, sub); button.append(icon, text);
     if (group.running) { const dot = document.createElement('span'); dot.className = `live-dot${group.runtime?.paused ? ' paused' : ''}`; dot.setAttribute('aria-label', group.runtime?.paused ? '已暂停' : '正在运行'); button.append(dot); }
     button.addEventListener('click', () => selectGroup(group.id));
@@ -224,11 +225,11 @@ function renderRunStatus() {
   $('connection-status').textContent = connectionLabels[connection] || '连接状态待更新';
   $('connection-status').className = `connection-status ${connection || 'unknown'}`;
   $('connection-status').title = ['connected', 'ready'].includes(connection) ? '' : runtime?.lastError || service?.diagnostic || '';
-  $('terminal-note').textContent = !running ? '继续本对话组最近的会话' : runtime?.mode === 'background' ? '本对话组会话在后台运行' : runtime?.mode === 'terminal' ? '本对话组会话已在终端中运行' : '本对话组会话正在运行';
+  $('terminal-note').textContent = !running ? '打开终端继续最近会话' : runtime?.mode === 'background' ? '旧实例运行中，请先停止再打开终端' : '关闭终端即停止本组 Pi';
   const descriptions = [];
   if (state.detail && !running && !starting && !state.detail.config.conversations.length) descriptions.push('添加并保存至少一个对话后即可启动 Pi');
   if (paused) descriptions.push('暂停中，消息继续保存');
-  else if (running) descriptions.push(runtime?.mode === 'background' ? 'Pi 在后台运行' : runtime?.mode === 'terminal' ? 'Pi 在终端运行' : 'Pi 进程已启动');
+  else if (running) descriptions.push(runtime?.mode === 'background' ? '检测到旧实例，请停止后通过终端运行' : 'Pi 在终端运行，关窗即停止');
   if (running && Number.isFinite(runtime?.pendingCount) && runtime.pendingCount > 0) descriptions.push(`待处理 ${runtime.pendingCount} 条消息`);
   if (running && runtime?.lastError) descriptions.push(runtime.lastError);
   else if (running && ['disconnected', 'error'].includes(connection)) descriptions.push('等待 SnowLuma 连接，暂时无法发送 QQ 消息');
@@ -248,14 +249,16 @@ function renderRunStatus() {
   for (const option of $('log-conversation').options) if (option.value) option.textContent = logConversationLabel(option.value);
   const action = !running ? 'start' : paused ? 'resume' : 'pause';
   $('run-action').dataset.action = action;
-  $('run-action').textContent = pending ? ({ start: '正在启动…', pause: '正在暂停…', resume: '正在恢复…', stop: '正在停止…' }[pending.action]) : ({ start: '启动 Pi', pause: '暂停', resume: '恢复运行' }[action]);
+  $('run-action').textContent = terminalPending ? '正在打开终端…' : pending ? ({ start: '正在打开终端…', pause: '正在暂停…', resume: '正在恢复…', stop: '正在停止…' }[pending.action]) : ({ start: '打开 Pi 终端', pause: '暂停', resume: '恢复运行' }[action]);
   const noConversations = !state.detail?.config.conversations.length;
   $('run-action').disabled = !state.detail || !!pending || starting || terminalPending || !!servicePending || (!running && noConversations);
   $('stop-run').hidden = !running;
   $('stop-run').disabled = !running || !!pending || terminalPending || !!servicePending;
   $('stop-run').textContent = pending?.action === 'stop' ? '正在停止…' : '停止';
   $('open-terminal').disabled = !state.detail || !!pending || starting || terminalPending || !!servicePending || noConversations;
-  $('open-terminal').title = running && runtime?.mode === 'background' ? '将当前会话交给交互终端继续' : running ? '查看已有 Pi 终端' : '在交互终端中继续本对话组会话';
+  $('open-terminal').hidden = !running;
+  $('open-terminal').title = runtime?.mode === 'background' ? '请先停止旧实例，再打开 Pi 终端' : '查看已有 Pi 终端';
+  if (runtime?.mode === 'background') $('open-terminal').disabled = true;
   $('service-recovery').hidden = !state.detail || runtime?.connection === 'connected';
   $('service-recovery').classList.toggle('error', service?.ok === false && !servicePending);
   $('service-message').textContent = servicePending
@@ -271,6 +274,172 @@ function renderRunStatus() {
   $('open-snowluma').title = cannotOpenManual ? service.diagnostic || service.message || '此连接没有可打开的本机界面，请检查 SnowLuma 安装或远端服务。' : '打开 SnowLuma 界面或启动窗口，查看登录和运行情况';
   if (current?.name) $('group-title').textContent = current.name;
   updateMembershipState();
+  renderGroupManagement();
+}
+
+function renderGroupManagement() {
+  const pending = state.groupPending.get(state.selected);
+  const current = state.groups.find(group => group.id === state.selected);
+  const unavailable = !state.detail || !!pending || state.busy || state.configLoading;
+  $('rename-group').disabled = unavailable;
+  $('delete-group').disabled = unavailable || membershipLocked();
+  $('new-session').disabled = unavailable || !!current?.starting || state.runPending.has(state.selected)
+    || state.terminalPending.has(state.selected) || state.servicePending.has(state.selected) || !state.detail?.config.conversations.length;
+  $('group-menu-help').textContent = pending ? '正在处理，请稍候…' : membershipLocked()
+    ? '删除前请先停止本组 Pi。重开会话会先结束当前会话。' : '删除后可从回收站恢复；重开会话保留文档和历史记录。';
+  if (pending) {
+    for (const id of ['run-action', 'stop-run', 'open-terminal', 'recover-connection', 'open-snowluma']) $(id).disabled = true;
+  }
+  updateDocumentState(); updateConfigState(); updateModelState();
+}
+
+function validGroupName(value) {
+  const name = value.trim();
+  if (!name || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)) throw new Error('名称须为 1 到 80 个字符，且不含控制字符。');
+  return name;
+}
+
+function clearGroupSelection() {
+  state.selected = null; state.detail = null; state.detailSequence++;
+  state.documentSequence++; state.logSequence++; state.modelSequence++;
+  state.documentLoaded = false; state.membershipLoaded = false; state.modelLoaded = false;
+  state.modelRuntime = null; state.modelPendingRequestId = null;
+  $('document-content').value = ''; $('group-workspace').hidden = true; $('welcome').hidden = false;
+  $('group-menu').open = false;
+  try { localStorage.removeItem('piq:selected-group'); } catch { /* Storage is optional. */ }
+}
+
+async function manageGroup(action) {
+  const id = state.selected, detail = state.detail, sequence = state.detailSequence;
+  if (!id || !detail || state.groupPending.has(id) || state.busy || state.configLoading) return;
+  if (action === 'delete' && membershipLocked()) { notice('请先停止本组 Pi，再移入回收站。', true); return; }
+  let name;
+  if (action === 'rename') {
+    if (membershipDirty() || configDirty()) { notice('请先保存或重新读取当前设置，再重命名。', true); return; }
+    const requested = window.prompt('对话组新名称', detail.config.name);
+    if (requested === null) return;
+    try { name = validGroupName(requested); } catch (error) { notice(error.message, true); return; }
+    if (name === detail.config.name) return;
+  } else if (action === 'delete') {
+    if (!mayDiscard() || !window.confirm('将对话组“' + detail.config.name + '”移入回收站？\n\n文档、聊天记录、资料和 Pi 会话历史都会保留，可在回收站恢复。')) return;
+  } else return;
+  $('group-menu').open = false;
+  state.groupPending.set(id, action); renderRunStatus();
+  try {
+    if (action === 'rename') {
+      const result = await api(groupUrl(id) + '/config', { method: 'PUT', body: { config: { ...detail.config, name }, revision: state.configRevision } });
+      state.registryVersion++;
+      const group = state.groups.find(item => item.id === id); if (group) group.name = result.config.name;
+      if (id === state.selected && sequence === state.detailSequence) {
+        state.detail.config = result.config; state.detail.configRevision = result.revision; state.configRevision = result.revision;
+        $('group-name').value = result.config.name; state.membershipSaved = JSON.stringify(membershipValue());
+        notice('对话组已重命名为“' + result.config.name + '”。');
+      }
+      renderGroups();
+    } else {
+      await api(groupUrl(id), { method: 'DELETE' });
+      state.registryVersion++;
+      state.groups = state.groups.filter(group => group.id !== id);
+      state.serviceCache.delete(id); state.runPending.delete(id);
+      if (id === state.selected) {
+        clearGroupSelection();
+        const next = state.groups[0]?.id;
+        if (next) await selectGroup(next, true);
+      }
+      renderGroups();
+      await refreshState();
+      notice('对话组“' + detail.config.name + '”已移入回收站。');
+      if ($('trash-dialog').open) await loadTrash();
+    }
+  } catch (error) {
+    if (id === state.selected && sequence === state.detailSequence) notice(error.message, true);
+  } finally { state.groupPending.delete(id); renderRunStatus(); }
+}
+
+async function newSession() {
+  const id = state.selected, detail = state.detail, sequence = state.detailSequence;
+  if (!id || !detail || $('new-session').disabled) return;
+  if (documentDirty() || configDirty() || membershipDirty() || modelDirty()) { notice('请先保存当前修改，再重开 Pi 会话。', true); return; }
+  if (!window.confirm('为“' + detail.config.name + '”重开 Pi 会话？\n\n当前 Pi 会先停止，再打开一个空上下文的新终端会话。原有聊天日志、文档、记忆、资料和旧会话文件会保留；新会话不会加载旧会话上下文。')) return;
+  $('group-menu').open = false;
+  state.groupPending.set(id, 'new-session'); renderRunStatus();
+  try {
+    const result = await api(groupUrl(id) + '/new-session', { method: 'POST', body: {} });
+    rememberService(id, result);
+    if (id === state.selected && sequence === state.detailSequence) {
+      state.modelRuntime = null; state.modelLoaded = false; state.modelSequence++;
+      state.modelPendingRequestId = null; state.modelAwaitTimedOut = false;
+      $('model-runtime').textContent = '正在打开新的 Pi 会话…'; $('model-runtime').classList.remove('error');
+      notice(result.message || '已请求打开空上下文的新会话，旧会话文件已保留。');
+    }
+    await refreshState();
+  } catch (error) {
+    rememberService(id, error.response);
+    if (id === state.selected && sequence === state.detailSequence) notice(error.message, true);
+  } finally { state.groupPending.delete(id); renderRunStatus(); }
+}
+
+function renderTrash() {
+  const list = $('trash-list'); list.replaceChildren();
+  $('trash-status').textContent = state.trashLoading ? '正在读取…' : state.trashEntries.length + ' 个对话组';
+  $('refresh-trash').disabled = state.trashLoading || state.trashPending.size > 0;
+  $('trash-error').textContent = state.trashError;
+  $('trash-error').hidden = !state.trashError;
+  $('trash-empty').hidden = state.trashLoading || !!state.trashError || state.trashEntries.length > 0;
+  for (const entry of state.trashEntries) {
+    const row = document.createElement('article'); row.className = 'trash-entry';
+    const copy = document.createElement('div'); copy.className = 'trash-entry-copy';
+    const heading = document.createElement('h3'); heading.textContent = entry.name || entry.id;
+    const meta = document.createElement('p');
+    const date = new Date(entry.deletedAt);
+    meta.textContent = entry.id + (Number.isFinite(date.getTime()) ? ' · 删除于 ' + date.toLocaleString('zh-CN', { hour12: false }) : '');
+    copy.append(heading, meta);
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'button subtle';
+    button.textContent = state.trashPending.has(entry.token) ? '正在恢复…' : '恢复';
+    button.disabled = state.trashLoading || state.trashPending.size > 0;
+    button.setAttribute('aria-label', '恢复对话组“' + (entry.name || entry.id) + '”');
+    button.addEventListener('click', () => restoreGroup(entry));
+    row.append(copy, button); list.append(row);
+  }
+}
+
+async function loadTrash() {
+  const sequence = ++state.trashSequence;
+  state.trashLoading = true; state.trashError = ''; renderTrash();
+  try {
+    const result = await api('/api/trash');
+    if (sequence !== state.trashSequence) return;
+    if (!Array.isArray(result.entries) || result.entries.some(entry => !entry || typeof entry.token !== 'string' || typeof entry.id !== 'string' || typeof entry.name !== 'string')) throw new Error('回收站返回格式无效，请刷新后重试。');
+    state.trashEntries = result.entries;
+  } catch (error) {
+    if (sequence === state.trashSequence) state.trashError = error.message;
+  } finally {
+    if (sequence === state.trashSequence) { state.trashLoading = false; renderTrash(); }
+  }
+}
+
+function showTrash() {
+  $('trash-dialog').showModal();
+  void loadTrash();
+}
+
+function closeTrash() {
+  state.trashSequence++; state.trashLoading = false;
+  $('trash-dialog').close();
+}
+
+async function restoreGroup(entry) {
+  if (state.trashPending.size || state.trashLoading) return;
+  state.trashPending.add(entry.token); state.trashError = ''; renderTrash();
+  try {
+    const result = await api('/api/trash/' + encodeURIComponent(entry.token) + '/restore', { method: 'POST', body: {} });
+    state.registryVersion++;
+    state.trashEntries = state.trashEntries.filter(item => item.token !== entry.token);
+    await refreshState();
+    if (!state.selected) await selectGroup(result.id, true);
+    notice('对话组“' + (result.name || entry.name) + '”已恢复。');
+  } catch (error) { state.trashError = error.message; }
+  finally { state.trashPending.delete(entry.token); renderTrash(); }
 }
 
 function rememberService(id, result) {
@@ -337,6 +506,7 @@ async function controlRun(requestedAction) {
   const id = state.selected;
   const action = typeof requestedAction === 'string' ? requestedAction : $('run-action').dataset.action;
   if (!id || (action === 'stop' ? $('stop-run').disabled : $('run-action').disabled)) return;
+  if (action === 'start') { await openTerminal(); return; }
   const pending = { action, startedAt: Date.now(), requestId: null, submitting: true };
   state.runPending.set(id, pending);
   renderRunStatus();
@@ -361,8 +531,10 @@ async function controlRun(requestedAction) {
 async function refreshState(initial = false) {
   if (state.loadingState) return;
   state.loadingState = true;
+  const registryVersion = state.registryVersion;
   try {
     const next = await api('/api/state');
+    if (registryVersion !== state.registryVersion) return;
     state.csrfToken = next.csrfToken;
     state.groups = next.groups;
     for (const group of next.groups) if (group.service) state.serviceCache.set(group.id, group.service);
@@ -392,7 +564,10 @@ async function refreshState(initial = false) {
   } catch (error) {
     if (initial) { $('group-list').textContent = '读取对话组目录失败'; $('welcome').hidden = true; }
     notice(error.message, true);
-  } finally { state.loadingState = false; }
+  } finally {
+    state.loadingState = false;
+    if (registryVersion !== state.registryVersion) void refreshState();
+  }
 }
 
 async function selectGroup(id, force = false) {
@@ -400,6 +575,7 @@ async function selectGroup(id, force = false) {
   if (!force && !mayDiscard()) return;
   const sequence = ++state.detailSequence;
   state.documentSequence++; state.logSequence++; state.modelSequence++;
+  $('group-menu').open = false;
   state.selected = id; state.detail = null; state.documentLoaded = false; state.modelLoaded = false;
   state.membershipLoaded = false; state.membershipOutdated = false; state.configLoading = false; state.logConversation = '';
   state.modelRuntime = null; state.modelPendingRequestId = null; state.modelAwaitTimedOut = false;
@@ -515,7 +691,7 @@ async function loadDocument(filename, force = false) {
 }
 
 async function saveDocument() {
-  if (!documentDirty() || state.busy) return;
+  if (!documentDirty() || state.busy || state.groupPending.has(state.selected)) return;
   const id = state.selected, filename = state.document, content = $('document-content').value;
   state.busy = true; updateDocumentState();
   try {
@@ -529,7 +705,7 @@ async function saveDocument() {
 
 async function saveConfig(event) {
   event.preventDefault();
-  if (!configDirty() || state.busy || !$('connection-form').reportValidity()) return;
+  if (!configDirty() || state.busy || state.groupPending.has(state.selected) || !$('connection-form').reportValidity()) return;
   const config = configValue();
   if (config.quietMs > config.maxWaitMs) { notice('最长等待不能小于静默等待。', true); return; }
   const id = state.selected, sequence = state.detailSequence;
@@ -554,7 +730,7 @@ async function saveConfig(event) {
 
 async function saveMembership(event) {
   event.preventDefault();
-  if (!membershipDirty() || membershipLocked() || state.busy || !$('membership-form').reportValidity()) return;
+  if (!membershipDirty() || membershipLocked() || state.busy || state.groupPending.has(state.selected) || !$('membership-form').reportValidity()) return;
   const id = state.selected, sequence = state.detailSequence;
   let chosen;
   try {
@@ -607,7 +783,7 @@ function updateModelState() {
   const dirty = modelDirty();
   $('model-state').classList.toggle('dirty', dirty);
   $('model-state').textContent = !state.modelLoaded ? '正在读取…' : dirty ? '有未保存的修改' : '已保存';
-  $('save-model').disabled = !state.modelLoaded || !dirty || state.busy;
+  $('save-model').disabled = !state.modelLoaded || !dirty || state.busy || state.groupPending.has(state.selected);
 }
 
 function currentModelDescription(runtime) {
@@ -730,7 +906,7 @@ async function loadModel() {
 
 async function saveModel(event) {
   event.preventDefault();
-  if (!modelDirty() || state.busy) return;
+  if (!modelDirty() || state.busy || state.groupPending.has(state.selected)) return;
   const id = state.selected, preference = modelValue();
   state.busy = true; updateModelState();
   try {
@@ -895,14 +1071,14 @@ async function loadLog() {
 
 async function openTerminal() {
   if (!state.selected || $('open-terminal').disabled) return;
-  const id = state.selected;
+  const id = state.selected, sequence = state.detailSequence;
   state.terminalPending.add(id); renderRunStatus();
   try {
     const result = await api(`${groupUrl(id)}/open`, { method: 'POST', body: {} });
     rememberService(id, result);
-    notice(result.message || (result.alreadyRunning ? '本对话组 Pi 已在运行，请切换到对应终端。' : '已请求打开终端，将继续本对话组最近的会话。'));
+    if (id === state.selected && sequence === state.detailSequence) notice(result.message || (result.alreadyRunning ? '本对话组 Pi 已在运行，请切换到对应终端。' : '已请求打开终端，将继续本对话组最近的会话；关闭终端即停止。'));
     await refreshState();
-  } catch (error) { rememberService(id, error.response); notice(error.message, true); }
+  } catch (error) { rememberService(id, error.response); if (id === state.selected && sequence === state.detailSequence) notice(error.message, true); }
   finally { state.terminalPending.delete(id); renderRunStatus(); }
 }
 
@@ -920,6 +1096,7 @@ async function addGroup(event) {
     const body = { name: $('new-group-name').value.trim(), conversations: validateConversations(readConversationRows('new-conversation-rows')), wsUrl: $('new-ws-url').value.trim() };
     if ($('new-group-id').value.trim()) body.id = $('new-group-id').value.trim();
     const result = await api('/api/groups', { method: 'POST', body });
+    state.registryVersion++;
     $('add-dialog').close();
     await refreshState();
     if (mayDiscard()) await selectGroup(result.id, true);
@@ -928,6 +1105,14 @@ async function addGroup(event) {
   finally { $('confirm-add').disabled = false; }
 }
 
+$('rename-group').addEventListener('click', () => manageGroup('rename'));
+$('delete-group').addEventListener('click', () => manageGroup('delete'));
+$('new-session').addEventListener('click', newSession);
+$('open-trash').addEventListener('click', showTrash);
+$('close-trash').addEventListener('click', closeTrash);
+$('done-trash').addEventListener('click', closeTrash);
+$('refresh-trash').addEventListener('click', loadTrash);
+$('trash-dialog').addEventListener('cancel', () => { state.trashSequence++; state.trashLoading = false; });
 $('document-content').addEventListener('input', () => updateDocumentState());
 $('save-document').addEventListener('click', saveDocument);
 $('connection-form').addEventListener('input', updateConfigState);

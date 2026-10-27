@@ -135,7 +135,7 @@ async function atomicFile(path: string, text: string): Promise<void> {
 }
 
 /** One root lease covers config edits and runtime conversation claims. */
-async function withRootLock<T>(rootInput: string, operation: (root: string) => Promise<T>): Promise<T> {
+export async function withRootLock<T>(rootInput: string, operation: (root: string) => Promise<T>): Promise<T> {
   await mkdir(rootInput, { recursive: true });
   const root = await realpath(rootInput);
   const path = await localFile(root, '.piq-config.lock');
@@ -210,7 +210,8 @@ async function activeClaims(cwd: string): Promise<string[]> {
   return value.keys.map(key => conversationKey(parseConversationKey(key)));
 }
 
-async function checkAssignments(root: string, candidate?: GroupConfig): Promise<GroupListing[]> {
+/** Call while holding withRootLock when validating a registry mutation. */
+export async function checkAssignments(root: string, candidate?: GroupConfig): Promise<GroupListing[]> {
   const groups = await scanGroups(root);
   const owners = new Map<string, string>();
   const claim = (key: string, id: string) => {
