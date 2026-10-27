@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rename, rm, rmdir, writeFile } from "node:fs/promises";
+import { spawn } from 'node:child_process';
 import path from "node:path";
 import test from "node:test";
 import { GroupStore, parseStoredMessage, parseStoredRecord, type IncomingRecord, type StoredMessage, type StoredPoke } from "../src/store.ts";
@@ -11,11 +12,72 @@ const group: Conversation = { type: 'group', id: '123456' };
 const privateChat: Conversation = { type: 'private', id: '123456' };
 const config = { id: 'shared-group', conversations: [group] };
 
+test('Windows temporary file readers cannot strand history checkpoints or notification acknowledgements', {
+  skip: process.platform !== 'win32', timeout: 15_000,
+}, async () => {
+  const cwd = await temporary();
+  const store = await GroupStore.open(cwd, config);
+  try {
+    await store.append(message('-1'));
+    await store.append(message('-2'));
+    const cursor = { messageId: '-1', messageSeq: '1', time: 1793000000 };
+    await store.saveHistoryCursor(group, cursor);
+    await store.acknowledge(1);
+    const updates: Array<[string, () => Promise<void>]> = [
+      ['history.json', () => store.saveHistoryCursor(group, { ...cursor, messageId: '-2', messageSeq: '2' })],
+      ['state.json', () => store.acknowledge(2)],
+    ];
+    for (const [name, update] of updates) {
+      const filename = path.join(cwd, '.piq', name);
+      const shell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      const reader = spawn(shell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.resolve('tests/helpers/hold-file.ps1')], {
+        windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, PIQ_TEST_LOCK_PATH: filename },
+      });
+      const exited = new Promise<void>(resolve => reader.once('exit', () => resolve()));
+      let release: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          reader.once('error', reject);
+          reader.once('exit', code => reject(new Error(`File reader exited before acquiring the lock (${code}).`)));
+          reader.stdout.once('data', value => String(value).includes('locked') ? resolve() : reject(new Error('Unexpected file reader output.')));
+          reader.stderr.on('data', () => {});
+        });
+        await assert.rejects(rename(filename, `${filename}.moved`), (error: NodeJS.ErrnoException) => ['EPERM', 'EACCES', 'EBUSY'].includes(error.code ?? ''));
+        release = setTimeout(() => reader.stdin.end('release\n'), 75);
+        await update();
+      } finally {
+        clearTimeout(release);
+        if (!reader.stdin.writableEnded) reader.stdin.end('release\n');
+        await exited;
+      }
+    }
+    assert.equal(store.pending(), null);
+    assert.equal(JSON.parse(await readFile(path.join(cwd, '.piq', 'history.json'), 'utf8')).cursors['group:123456'].messageSeq, '2');
+    assert.equal(JSON.parse(await readFile(path.join(cwd, '.piq', 'state.json'), 'utf8')).notifiedThrough, 2);
+  } finally { await store.close(); await rm(cwd, { recursive: true, force: true }); }
+});
+
 async function temporary(): Promise<string> {
   const parent = path.resolve(".test-tmp");
   await mkdir(parent, { recursive: true });
   return mkdtemp(path.join(parent, "store-"));
 }
+
+test('a failed first history freeze retains its original anchor across newer live arrivals', async () => {
+  const cwd = await temporary();
+  const store = await GroupStore.open(cwd, config);
+  const historyPath = path.join(cwd, '.piq', 'history.json');
+  try {
+    await store.append(message('-1', { messageSeq: '1' }));
+    await mkdir(historyPath);
+    await assert.rejects(store.freezeHistoryCursor(group));
+    await store.append(message('-9', { messageSeq: '9', time: 1793000009 }));
+    await rmdir(historyPath);
+    assert.deepEqual(await store.freezeHistoryCursor(group), { messageId: '-1', messageSeq: '1', time: 1793000000 });
+    const saved = JSON.parse(await readFile(historyPath, 'utf8'));
+    assert.equal(saved.cursors['group:123456'].messageSeq, '1', 'retry must not jump past the offline gap to live message 9');
+  } finally { await store.close(); await rm(cwd, { recursive: true, force: true }); }
+});
 
 function message(id = "-1", changes: Partial<IncomingRecord> = {}): IncomingRecord {
   return {

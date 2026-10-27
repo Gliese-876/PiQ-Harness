@@ -18,6 +18,8 @@ export interface HistoryOptions {
   pageSize?: number;
   batchPages?: number;
   batchDelayMs?: number;
+  /** Connected failures retry on this schedule, repeating its final delay. */
+  retryDelaysMs?: readonly number[];
 }
 
 function sameMessage(left: HistoryCursor, right: HistoryCursor): boolean {
@@ -36,10 +38,51 @@ export class HistorySync {
   private latestLive?: HistoryCursor;
   private generation = 0;
   private currentCursor: HistoryCursor | null = null;
+  private readonly retryDelaysMs: readonly number[];
+  private retryTimer?: ReturnType<typeof setTimeout>;
+  private retryFailures = 0;
+  private errorMessage?: string;
+  private retryDueAt?: number;
   running = false;
 
   constructor(options: HistoryOptions) {
     this.options = { ...options, conversation: validateConversation(options.conversation) };
+    const retryDelays = options.retryDelaysMs ?? [2_000, 5_000, 10_000, 30_000];
+    if (!Array.isArray(retryDelays) || !retryDelays.length || retryDelays.length > 16
+      || retryDelays.some(value => !Number.isSafeInteger(value) || value < 1 || value > 3_600_000)) {
+      throw new Error('History retry delays must contain 1 to 16 positive integer millisecond values, at most one hour each.');
+    }
+    this.retryDelaysMs = [...retryDelays];
+  }
+
+  get lastError(): string | undefined { return this.errorMessage; }
+  get nextRetryAt(): number | undefined { return this.retryDueAt; }
+
+  private reportError(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const changed = message !== this.errorMessage;
+    this.errorMessage = message;
+    if (changed) this.options.error(error);
+  }
+
+  private clearRetry(): void {
+    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    this.retryDueAt = undefined;
+  }
+
+  private scheduleRetry(generation: number): void {
+    this.clearRetry();
+    const delayMs = this.retryDelaysMs[Math.min(this.retryFailures, this.retryDelaysMs.length - 1)]!;
+    this.retryFailures = Math.min(this.retryFailures + 1, this.retryDelaysMs.length - 1);
+    this.retryDueAt = Date.now() + delayMs;
+    this.retryTimer = setTimeout(() => {
+      if (!this.connected || generation !== this.generation) return;
+      this.retryTimer = undefined;
+      this.retryDueAt = undefined;
+      this.retry();
+    }, delayMs);
+    this.retryTimer.unref();
   }
 
   private compare(left: HistoryCursor, right: HistoryCursor): number {
@@ -66,6 +109,8 @@ export class HistorySync {
   }
 
   disconnect(): void {
+    this.clearRetry();
+    this.retryFailures = 0;
     this.generation++;
     this.connected = false;
     this.synchronized = false;
@@ -79,17 +124,27 @@ export class HistorySync {
 
   retry(): void {
     if (!this.connected || this.running) return;
+    this.clearRetry();
     this.running = true;
     this.synchronized = false;
     const generation = this.generation;
     const controller = this.controller = new AbortController();
+    let failed = false;
     this.task = this.catchUp(controller.signal).then(() => {
-      if (generation === this.generation) this.synchronized = true;
+      if (generation === this.generation && this.connected && !controller.signal.aborted) {
+        this.synchronized = true;
+        this.retryFailures = 0;
+        this.errorMessage = undefined;
+      }
     }).catch(error => {
-      if (!controller.signal.aborted && generation === this.generation) this.options.error(error);
+      if (!controller.signal.aborted && generation === this.generation && this.connected) {
+        failed = true;
+        this.reportError(error);
+      }
     }).finally(() => {
       if (generation !== this.generation) return;
       this.running = false;
+      if (failed && this.connected && !controller.signal.aborted) this.scheduleRetry(generation);
       this.options.changed();
     });
   }
@@ -97,20 +152,34 @@ export class HistorySync {
   async receive(event: ConversationEvent): Promise<void> {
     if (conversationKey(event.conversation) !== conversationKey(this.options.conversation)) return;
     const generation = this.generation;
-    await this.options.store.append(event);
+    try { await this.options.store.append(event); }
+    catch (error) {
+      if (generation === this.generation) this.synchronized = false;
+      throw error;
+    }
     if (generation !== this.generation || !this.connected) return;
     const cursor = messageCursor(event);
     if (!this.latestLive || this.compare(cursor, this.latestLive) >= 0) this.latestLive = cursor;
-    if (this.connected && this.synchronized && !this.running) {
-      if (!this.currentCursor || this.compare(this.latestLive, this.currentCursor) >= 0) {
-        this.currentCursor = this.latestLive;
-        await this.options.store.saveHistoryCursor(this.options.conversation, this.currentCursor);
+    try {
+      if (this.synchronized && !this.running && (!this.currentCursor || this.compare(this.latestLive, this.currentCursor) >= 0)) {
+        const checkpoint = this.latestLive;
+        await this.options.store.saveHistoryCursor(this.options.conversation, checkpoint);
+        if (generation === this.generation) this.currentCursor = checkpoint;
       }
+    } catch (error) {
+      if (generation === this.generation && this.connected) {
+        this.synchronized = false;
+        this.reportError(error);
+        if (!this.running) this.scheduleRetry(generation);
+      }
+    } finally {
+      // The journal append already succeeded. A cursor checkpoint failure must
+      // not hide that pending message from the notification scheduler.
+      if (generation === this.generation) this.options.changed();
     }
-    this.options.changed();
   }
 
-  /** Exposed for deterministic shutdown/integration tests, not an extra agent tool. */
+  /** Wait for the current attempt; a connected failure may still have a scheduled retry. */
   async wait(): Promise<void> { await this.task; }
 
   private async catchUp(signal: AbortSignal): Promise<void> {

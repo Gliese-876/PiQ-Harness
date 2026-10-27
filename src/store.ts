@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from 'node:timers/promises';
 import { compareCursors, messageCursor, type HistoryCursor, type PokeEvent } from './transport.ts';
 import { conversationKey, parseConversationKey, validateConversation, type Conversation } from './conversations.ts';
 import { validateGroupId, type GroupConfig } from './config.ts';
@@ -168,7 +169,14 @@ async function atomicJson(filename: string, data: unknown): Promise<void> {
   const temporary = `${filename}.${randomUUID()}.tmp`;
   try {
     await writeExclusive(temporary, `${JSON.stringify(data, null, 2)}\n`);
-    await rename(temporary, filename);
+    for (let attempt = 0; ; attempt++) {
+      try { await rename(temporary, filename); break; }
+      catch (error) {
+        if (process.platform !== 'win32' || attempt >= 5
+          || !['EPERM', 'EACCES', 'EBUSY'].some(code => isCode(error, code))) throw error;
+        await delay(20 * (attempt + 1));
+      }
+    }
   } finally {
     await unlink(temporary).catch((error: unknown) => {
       if (!isCode(error, "ENOENT")) throw error;
@@ -318,6 +326,7 @@ export class GroupStore {
   private readonly conversations: Map<string, Conversation>;
   private readonly lock: { filename: string; token: string };
   private readonly historyCursors = new Map<string, HistoryCursor | null>();
+  private readonly frozenHistoryCursors = new Map<string, HistoryCursor | null>();
 
   private constructor(
     cwd: string,
@@ -368,6 +377,11 @@ export class GroupStore {
     return this.enqueue(async () => {
       const key = this.memberKey(conversation);
       if (this.historyCursors.has(key)) return this.historyCursors.get(key)!;
+      if (this.frozenHistoryCursors.has(key)) {
+        const frozen = this.frozenHistoryCursors.get(key)!;
+        await this.writeHistoryCursor(key, frozen);
+        return frozen;
+      }
       let latest: HistoryCursor | null = null;
       for (const receipt of this.receipts) {
         if (conversationKey(receipt.conversation) !== key) continue;
@@ -375,6 +389,9 @@ export class GroupStore {
         if (!cursor) continue;
         if (!latest || compareCursors(cursor, latest, conversation.type) >= 0) latest = cursor;
       }
+      // Retain the original snapshot if persistence fails. Live arrivals must
+      // not shift a later retry past an offline gap.
+      this.frozenHistoryCursors.set(key, latest);
       await this.writeHistoryCursor(key, latest);
       return latest;
     });
@@ -397,6 +414,7 @@ export class GroupStore {
     cursors[key] = cursor;
     await atomicJson(path.join(this.cwd, '.piq', 'history.json'), { version: 2, groupId: this.groupId, cursors });
     this.historyCursors.set(key, cursor);
+    this.frozenHistoryCursors.delete(key);
   }
 
   pending(): PendingMessages | null {

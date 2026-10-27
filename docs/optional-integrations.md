@@ -29,6 +29,14 @@ PiQ 只提供 QQ 通道和对话组管理。以下包由用户独立安装到 Pi
 - Windows 的 `powershell` 每次执行前询问，`bash` 禁用。未知扩展工具默认询问。PiQ 已明确限制本地路径的 QQ 工具可以正常使用。
 - 关闭模型自动审批和目录扩权，配套可选 hook 拒绝 Agent 的无沙箱重试。
 
+### 用原生读取工具减少审批
+
+示例明确启用 Pi 原生 `read`、`grep`、`find`、`ls`：查看文件用 `read`，列目录用 `ls`，找文件用 `find`，搜索内容用 `grep`。权限示例已经允许这些读取操作；无需先生成 PowerShell 命令，也无需新增一套命令识别扩展。
+
+Pi 默认工具集已有 `read`，settings 示例中的 `+grep`、`+find`、`+ls` 补齐另外三个。仅在权限文件中写 `allow` 不会自动激活工具。使用全新的终端会话加载更改；本机已检查所需 `rg`、`fd` 并实际验证四个原生读取工具可用。
+
+需要运行程序、脚本或执行文件修改时，仍使用 `powershell` 并批准本次操作。Pi 原生 `bash` 可以通过 Git Bash 在 Windows 运行，但 **yuru7 0.4.1 的 Windows 受限执行只支持 PowerShell**：该插件将 `bash` 隐藏，受限模式下也拒绝执行。添加 `+bash` 无法使它获得受限执行能力；保持目前的 `-bash` 配置。
+
 审批时选择 **Yes / 本次允许**。`Yes, allow ... for this session` 会允许后续匹配操作跳过询问；需要每次确认保护文件或命令时，不要选择会话放行。
 
 ## 安装与示例文件
@@ -51,7 +59,7 @@ pi install -l npm:@yuru7/pi-sandbox@0.4.1
 | [`pi-settings.example.json`](../examples/integrations/pi-settings.example.json) | 将需要的字段合并进 `<组目录>/.pi/settings.json` |
 | [`pi-settings.web.example.json`](../examples/integrations/pi-settings.web.example.json) | 在权限示例基础上增加 web-access 的本组设置 |
 
-`pi-settings.example.json` 中的 `C:/tools/PiQ-Harness` 是占位安装目录，必须换成本机真实路径。保留已有的 PiQ 包声明，不要重复添加。`defaultTools` 的 `+powershell` 与 `-bash` 分别增加和移除内置工具；其他已有选择也应保留。
+`pi-settings.example.json` 中的 `C:/tools/PiQ-Harness` 是占位安装目录，必须换成本机真实路径。保留已有的 PiQ 包声明，不要重复添加。`defaultTools` 的 `+grep`、`+find`、`+ls`、`+powershell` 增加内置工具，`-bash` 移除原生 Bash 选择；其他已有选择也应保留。yuru7 对同名工具的接管和 Windows Bash 隐藏由插件自身处理。
 
 ### 禁止 Agent 提权的可选 hook
 

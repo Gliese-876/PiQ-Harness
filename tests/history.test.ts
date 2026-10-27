@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { test, type TestContext } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { HistorySync } from '../src/history.ts';
 import { GroupStore } from '../src/store.ts';
 import { messageCursor, type ConversationEvent, type HistoryCursor } from '../src/transport.ts';
@@ -28,10 +29,10 @@ async function fixture(t: TestContext) {
   t.after(async () => { for (const sync of syncs) sync.close(); await store.close(); await rm(cwd, { recursive: true, force: true }); });
   const errors: string[] = [];
   let changes = 0;
-  const sync = (fetch: (cursor: HistoryCursor | null, count: number, signal: AbortSignal) => Promise<ConversationEvent[]>, conversation: Conversation = GROUP) => {
+  const sync = (fetch: (cursor: HistoryCursor | null, count: number, signal: AbortSignal) => Promise<ConversationEvent[]>, conversation: Conversation = GROUP, retryDelaysMs?: readonly number[]) => {
     const instance = new HistorySync({ conversation, store, fetch,
       changed: () => changes++, error: error => errors.push(String(error)),
-      pageSize: 4, batchPages: 2, batchDelayMs: 0,
+      pageSize: 4, batchPages: 2, batchDelayMs: 0, retryDelaysMs,
     });
     syncs.push(instance);
     return instance;
@@ -49,6 +50,14 @@ function historyPage(records: ConversationEvent[], cursor: HistoryCursor | null,
   if (!cursor) return records.slice(-count);
   const start = records.findIndex(event => event.messageId === cursor.messageId);
   return start < 0 ? [] : records.slice(start, start + count);
+}
+
+async function eventually(predicate: () => boolean, description: string): Promise<void> {
+  const deadline = performance.now() + 3_000;
+  while (!predicate()) {
+    if (performance.now() >= deadline) assert.fail(`Timed out waiting for ${description}`);
+    await delay(5);
+  }
 }
 
 test('a new group seeds latest 20 available messages and excludes own messages from notifications', async t => {
@@ -309,4 +318,185 @@ test('temporary reconnect keeps saved messages and follows time without touching
   assert.equal((await f.cursor(temporary))!.messageId, '-2');
   assert.equal(f.store.pending()!.count, 3, 'temporary and private identities remain separate for the same QQ user');
   assert.deepEqual(f.errors, []);
+});
+
+test('an initially empty backend automatically retries from its saved cursor and clears the visible error', async t => {
+  const f = await fixture(t);
+  await f.store.append(record(1));
+  await f.store.acknowledge(1);
+  const records = Array.from({ length: 8 }, (_, index) => record(index + 1));
+  let snapshots = 0;
+  const sync = f.sync(async (cursor, count) => {
+    if (!cursor && ++snapshots === 1) return [];
+    return historyPage(records, cursor, count);
+  }, GROUP, [20, 30]);
+  sync.connect(); await sync.wait();
+  assert.match(sync.lastError!, /暂未返回/);
+  assert.equal(typeof sync.nextRetryAt, 'number');
+  assert.equal((await f.cursor())!.messageId, '-1');
+  await sync.receive(record(8));
+  assert.equal((await f.cursor())!.messageId, '-1', 'new live traffic cannot skip the recovery gap');
+  await eventually(() => snapshots >= 2 && !sync.running && sync.lastError === undefined, 'automatic empty-snapshot recovery');
+  assert.equal((await f.cursor())!.messageId, '-8');
+  assert.equal(f.store.pending()!.count, 7);
+  assert.equal(sync.nextRetryAt, undefined);
+  assert.equal(f.errors.length, 1);
+  assert.ok(f.changes() >= 3, 'failure, live append and recovered history all refresh status');
+});
+
+test('a transient history API failure retries automatically without another socket connection', async t => {
+  const f = await fixture(t);
+  let calls = 0;
+  const sync = f.sync(async () => {
+    if (++calls < 3) throw new Error('Temporary backend failure');
+    return [record(1), record(2)];
+  }, GROUP, [5, 10]);
+  sync.connect(); await sync.wait();
+  assert.equal(sync.lastError, 'Temporary backend failure');
+  await eventually(() => calls >= 3 && !sync.running && sync.lastError === undefined, 'backend retry recovery');
+  assert.equal((await f.cursor())!.messageId, '-2');
+  assert.equal(f.store.pending()!.count, 2);
+  assert.deepEqual(f.errors, ['Error: Temporary backend failure']);
+});
+
+test('retry delays cap, repeated errors stay quiet, and success resets both error reporting and backoff', async t => {
+  const now = 10_000;
+  t.mock.method(Date, 'now', () => now);
+  const waits: number[] = [], errors: string[] = [];
+  let message: string | undefined = 'Still starting';
+  let sync!: HistorySync;
+  sync = new HistorySync({ conversation: GROUP, retryDelaysMs: [5, 10],
+    store: { async freezeHistoryCursor() { return null; }, async saveHistoryCursor() {}, async append() { return true; } },
+    async fetch() { if (message) throw new Error(message); return []; },
+    error: error => errors.push(String(error)),
+    changed: () => { if (sync.nextRetryAt !== undefined) waits.push(sync.nextRetryAt - now); },
+  });
+  t.after(() => sync.close());
+  sync.connect(); await sync.wait();
+  await eventually(() => waits.length >= 4, 'capped backoff attempts');
+  assert.deepEqual(waits.slice(0, 4), [5, 10, 10, 10]);
+  assert.deepEqual(errors, ['Error: Still starting']);
+  message = undefined;
+  sync.retry(); await sync.wait();
+  assert.equal(sync.lastError, undefined);
+  assert.equal(sync.nextRetryAt, undefined);
+  message = 'Still starting';
+  sync.retry(); await sync.wait();
+  assert.equal(waits.at(-1), 5);
+  assert.equal(errors.length, 2, 'a new failure after successful recovery is reported');
+  message = 'A different failure';
+  sync.retry(); await sync.wait();
+  assert.equal(errors.at(-1), 'Error: A different failure');
+  assert.equal(sync.lastError, 'A different failure');
+});
+
+test('manual retry cancels the pending timer and cannot overlap an active attempt', async t => {
+  let calls = 0, active = 0, peak = 0;
+  let release!: () => void, entered!: () => void;
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const sync = new HistorySync({ conversation: GROUP, retryDelaysMs: [30],
+    store: { async freezeHistoryCursor() { return null; }, async saveHistoryCursor() {}, async append() { return true; } },
+    async fetch() {
+      calls++; active++; peak = Math.max(peak, active);
+      try {
+        if (calls === 1) throw new Error('Retry required');
+        entered(); await hold; return [];
+      } finally { active--; }
+    }, changed() {}, error() {},
+  });
+  t.after(() => { release(); sync.close(); });
+  sync.connect(); await sync.wait();
+  sync.retry(); await started;
+  sync.retry(); sync.retry();
+  await delay(60);
+  assert.equal(calls, 2, 'the old automatic timer was cancelled');
+  assert.equal(peak, 1);
+  release(); await sync.wait();
+  await delay(40);
+  assert.equal(calls, 2, 'successful retry schedules no further work');
+});
+
+test('disconnect and close cancel queued retries and ignore failures from an obsolete attempt', async t => {
+  for (const stop of ['disconnect', 'close'] as const) {
+    let calls = 0;
+    const sync = new HistorySync({ conversation: GROUP, retryDelaysMs: [15],
+      store: { async freezeHistoryCursor() { return null; }, async saveHistoryCursor() {}, async append() { return true; } },
+      async fetch() { calls++; throw new Error('Waiting for backend'); }, changed() {}, error() {},
+    });
+    t.after(() => sync.close());
+    sync.connect(); await sync.wait();
+    sync[stop](); sync.retry();
+    assert.equal(sync.nextRetryAt, undefined);
+    await delay(40);
+    assert.equal(calls, 1, stop);
+  }
+  let reject!: (error: Error) => void, entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let calls = 0;
+  const errors: unknown[] = [];
+  const sync = new HistorySync({ conversation: GROUP, retryDelaysMs: [5],
+    store: { async freezeHistoryCursor() { return null; }, async saveHistoryCursor() {}, async append() { return true; } },
+    async fetch() { calls++; entered(); return new Promise((_resolve, fail) => { reject = fail; }); },
+    changed() {}, error: error => errors.push(error),
+  });
+  t.after(() => sync.close());
+  sync.connect(); await started;
+  sync.close(); reject(new Error('Late failure')); await sync.wait();
+  await delay(20);
+  assert.equal(calls, 1);
+  assert.deepEqual(errors, []);
+  assert.equal(sync.nextRetryAt, undefined);
+});
+
+test('a failed live cursor checkpoint still announces the durable message and recovers automatically', async t => {
+  const remote = [record(1)];
+  const appended = new Set<string>();
+  let cursor: HistoryCursor | null = null;
+  let failCheckpoint = true, changes = 0;
+  const errors: string[] = [];
+  const sync = new HistorySync({ conversation: GROUP, retryDelaysMs: [20],
+    store: {
+      async freezeHistoryCursor() { return cursor; },
+      async append(event) { const added = !appended.has(event.messageId); appended.add(event.messageId); return added; },
+      async saveHistoryCursor(_conversation, next) {
+        if (next?.messageId === '-2' && failCheckpoint) { failCheckpoint = false; throw new Error('Checkpoint temporarily busy'); }
+        cursor = next;
+      },
+    },
+    async fetch(anchor, count) { return historyPage(remote, anchor, count); },
+    changed: () => changes++, error: error => errors.push(String(error)),
+  });
+  t.after(() => sync.close());
+  sync.connect(); await sync.wait();
+  const before = changes;
+  remote.push(record(2)); await sync.receive(record(2));
+  assert.ok(appended.has('-2'));
+  assert.equal(cursor!.messageId, '-1');
+  assert.equal(changes, before + 1, 'checkpoint failure still schedules the persisted incoming message');
+  assert.equal(sync.lastError, 'Checkpoint temporarily busy');
+  remote.push(record(3)); await sync.receive(record(3));
+  assert.equal(cursor!.messageId, '-1', 'later live messages cannot jump over a failed checkpoint');
+  await eventually(() => cursor?.messageId === '-3' && !sync.running && sync.lastError === undefined, 'live checkpoint retry');
+  assert.equal(appended.size, 3);
+  assert.deepEqual(errors, ['Error: Checkpoint temporarily busy']);
+  remote.push(record(4)); await sync.receive(record(4));
+  assert.equal(cursor!.messageId, '-4');
+});
+
+test('a failed journal append still propagates and prevents subsequent live cursor advancement', async t => {
+  let cursor: HistoryCursor | null = null;
+  const sync = new HistorySync({ conversation: GROUP, retryDelaysMs: [10],
+    store: {
+      async freezeHistoryCursor() { return cursor; },
+      async append(event) { if (event.messageId === '-2') throw new Error('Journal write failed'); return true; },
+      async saveHistoryCursor(_conversation, next) { cursor = next; },
+    },
+    async fetch() { return [record(1)]; }, changed() {}, error() {},
+  });
+  t.after(() => sync.close());
+  sync.connect(); await sync.wait();
+  await assert.rejects(sync.receive(record(2)), /Journal write failed/);
+  await sync.receive(record(3));
+  assert.equal(cursor!.messageId, '-1');
 });

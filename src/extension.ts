@@ -41,6 +41,8 @@ interface Binding {
   sendAbort: AbortController;
   resumeTurn: boolean;
   lastError?: string;
+  notificationError?: string;
+  receiveError?: string;
   recovering?: Promise<void>;
   receiving: Promise<void>;
 }
@@ -66,6 +68,17 @@ export default function piq(pi: ExtensionAPI): void {
     current.ctx.ui.notify(`PiQ: ${message}`, 'error');
   }
 
+  function receiveFailed(current: Binding, error: unknown): void {
+    if (current.closed) return;
+    const message = `接收消息：${error instanceof Error ? error.message : String(error)}`;
+    if (current.receiveError !== message) report(current, message);
+    current.receiveError = message;
+    // Receiving and checkpoint failures must not pause delivery of records that
+    // are already safely stored. Signal/receipt failures have their own pause.
+    current.notifier.schedule();
+    current.control?.refresh();
+  }
+
   function syncing(current: Binding): boolean {
     return [...current.histories.values()].some(history => history.running);
   }
@@ -84,28 +97,30 @@ export default function piq(pi: ExtensionAPI): void {
     return history;
   }
 
-  async function receive(current: Binding, event: ConversationEvent): Promise<void> {
+  async function receive(current: Binding, event: ConversationEvent): Promise<boolean> {
     const key = conversationKey(event.conversation);
     let history = current.histories.get(key);
     if (!history && event.conversation.type === 'temporary') {
       const adopted = await adoptTemporaryConversation(current.cwd,event.conversation);
-      if (!adopted) return;
+      if (!adopted) return false;
       current.config = adopted;
       current.store.addConversation(event.conversation);
       history = addHistory(current,event.conversation);
       if (!current.closed && current.transport.isConnected) history.connect();
     }
-    if (!history) return;
+    if (!history) return false;
     current.selfId = event.selfId;
     await history.receive(event);
+    return true;
   }
 
-  async function receivePoke(current: Binding, event: PokeEvent): Promise<void> {
-    if (!current.histories.has(conversationKey(event.conversation))) return;
+  async function receivePoke(current: Binding, event: PokeEvent): Promise<boolean> {
+    if (!current.histories.has(conversationKey(event.conversation))) return false;
     current.selfId = event.selfId;
     await current.store.appendPoke(event);
     current.notifier.schedule();
     current.control?.refresh();
+    return true;
   }
 
   function active(ctx: ExtensionContext): Binding {
@@ -211,18 +226,28 @@ export default function piq(pi: ExtensionAPI): void {
             details: { bindingId: current.id, groupId: config.id, through: pending.through, conversations: pending.conversations },
           }, { triggerTurn: true, deliverAs: 'followUp' });
         },
-        stalled: error => report(current, error instanceof Error ? error.message : String(error)),
+        stalled: error => {
+          current.notificationError = error instanceof Error ? error.message : String(error);
+          report(current, current.notificationError);
+          current.control?.refresh();
+        },
       });
       current.transport = new SnowLumaTransport({
         url: config.wsUrl,
         accessToken: credentials.env[config.accessTokenEnv],
         onMessage: event => {
           if (current.closed) return;
-          current.receiving = current.receiving.then(()=>receive(current,event)).catch(error=>current.notifier.fail(error));
+          current.receiving = current.receiving.then(async () => {
+            if (await receive(current, event)) current.receiveError = undefined;
+            current.control?.refresh();
+          }).catch(error => receiveFailed(current, error));
         },
         onPoke: event => {
           if (current.closed) return;
-          current.receiving = current.receiving.then(()=>receivePoke(current,event)).catch(error=>current.notifier.fail(error));
+          current.receiving = current.receiving.then(async () => {
+            if (await receivePoke(current, event)) current.receiveError = undefined;
+            current.control?.refresh();
+          }).catch(error => receiveFailed(current, error));
         },
         onStatus: status => {
           if (current.closed) return;
@@ -238,8 +263,11 @@ export default function piq(pi: ExtensionAPI): void {
       current.control = await RunController.open(ctx.cwd, {
         snapshot: () => {
           const pending = current.store.pending();
+          const historyErrors = [...current.histories].flatMap(([key, history]) => history.lastError
+            ? [`${key} 历史补拉：${history.lastError}；连接正常时会自动重试。`] : []);
           return { connection: current.status, pendingCount: pending?.count ?? 0,
-            pendingConversations: pending?.conversations.map(item=>({key:conversationKey(item.conversation),count:item.count})) ?? [], lastError: current.lastError };
+            pendingConversations: pending?.conversations.map(item=>({key:conversationKey(item.conversation),count:item.count})) ?? [],
+            lastError: [current.lastError, current.receiveError, current.notificationError, ...historyErrors].filter(Boolean).join('\n') || undefined };
         },
         isBusy: () => !current.ctx.isIdle(),
         pause: () => {
@@ -250,6 +278,7 @@ export default function piq(pi: ExtensionAPI): void {
         resume: interrupted => {
           current.sendAbort = new AbortController();
           current.resumeTurn ||= interrupted;
+          current.notificationError = undefined;
           current.notifier.retry();
           resumeIfReady(current);
         },
@@ -302,7 +331,11 @@ export default function piq(pi: ExtensionAPI): void {
     description: '查看本对话组状态；/piq retry 恢复通知；/piq sync 重试离线历史补拉',
     handler: async (args, ctx) => {
       if (!binding) { ctx.ui.notify('当前目录未接入 PiQ；先运行 piq init。', 'info'); return; }
-      if (args.trim() === 'retry' && !binding.control?.paused) binding.notifier.retry();
+      if (args.trim() === 'retry' && !binding.control?.paused) {
+        binding.notificationError = undefined;
+        binding.notifier.retry();
+        binding.control?.refresh();
+      }
       if (args.trim() === 'sync') for (const history of binding.histories.values()) history.retry();
       ctx.ui.notify(`对话组 ${binding.config.name} · ${binding.control?.paused ? '已暂停 · ' : ''}${binding.status}${syncing(binding) ? ' · 正在补拉历史' : ''} · 待通知 ${binding.store.pending()?.count ?? 0} 条`, 'info');
     },
