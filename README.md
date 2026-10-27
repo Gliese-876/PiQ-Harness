@@ -65,6 +65,8 @@ npm run web
 | 移入回收站 | 停止后将完整目录移到根目录 `.trash/` |
 | 从回收站恢复 | 恢复原组；原标识或对话归属已被占用时提示冲突并保留数据 |
 
+工作台右上角的“外观”默认选择“跟随系统”：系统深色使用石墨（Graphite），系统浅色使用明亮（Light）。也可手动选择午夜（Midnight）、玫瑰（Rose）、纸张（Paper）等配色；选择保存在当前浏览器，刷新后继续使用。
+
 关闭工作台网页不会结束已打开的 Pi 终端。重开会话后，Pi 仍会加载本组约定，并可按需读取 `MEMORY.md` 等资料；这一操作清空的是当前模型上下文。
 
 调整成员归属前先停止相关组。移出的对话在原组留下已有日志与记忆，新消息随后进入新归属组。未单独分配的群临时私聊，会归入来源 QQ 群所在组。
@@ -214,6 +216,6 @@ npm run verify
 
 验证包含 TypeScript 检查和测试。测试使用临时目录、模拟 QQ 端点与 Pi 官方 faux 模型，不发送真实 QQ 消息。网络接入依据 [OneBot 11 标准](https://github.com/botuniverse/onebot-11)及 [SnowLuma 公开 API 目录](https://github.com/SnowLuma/SnowLuma/blob/main/packages/mcp/src/generated/catalog.json)，始终独立实现。
 
-感谢 [方缘（@Fangyuanz06）](https://github.com/Fangyuanz06) 在 [PR #1](https://github.com/Gliese-876/PiQ-Harness/pull/1) 中提供对话组管理和合并转发读取的初始实现。采用其贡献的提交保留共同作者署名。
+感谢 [方缘（@Fangyuanz06）](https://github.com/Fangyuanz06) 在 [PR #1](https://github.com/Gliese-876/PiQ-Harness/pull/1) 中提供对话组管理、合并转发读取和工作台主题的初始实现。采用其贡献的提交保留共同作者署名。
 
 本项目采用 [AGPL-3.0-only](LICENSE)。SnowLuma、Pi 以及可选插件和技能分别遵循自身许可，详见 [第三方组件说明](THIRD_PARTY_NOTICES.md)。
