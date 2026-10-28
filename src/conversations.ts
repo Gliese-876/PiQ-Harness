@@ -1,48 +1,45 @@
+import { createHash } from 'node:crypto';
+
 export interface Conversation {
-  type: 'group' | 'private' | 'temporary';
+  type: 'group' | 'private';
   id: string;
   name?: string;
-  sourceGroupId?: string;
 }
 
-export function validateQQId(value: unknown): string {
-  const id = typeof value === 'number' ? String(value) : value;
-  if (typeof id !== 'string' || !/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id))) {
-    throw new Error('QQ 号码必须是正整数。');
+/** Official QQ OpenIDs are opaque and case-sensitive; never convert them to numbers. */
+export function validateOpenId(value: unknown): string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw new Error('OpenID 须为 1 到 128 位字母、数字、下划线或连字符，不能包含路径字符。');
   }
-  return id;
+  return value;
 }
 
 export function validateConversation(value: unknown): Conversation {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('对话必须是对象。');
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).some(key => !['type', 'id', 'name', 'sourceGroupId'].includes(key))) throw new Error('对话含未知配置项。');
-  if (!['group', 'private', 'temporary'].includes(String(input.type))) throw new Error('对话类型必须是 group、private 或 temporary。');
-  const id = validateQQId(input.id);
-  const sourceGroupId = input.type === 'temporary' ? validateQQId(input.sourceGroupId) : undefined;
-  if (input.type !== 'temporary' && input.sourceGroupId !== undefined) throw new Error('只有群临时私聊可以指定来源群。');
+  if (Object.keys(input).some(key => !['type', 'id', 'name'].includes(key))) throw new Error('对话含未知配置项。');
+  if (input.type !== 'group' && input.type !== 'private') throw new Error('官方机器人对话类型必须是 group 或 private。');
+  const id = validateOpenId(input.id);
   if (input.name !== undefined && (typeof input.name !== 'string' || !input.name.trim()
     || input.name.trim().length > 80 || /[\x00-\x1f\x7f]/.test(input.name))) throw new Error('对话名称须为 1 到 80 个字符。');
-  return { type: input.type as Conversation['type'], id,
-    ...(sourceGroupId === undefined ? {} : { sourceGroupId }),
-    ...(input.name === undefined ? {} : { name: (input.name as string).trim() }) };
+  return { type: input.type, id, ...(input.name === undefined ? {} : { name: (input.name as string).trim() }) };
 }
 
-export function conversationKey(conversation: Pick<Conversation, 'type' | 'id' | 'sourceGroupId'>): string {
+export function conversationKey(conversation: Pick<Conversation, 'type' | 'id'>): string {
   const value = validateConversation(conversation);
-  return value.type === 'temporary' ? `temporary:${value.sourceGroupId}:${value.id}` : `${value.type}:${value.id}`;
+  return `${value.type}:${value.id}`;
 }
 
 export function parseConversationKey(value: unknown): Conversation {
-  if (typeof value !== 'string') throw new Error('对话标识须为 group:群号、private:QQ号 或 temporary:来源群:QQ号。');
-  const temporary = /^temporary:([1-9]\d*):([1-9]\d*)$/.exec(value);
-  if (temporary) return validateConversation({ type: 'temporary', sourceGroupId: temporary[1], id: temporary[2] });
-  const matched = /^(group|private):([1-9]\d*)$/.exec(value);
-  if (!matched) throw new Error('对话标识须为 group:群号、private:QQ号 或 temporary:来源群:QQ号。');
+  if (typeof value !== 'string') throw new Error('对话标识须为 group:群OpenID 或 private:用户OpenID。');
+  const matched = /^(group|private):(.+)$/.exec(value);
+  if (!matched) throw new Error('对话标识须为 group:群OpenID 或 private:用户OpenID。');
   return validateConversation({ type: matched[1], id: matched[2] });
 }
 
+/** Hashes keep case-sensitive OpenIDs distinct on Windows and never become raw filenames. */
 export function conversationDirectory(conversation: Conversation): string {
   const value = validateConversation(conversation);
-  return value.type === 'temporary' ? `messages/temporary/${value.sourceGroupId}/${value.id}` : `messages/${value.type}/${value.id}`;
+  const hash = createHash('sha256').update(value.id, 'utf8').digest('hex');
+  return `messages/v3/${value.type}/${hash}`;
 }

@@ -105,45 +105,18 @@ async function acquire(path: string, token: string, recoveryHeld = false): Promi
 }
 
 async function stoppedRuntime(directory: string): Promise<void> {
-  let workerState: { launchId: string; startedAt: number } | undefined;
-  const worker = await json(join(directory, 'worker.json'));
-  if (worker) {
-    if (worker.version !== 1 || worker.mode !== 'background' || !validPid(worker.pid)
-      || typeof worker.launchId !== 'string' || typeof worker.startedAt !== 'number' || !Number.isFinite(worker.startedAt)
-      || !['starting', 'running', 'stopped', 'error'].includes(String(worker.state))) {
-      throw new ConfigError(409, '后台运行记录无效，请检查 .piq/worker.json。');
-    }
-    workerState = { launchId: worker.launchId, startedAt: worker.startedAt };
-    if (['starting', 'running'].includes(String(worker.state)) && alive(worker.pid)) {
-      throw new ConfigError(409, '旧版后台 Pi 仍在运行，请先停止后重试。');
-    }
-  }
-  for (const file of ['worker-launch.json', 'launch.json']) {
-    const launch = await json(join(directory, file));
-    if (!launch) continue;
-    if (launch.version !== 1 || !validPid(launch.pid) || typeof launch.launchId !== 'string' || !launch.launchId
-      || typeof launch.startedAt !== 'number' || !Number.isFinite(launch.startedAt) || launch.startedAt < 0) {
-      throw new ConfigError(409, `后台启动记录无效，请检查 .piq/${file}。`);
-    }
-    if (alive(launch.pid) && (!workerState
-      || (workerState.launchId !== launch.launchId && workerState.startedAt < launch.startedAt))) {
-      throw new ConfigError(409, '对话组进程正在启动，请先停止后重试。');
-    }
-  }
   const terminal = await json(join(directory, 'terminal-return.json'));
   if (terminal) {
     if (terminal.version !== 1 || typeof terminal.token !== 'string' || !terminal.token || !validPid(terminal.launcherPid)
       || typeof terminal.createdAt !== 'number' || !Number.isFinite(terminal.createdAt)
-      || (terminal.kind !== undefined && terminal.kind !== 'terminal-only')
-      || !['starting', 'watching', 'recovering', 'error'].includes(String(terminal.state))
-      || [terminal.monitorPid, terminal.wrapperPid, terminal.piPid].some(value => value !== undefined && !validPid(value))) {
+      || terminal.kind !== 'terminal-only'
+      || !['starting', 'watching', 'disabled'].includes(String(terminal.state))
+      || [terminal.wrapperPid, terminal.piPid].some(value => value !== undefined && !validPid(value))) {
       throw new ConfigError(409, '终端运行记录无效，请检查 .piq/terminal-return.json。');
     }
     const liveTerminal = [terminal.wrapperPid, terminal.piPid].some(value => validPid(value) && alive(value));
-    const pendingReturn = terminal.kind === 'terminal-only'
-      ? terminal.state === 'starting' && Date.now() - terminal.createdAt < 30_000 && alive(terminal.launcherPid)
-      : terminal.state !== 'error' && [terminal.monitorPid, terminal.launcherPid].some(value => validPid(value) && alive(value));
-    if (liveTerminal || pendingReturn) throw new ConfigError(409, '终端 Pi 或旧版后台恢复仍在运行，请先停止后重试。');
+    const pendingLaunch = terminal.state === 'starting' && Date.now() - terminal.createdAt < 30_000 && alive(terminal.launcherPid);
+    if (liveTerminal || pendingLaunch) throw new ConfigError(409, '终端 Pi 正在运行或启动，请先停止后重试。');
   }
 }
 

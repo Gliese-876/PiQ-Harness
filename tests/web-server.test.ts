@@ -6,16 +6,18 @@ import { mkdir, mkdtemp, readFile, writeFile, rm, symlink, realpath, unlink } fr
 import { join, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, type TestContext } from 'node:test';
+import { conversationDirectory } from '../src/conversations.ts';
 import { initializeGroup, loadConfig, type GroupConfig } from '../src/config.ts';
 import { startWebServer } from '../src/web-server.ts';
 import type { ModelCatalog } from '../src/web-models.ts';
 import { getProcessStatus } from '../src/process-manager.ts';
-import { prepareTerminalReturn, registerTerminal } from '../src/terminal-monitor.ts';
+import { prepareTerminalLaunch, registerTerminal } from '../src/terminal-monitor.ts';
 
 interface State {
   root: string;
   csrfToken: string;
-  defaultWsUrl: string;
+  defaultAppIdEnv: string;
+  defaultAppSecretEnv: string;
   groups: Array<{ id: string; name: string; conversations: GroupConfig['conversations']; path: string; running: boolean; pid: number | null }>;
 }
 interface Group {
@@ -30,18 +32,10 @@ interface Group {
 interface Document { content: string; revision: string }
 
 function logRecord(seq: number, text = '测试消息', changes: Record<string, unknown> = {}) {
-  return { v: 2, seq, receivedAt: 1793000000000 + seq, conversation: { type: 'group', id: '123456' },
-    messageId: String(-seq), messageSeq: String(seq), selfId: '111111', userId: '222222',
+  return { v: 3, seq, receivedAt: 1793000000000 + seq, conversation: { type: 'group', id: 'GROUP_OPENID_A' },
+    messageId: `official-message-${seq}`, selfId: '111111', userId: '222222',
     sender: '测试成员', time: 1793000000, rawText: text,
-    segments: [{ type: 'text', data: { text } }], outgoing: false, ...changes };
-}
-
-function pokeRecord(seq: number, changes: Record<string, unknown> = {}) {
-  return { v: 2, seq, receivedAt: 1793000000000 + seq, kind: 'poke',
-    eventId: '4b5f875c-818b-4580-9445-505c43a832a0', source: 'notice',
-    conversation: { type: 'group', id: '123456' }, selfId: '111111', userId: '222222', targetId: '111111',
-    sender: '222222', time: 1793000000, rawText: '222222 戳了 111111',
-    segments: [{ type: 'poke', data: { user_id: '222222', target_id: '111111' } }], outgoing: false, ...changes };
+    attachments: [], raw: { content: text }, outgoing: false, ...changes };
 }
 
 const logLine = (record: ReturnType<typeof logRecord>) => JSON.stringify(record) + '\n';
@@ -50,8 +44,8 @@ async function fixture(t: TestContext, catalog: ModelCatalog = { models: [] }) {
   const parent = fileURLToPath(new URL('../.test-tmp/', import.meta.url));
   await mkdir(parent, { recursive: true });
   const root = await mkdtemp(join(parent, 'web-server-'));
-  const cwd = await initializeGroup(root, '123456', { name: 'Test conversation group', conversations: [{ type: 'group', id: '123456' }], wsUrl: 'ws://127.0.0.1:3000/' });
-  const messageDir = join(cwd, 'messages', 'group', '123456');
+  const cwd = await initializeGroup(root, '123456', { name: 'Test conversation group', conversations: [{ type: 'group', id: 'GROUP_OPENID_A' }] });
+  const messageDir = join(cwd, conversationDirectory({ type: 'group', id: 'GROUP_OPENID_A' }));
   await mkdir(messageDir, { recursive: true });
   const launched: string[] = [];
   const launchOptions: Array<{ freshSession?: boolean }> = [];
@@ -61,24 +55,11 @@ async function fixture(t: TestContext, catalog: ModelCatalog = { models: [] }) {
     openTerminal: async (path, options) => { launched.push(path); launchOptions.push({ freshSession: options?.freshSession }); return { message: '已请求打开测试终端。' }; },
     credentials: async () => ({ available: true, source: '测试凭据来源' }),
     models: async () => catalog,
-    ensure: async () => ({ ok: true, started: false, message: '模拟服务已连接', diagnostic: 'ready', canStart: false, canOpenManual: true }),
-    manual: async () => ({ message: '已请求打开模拟恢复入口' }),
     action: async (path, action) => {
       actions.push(action);
       if (action === 'shutdown' || action === 'handoff') {
         await unlink(join(path, '.piq', 'owner.lock'));
-        // A legacy worker publishes its stopped state before exiting. Keep the
-        // mock's own PID alive without pretending its launch is still pending.
-        const workerPath = join(path, '.piq', 'worker.json');
-        const worker = await readFile(workerPath, 'utf8').then(JSON.parse).catch(error => {
-          if (error.code === 'ENOENT') return null; throw error;
-        });
-        const launch = await readFile(join(path, '.piq', 'worker-launch.json'), 'utf8').then(JSON.parse).catch(error => {
-          if (error.code === 'ENOENT') return null; throw error;
-        });
-        if (worker || launch) await writeFile(workerPath, JSON.stringify({
-          ...(worker ?? launch), version: 1, mode: 'background', state: 'stopped',
-        }));
+
       }
       return { requestId: `mock-${action}` };
     },
@@ -115,11 +96,12 @@ test('WebUI exposes only local group metadata and serves its frontend with restr
   assert.ok(address && typeof address !== 'string');
   assert.equal(address.address, '127.0.0.1');
   assert.equal(f.state.root, await realpath(f.root));
-  assert.equal(f.state.defaultWsUrl, 'ws://127.0.0.1:3000/');
+  assert.equal(f.state.defaultAppIdEnv, 'QQBOT_APP_ID');
+  assert.equal(f.state.defaultAppSecretEnv, 'QQBOT_APP_SECRET');
   assert.match(f.state.csrfToken, /^[0-9a-f]{64}$/);
   assert.deepEqual(f.state.groups.map(group => group.id), ['123456']);
   assert.equal(f.state.groups[0]?.name, 'Test conversation group');
-  assert.deepEqual(f.state.groups[0]?.conversations, [{ type: 'group', id: '123456' }]);
+  assert.deepEqual(f.state.groups[0]?.conversations, [{ type: 'group', id: 'GROUP_OPENID_A' }]);
   assert.equal(f.state.groups[0]?.running, false);
   const group = await f.get<Group>('/api/groups/123456');
   assert.equal(group.path, await realpath(f.cwd));
@@ -171,7 +153,7 @@ test('connection edits preserve Markdown around the JSON block and reject group 
   const f = await fixture(t);
   await writeFile(join(f.cwd, 'PIQ.md'), '# 自定义连接说明\n\n请保留这段。\n\n```json\n' + JSON.stringify(await loadConfig(f.cwd), null, 2) + '\n```\n\n尾部说明也需要保留。\n');
   const group = await f.get<Group>('/api/groups/123456');
-  const config = { ...group.config, quietMs: 2500, maxWaitMs: 12000, wsUrl: 'ws://127.0.0.1:3010/' };
+  const config = { ...group.config, quietMs: 2500, maxWaitMs: 12000, appIdEnv: 'TEST_APP_ID', appSecretEnv: 'TEST_APP_SECRET' };
   const response = await f.call('/api/groups/123456/config', 'PUT', { config, revision: group.configRevision });
   assert.equal(response.status, 200, await response.clone().text());
   assert.deepEqual(await loadConfig(f.cwd), config);
@@ -183,7 +165,7 @@ test('connection edits preserve Markdown around the JSON block and reject group 
     config: { ...config, id: '654321' }, revision: refreshed.configRevision,
   })).status, 400);
   assert.equal((await f.call('/api/groups/123456/config', 'PUT', {
-    config: { ...config, wsUrl: 'ws://token:secret@localhost:3000/' }, revision: refreshed.configRevision,
+    config: { ...config, appSecretEnv: 'invalid-secret-variable!' }, revision: refreshed.configRevision,
   })).status, 400);
   assert.equal((await f.call('/api/groups/123456/config', 'PUT', { config, revision: group.configRevision })).status, 409);
   assert.equal(await readFile(join(f.cwd, 'PIQ.md'), 'utf8'), markdown);
@@ -197,51 +179,14 @@ test('JSONL logs are read-only, preserve multiline content, and exclude Markdown
   await writeFile(join(f.messageDir, '2026-10-26.jsonl'), logLine(logRecord(2)));
   await writeFile(join(f.messageDir, '2026-10-27.md'), '# Legacy journal should not be exposed\n');
   const group = await f.get<Group>('/api/groups/123456');
-  assert.deepEqual(group.logs['group:123456'], ['2026-10-26.jsonl', '2026-10-25.jsonl']);
-  assert.deepEqual(await f.get('/api/groups/123456/logs/group:123456/2026-10-25.jsonl'), { content: older, truncated: false });
+  assert.deepEqual(group.logs['group:GROUP_OPENID_A'], ['2026-10-26.jsonl', '2026-10-25.jsonl']);
+  assert.deepEqual(await f.get('/api/groups/123456/logs/group:GROUP_OPENID_A/2026-10-25.jsonl'), { content: older, truncated: false });
   assert.equal(JSON.parse(older).rawText, text);
   assert.equal(older.split('\n').length, 2, 'embedded message newlines stay inside one JSONL record');
-  assert.equal((await f.call('/api/groups/123456/logs/group:123456/2026-10-27.md')).status, 404);
+  assert.equal((await f.call('/api/groups/123456/logs/group:GROUP_OPENID_A/2026-10-27.md')).status, 404);
   assert.equal((await f.call('/api/groups/123456/logs/2026-10-25.jsonl')).status, 404);
-  assert.equal((await f.call('/api/groups/123456/logs/group:123456/2026-10-25.jsonl', 'PUT', { content: 'replacement' })).status, 404);
+  assert.equal((await f.call('/api/groups/123456/logs/group:GROUP_OPENID_A/2026-10-25.jsonl', 'PUT', { content: 'replacement' })).status, 404);
   assert.equal(await readFile(join(f.messageDir, '2026-10-25.jsonl'), 'utf8'), older);
-});
-
-test('mixed message and poke journals retain explicit events and isolated conversation routes', async t => {
-  const f = await fixture(t);
-  const path = join(f.messageDir, '2026-10-26.jsonl');
-  const route = '/api/groups/123456/logs/group:123456/2026-10-26.jsonl';
-  const records = [logRecord(1), pokeRecord(2), pokeRecord(3, {
-    eventId: 'd0a3ca10-0d11-4f38-9626-ea66925be84c', source: 'action', userId: '111111', targetId: '222222', outgoing: true,
-  })];
-  const content = records.map(record => JSON.stringify(record) + '\n').join('');
-  await writeFile(path, content);
-  assert.deepEqual(await f.get(route), { content, truncated: false });
-  assert.deepEqual((await f.get<Group>('/api/groups/123456')).logs['group:123456'], ['2026-10-26.jsonl']);
-  assert.equal('messageId' in records[1]!, false);
-  assert.equal('messageSeq' in records[1]!, false);
-  await writeFile(path, JSON.stringify(pokeRecord(2, { conversation: { type: 'private', id: '123456' } })) + '\n');
-  const mismatch = await f.call(route);
-  assert.equal(mismatch.status, 400, await mismatch.clone().text());
-  assert.match((await mismatch.json() as { error: string }).error, /来源对话/);
-});
-
-test('poke journals reject malformed identities and invented message identifiers without modifying the log', async t => {
-  const f = await fixture(t);
-  const path = join(f.messageDir, '2026-10-26.jsonl');
-  const route = '/api/groups/123456/logs/group:123456/2026-10-26.jsonl';
-  for (const changes of [
-    { eventId: 'not-an-event-id' }, { source: 'unknown' }, { source: 'action' },
-    { targetId: '' }, { userId: '-1' }, { outgoing: true },
-    { messageId: '-123' }, { messageSeq: '123' }, { kind: 'unknown' },
-    { conversation: { type: 'temporary', sourceGroupId: '123456', id: '222222' } },
-  ]) {
-    const content = JSON.stringify(pokeRecord(1, changes)) + '\n';
-    await writeFile(path, content);
-    const response = await f.call(route);
-    assert.equal(response.status, 400, await response.clone().text());
-    assert.equal(await readFile(path, 'utf8'), content);
-  }
 });
 
 test('large JSONL logs return a bounded tail made only of complete records', async t => {
@@ -250,7 +195,7 @@ test('large JSONL logs return a bounded tail made only of complete records', asy
   const latest = records.map(logLine).join('');
   assert.ok(Buffer.byteLength(latest) > 512 * 1024);
   await writeFile(join(f.messageDir, '2026-10-26.jsonl'), latest);
-  const tail = await f.get<{ content: string; truncated: boolean }>('/api/groups/123456/logs/group:123456/2026-10-26.jsonl');
+  const tail = await f.get<{ content: string; truncated: boolean }>('/api/groups/123456/logs/group:GROUP_OPENID_A/2026-10-26.jsonl');
   assert.equal(tail.truncated, true);
   assert.ok(Buffer.byteLength(tail.content) <= 512 * 1024);
   assert.ok(tail.content.endsWith('\n'));
@@ -265,17 +210,17 @@ test('large JSONL logs return a bounded tail made only of complete records', asy
 test('a complete record on the byte limit boundary is retained instead of being mistaken for a partial line', async t => {
   const f = await fixture(t);
   const limit = 512 * 1024;
-  const base = logRecord(2, '', { segments: [] });
+  const base = logRecord(2, '', { attachments: [] });
   const final = logLine({ ...base, rawText: 'x'.repeat(limit - Buffer.byteLength(logLine(base))) });
   assert.equal(Buffer.byteLength(final), limit);
   await writeFile(join(f.messageDir, '2026-10-26.jsonl'), logLine(logRecord(1)) + final);
-  assert.deepEqual(await f.get('/api/groups/123456/logs/group:123456/2026-10-26.jsonl'), { content: final, truncated: true });
+  assert.deepEqual(await f.get('/api/groups/123456/logs/group:GROUP_OPENID_A/2026-10-26.jsonl'), { content: final, truncated: true });
 });
 
 test('oversized last records and malformed JSONL fail clearly instead of returning missing messages', async t => {
   const f = await fixture(t);
   const path = join(f.messageDir, '2026-10-26.jsonl');
-  const route = '/api/groups/123456/logs/group:123456/2026-10-26.jsonl';
+  const route = '/api/groups/123456/logs/group:GROUP_OPENID_A/2026-10-26.jsonl';
   await writeFile(path, logLine(logRecord(1)) + logLine(logRecord(2, 'x'.repeat(512 * 1024 + 100))));
   const tooLarge = await f.call(route);
   assert.equal(tooLarge.status, 413, await tooLarge.clone().text());
@@ -286,7 +231,7 @@ test('oversized last records and malformed JSONL fail clearly instead of returni
     logLine(logRecord(1)) + '{"v":1,"seq":2',
     JSON.stringify(logRecord(1)),
     logLine(logRecord(1, 'invalid conversation type', { conversation: { type: 'unknown', id: '654321' } })),
-    logLine(logRecord(1, 'wrong conversation in path', { conversation: { type: 'private', id: '123456' } })),
+    logLine(logRecord(1, 'wrong conversation in path', { conversation: { type: 'private', id: 'USER_OPENID_A' } })),
     logLine(logRecord(1, 'old schema', { v: 1, groupId: '123456' })),
   ];
   for (const content of invalid) {
@@ -302,8 +247,8 @@ test('group creation is isolated and duplicate requests cannot replace existing 
   const f = await fixture(t);
   const existing = await readFile(join(f.cwd, 'PERSONA.md'), 'utf8');
   const results = await Promise.all([
-    f.call('/api/groups', 'POST', { id: '654321', name: 'Second group', conversations: [{ type: 'group', id: '654321' }], wsUrl: 'ws://127.0.0.1:3333/' }),
-    f.call('/api/groups', 'POST', { id: '654321', name: 'Second group', conversations: [{ type: 'group', id: '654321' }], wsUrl: 'ws://127.0.0.1:4444/' }),
+    f.call('/api/groups', 'POST', { id: '654321', name: 'Second group', conversations: [{ type: 'group', id: '654321' }], appIdEnv: 'SECOND_APP_ID' }),
+    f.call('/api/groups', 'POST', { id: '654321', name: 'Second group', conversations: [{ type: 'group', id: '654321' }], appIdEnv: 'OTHER_APP_ID' }),
   ]);
   assert.deepEqual(results.map(response => response.status).sort(), [201, 409]);
   assert.equal((await loadConfig(join(f.root, '654321')))?.id, '654321');
@@ -317,20 +262,20 @@ test('group creation is isolated and duplicate requests cannot replace existing 
 
 test('conversation membership is exclusive across group creation and updates', async t => {
   const f = await fixture(t);
-  const conflict = await f.call('/api/groups', 'POST', { id: 'conflict', name: 'Conflicting group', conversations: [{ type: 'group', id: '123456' }] });
+  const conflict = await f.call('/api/groups', 'POST', { id: 'conflict', name: 'Conflicting group', conversations: [{ type: 'group', id: 'GROUP_OPENID_A' }] });
   assert.equal(conflict.status, 409, await conflict.clone().text());
   assert.match((await conflict.json() as { error: string }).error, /123456/);
   const shared = await f.call('/api/groups', 'POST', { id: 'shared', name: 'Shared dialogs', conversations: [
-    { type: 'group', id: '654321' }, { type: 'private', id: '123456' },
+    { type: 'group', id: '654321' }, { type: 'private', id: 'USER_OPENID_A' },
   ] });
   assert.equal(shared.status, 201, await shared.clone().text());
   const detail = await f.get<Group>('/api/groups/shared');
   assert.equal(detail.config.name, 'Shared dialogs');
-  assert.deepEqual(detail.config.conversations, [{ type: 'group', id: '654321' }, { type: 'private', id: '123456' }]);
-  assert.deepEqual(detail.logs, { 'group:654321': [], 'private:123456': [] });
+  assert.deepEqual(detail.config.conversations, [{ type: 'group', id: '654321' }, { type: 'private', id: 'USER_OPENID_A' }]);
+  assert.deepEqual(detail.logs, { 'group:654321': [], 'private:USER_OPENID_A': [] });
   const updated = await f.call('/api/groups/shared/config', 'PUT', {
     revision: detail.configRevision,
-    config: { ...detail.config, conversations: [...detail.config.conversations, { type: 'group', id: '123456' }] },
+    config: { ...detail.config, conversations: [...detail.config.conversations, { type: 'group', id: 'GROUP_OPENID_A' }] },
   });
   assert.equal(updated.status, 409, await updated.clone().text());
   assert.deepEqual((await loadConfig(join(f.root, 'shared')))!.conversations, detail.config.conversations);
@@ -370,41 +315,82 @@ test('each dialog has separate JSONL paths inside the shared group', async t => 
   const f = await fixture(t);
   const detail = await f.get<Group>('/api/groups/123456');
   assert.equal((await f.call('/api/groups/123456/config', 'PUT', {
-    revision: detail.configRevision, config: { ...detail.config, conversations: [...detail.config.conversations, { type: 'private', id: '123456' }] },
+    revision: detail.configRevision, config: { ...detail.config, conversations: [...detail.config.conversations, { type: 'private', id: 'USER_OPENID_A' }] },
   })).status, 200);
-  const privateDir = join(f.cwd, 'messages', 'private', '123456');
+  const privateDir = join(f.cwd, conversationDirectory({ type: 'private', id: 'USER_OPENID_A' }));
   await mkdir(privateDir, { recursive: true });
   const groupContent = logLine(logRecord(1, 'GROUP_ONLY'));
-  const privateContent = logLine(logRecord(2, 'PRIVATE_ONLY', { conversation: { type: 'private', id: '123456' } }));
+  const privateContent = logLine(logRecord(2, 'PRIVATE_ONLY', { conversation: { type: 'private', id: 'USER_OPENID_A' } }));
   await writeFile(join(f.messageDir, '2026-10-26.jsonl'), groupContent);
   await writeFile(join(privateDir, '2026-10-26.jsonl'), privateContent);
   const refreshed = await f.get<Group>('/api/groups/123456');
-  assert.deepEqual(refreshed.logs, { 'group:123456': ['2026-10-26.jsonl'], 'private:123456': ['2026-10-26.jsonl'] });
-  assert.deepEqual(await f.get('/api/groups/123456/logs/group:123456/2026-10-26.jsonl'), { content: groupContent, truncated: false });
-  assert.deepEqual(await f.get('/api/groups/123456/logs/private:123456/2026-10-26.jsonl'), { content: privateContent, truncated: false });
+  assert.deepEqual(refreshed.logs, { 'group:GROUP_OPENID_A': ['2026-10-26.jsonl'], 'private:USER_OPENID_A': ['2026-10-26.jsonl'] });
+  assert.deepEqual(await f.get('/api/groups/123456/logs/group:GROUP_OPENID_A/2026-10-26.jsonl'), { content: groupContent, truncated: false });
+  assert.deepEqual(await f.get('/api/groups/123456/logs/private:USER_OPENID_A/2026-10-26.jsonl'), { content: privateContent, truncated: false });
   assert.equal((await f.call('/api/groups/123456/logs/group:654321/2026-10-26.jsonl')).status, 404);
   assert.ok([400, 404].includes((await f.call('/api/groups/123456/logs/group%3A..%2F..%2F123456/2026-10-26.jsonl')).status));
 });
 
-test('temporary dialog logs include their source group and stay separate from direct private logs', async t => {
+test('official identities reject temporary conversations and old endpoint configuration', async t => {
   const f = await fixture(t);
-  const detail = await f.get<Group>('/api/groups/123456');
-  const temporary = { type: 'temporary', id: '777777', sourceGroupId: '123456' };
+  assert.equal((await f.call('/api/groups', 'POST', { id: 'invalid', name: 'Invalid', conversations: [{ type: 'temporary', id: 'OPENID_A', sourceGroupId: 'OPENID_B' }] })).status, 400);
+  assert.equal((await f.call('/api/groups', 'POST', { id: 'invalid', name: 'Invalid', conversations: [], wsUrl: 'ws://localhost:3001/' })).status, 400);
+  for (const suffix of ['recover', 'snowluma']) assert.equal((await f.call('/api/groups/123456/' + suffix, 'POST', {})).status, 404);
+  for (const fields of [{ appId: 'ACTUAL_APP_ID' }, { appSecret: 'ACTUAL_SECRET' }, { appSecretEnv: 'not a variable' }]) {
+    assert.equal((await f.call('/api/groups', 'POST', { id: 'invalid', name: 'Invalid', conversations: [], ...fields })).status, 400);
+  }
+});
+
+test('case-sensitive OpenIDs use separate hashed logs and removed members retain their official history', async t => {
+  const f = await fixture(t);
+  const before = await f.get<Group>('/api/groups/123456');
+  const sources = [{ type: 'group' as const, id: 'Case_OpenID' }, { type: 'group' as const, id: 'case_openid' }];
   assert.equal((await f.call('/api/groups/123456/config', 'PUT', {
-    revision: detail.configRevision,
-    config: { ...detail.config, conversations: [...detail.config.conversations, temporary, { type: 'private', id: '777777' }] },
+    config: { ...before.config, conversations: sources }, revision: before.configRevision,
   })).status, 200);
-  const temporaryDir = join(f.cwd, 'messages', 'temporary', '123456', '777777');
-  const privateDir = join(f.cwd, 'messages', 'private', '777777');
-  await mkdir(temporaryDir, { recursive: true }); await mkdir(privateDir, { recursive: true });
-  const content = logLine(logRecord(1, 'TEMPORARY_ONLY', { conversation: temporary }));
-  const direct = logLine(logRecord(2, 'DIRECT_ONLY', { conversation: { type: 'private', id: '777777' } }));
-  await writeFile(join(temporaryDir, '2026-10-26.jsonl'), content);
-  await writeFile(join(privateDir, '2026-10-26.jsonl'), direct);
-  const current = await f.get<Group>('/api/groups/123456');
-  assert.deepEqual(current.logs['temporary:123456:777777'], ['2026-10-26.jsonl']);
-  assert.deepEqual(await f.get('/api/groups/123456/logs/temporary:123456:777777/2026-10-26.jsonl'), { content, truncated: false });
-  assert.deepEqual(await f.get('/api/groups/123456/logs/private:777777/2026-10-26.jsonl'), { content: direct, truncated: false });
+  assert.notEqual(conversationDirectory(sources[0]!), conversationDirectory(sources[1]!));
+  for (const [index, conversation] of sources.entries()) {
+    const directory = join(f.cwd, conversationDirectory(conversation));
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, '2026-10-26.jsonl'), logLine(logRecord(index + 1, conversation.id, { conversation })));
+  }
+  const configured = await f.get<Group>('/api/groups/123456');
+  assert.deepEqual(configured.logs, { 'group:Case_OpenID': ['2026-10-26.jsonl'], 'group:case_openid': ['2026-10-26.jsonl'] });
+  assert.equal((await f.call('/api/groups/123456/config', 'PUT', {
+    config: { ...configured.config, conversations: [] }, revision: configured.configRevision,
+  })).status, 200);
+  const retained = await f.get<Group>('/api/groups/123456');
+  assert.deepEqual(retained.logs, configured.logs);
+  for (const conversation of sources) {
+    const log = await f.get<{ content: string }>(`/api/groups/123456/logs/${encodeURIComponent(`group:${conversation.id}`)}/2026-10-26.jsonl`);
+    assert.equal(JSON.parse(log.content).conversation.id, conversation.id);
+  }
+  const legacy = join(f.cwd, 'messages', 'group', '999999');
+  await mkdir(legacy, { recursive: true });
+  await writeFile(join(legacy, '2026-10-26.jsonl'), '{"v":2,"legacy":"do not expose"}\n');
+  assert.deepEqual((await f.get<Group>('/api/groups/123456')).logs, configured.logs);
+});
+
+test('an unassigned journal cannot impersonate a different OpenID from its hashed directory', async t => {
+  const f = await fixture(t);
+  const directory = join(f.cwd, conversationDirectory({ type: 'private', id: 'Expected_OpenID' }));
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, '2026-10-26.jsonl'), logLine(logRecord(1, 'foreign', { conversation: { type: 'private', id: 'Different_OpenID' } })));
+  const response = await f.call('/api/groups/123456');
+  assert.equal(response.status, 400);
+  assert.match((await response.json() as { error: string }).error, /OpenID/);
+});
+
+test('a retained conversation remains listed when its first message exceeds the log preview limit', async t => {
+  const f = await fixture(t);
+  const conversation = { type: 'private' as const, id: 'Retained_OpenID' };
+  const directory = join(f.cwd, conversationDirectory(conversation));
+  await mkdir(directory, { recursive: true });
+  const content = logLine(logRecord(1, 'x'.repeat(600_000), { conversation }));
+  await writeFile(join(directory, '2026-10-26.jsonl'), content);
+  assert.deepEqual((await f.get<Group>('/api/groups/123456')).logs['private:Retained_OpenID'], ['2026-10-26.jsonl']);
+  assert.equal((await f.call('/api/groups/123456/logs/private:Retained_OpenID/2026-10-26.jsonl')).status, 413);
+  assert.equal(await readFile(join(directory, '2026-10-26.jsonl'), 'utf8'), content);
 });
 
 test('empty groups can be created for setup, and stop releases a live owner before membership edits', async t => {
@@ -431,7 +417,7 @@ test('stop cancels a pending terminal return even after the terminal owner has d
   const directory = join(f.cwd, '.piq');
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, 'terminal-return.json'), JSON.stringify({
-    version: 1, token: 'pending-terminal-return', launcherPid: process.pid, monitorPid: process.pid,
+    version: 1, kind: 'terminal-only', token: 'pending-terminal-return', launcherPid: process.pid,
     createdAt: Date.now(), state: 'watching',
   }));
   await writeFile(join(directory, 'run-preferences.json'), JSON.stringify({ version: 1, paused: true, interrupted: true }));
@@ -441,36 +427,6 @@ test('stop cancels a pending terminal return even after the terminal owner has d
   assert.deepEqual(JSON.parse(await readFile(join(directory, 'run-preferences.json'), 'utf8')),
     { version: 1, paused: true, interrupted: false });
   assert.deepEqual(f.actions, []);
-});
-
-test('opening a background group uses a handoff rather than an explicit stop', async t => {
-  const f = await fixture(t);
-  const directory = join(f.cwd, '.piq');
-  await mkdir(directory, { recursive: true });
-  const token = 'handoff-owner';
-  await writeFile(join(directory, 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token }));
-  await writeFile(join(directory, 'worker.json'), JSON.stringify({ version: 1, mode: 'background', pid: process.pid,
-    launchId: 'test-launch', startedAt: Date.now(), state: 'running', ownerToken: token }));
-  const response = await f.call('/api/groups/123456/open', 'POST', {});
-  assert.equal(response.status, 200);
-  assert.deepEqual(f.actions, ['handoff']);
-  assert.equal(f.launched.length, 1);
-});
-
-for (const startupFile of ['worker.json', 'worker-launch.json']) test(`stop waits through ${startupFile} before stopping its newly acquired owner`, async t => {
-  const f = await fixture(t);
-  const directory = join(f.cwd, '.piq');
-  await mkdir(directory, { recursive: true });
-  await writeFile(join(directory, startupFile), JSON.stringify({ version: 1, pid: process.pid,
-    launchId: 'test-starting', startedAt: Date.now(),
-    ...(startupFile === 'worker.json' ? { mode: 'background', state: 'starting' } : {}) }));
-  const stopping = f.call('/api/groups/123456/stop', 'POST', {});
-  await new Promise(resolve => setTimeout(resolve, 150));
-  assert.deepEqual(f.actions, []);
-  await writeFile(join(directory, 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'late-owner' }));
-  assert.equal((await stopping).status, 200);
-  assert.deepEqual(f.actions, ['shutdown']);
-  await assert.rejects(readFile(join(directory, 'owner.lock')), { code: 'ENOENT' });
 });
 
 test('terminal requests are deduplicated and an existing group owner is respected', async t => {
@@ -493,7 +449,7 @@ test('terminal requests are deduplicated and an existing group owner is respecte
   assert.equal(f.launched.length, 1);
 });
 
-test('start and open share one terminal launch without creating a background worker', async t => {
+test('start and open share one terminal launch', async t => {
   const f = await fixture(t);
   const responses = await Promise.all([
     f.call('/api/groups/123456/start', 'POST', {}),
@@ -502,7 +458,6 @@ test('start and open share one terminal launch without creating a background wor
   assert.deepEqual(responses.map(response => response.status), [200, 200]);
   assert.equal(f.launched.length, 1);
   assert.deepEqual(f.launchOptions, [{ freshSession: false }]);
-  await assert.rejects(readFile(join(f.cwd, '.piq', 'worker.json')), { code: 'ENOENT' });
   assert.equal((await f.call('/api/groups/123456', 'DELETE')).status, 409, 'a pending launch cannot be moved to trash');
 });
 
@@ -512,7 +467,7 @@ test('stop retains a live terminal without an owner lock and prevents deletion o
   await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   try {
     assert.ok(child.pid);
-    const lease = await prepareTerminalReturn(f.cwd);
+    const lease = await prepareTerminalLaunch(f.cwd);
     await registerTerminal(f.cwd, lease.token, child.pid, child.pid);
     assert.equal((await getProcessStatus(f.cwd)).running, true);
     const stop = await f.call('/api/groups/123456/stop', 'POST', {});
@@ -539,7 +494,7 @@ test('stop waits for the tracked Pi process after its owner lock is released', a
   await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   try {
     assert.ok(child.pid);
-    const lease = await prepareTerminalReturn(f.cwd);
+    const lease = await prepareTerminalLaunch(f.cwd);
     await registerTerminal(f.cwd, lease.token, child.pid, child.pid);
     await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: child.pid, token: 'exiting-owner' }));
     let settled = false;
@@ -628,7 +583,7 @@ test('trash mutations require local authorization and restoration refuses assign
   for (const token of ['..', '..%2F123456', '..%5C123456', 'invalid']) {
     assert.ok([400, 404].includes((await f.call(`/api/trash/${token}/restore`, 'POST', {})).status));
   }
-  await initializeGroup(f.root, 'replacement', { name: 'New owner', conversations: [{ type: 'group', id: '123456' }] });
+  await initializeGroup(f.root, 'replacement', { name: 'New owner', conversations: [{ type: 'group', id: 'GROUP_OPENID_A' }] });
   assert.equal((await f.call(endpoint, 'POST', {})).status, 409);
   assert.equal((await f.get<{ entries: unknown[] }>('/api/trash')).entries.length, 1);
   assert.ok(await readFile(join(deleted.recoveryPath, 'PIQ.md'), 'utf8'));

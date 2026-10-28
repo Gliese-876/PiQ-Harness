@@ -9,15 +9,17 @@ export interface GroupConfig {
   id: string;
   name: string;
   conversations: Conversation[];
-  wsUrl: string;
-  accessTokenEnv: string;
+  appIdEnv: string;
+  appSecretEnv: string;
+  groupMemberEvents: boolean;
   quietMs: number;
   maxWaitMs: number;
   minIntervalMs: number;
 }
 
 export const DEFAULTS: Omit<GroupConfig, 'id' | 'name' | 'conversations'> = {
-  wsUrl: 'ws://127.0.0.1:3001/', accessTokenEnv: 'SNOWLUMA_ACCESS_TOKEN',
+  appIdEnv: 'QQBOT_APP_ID', appSecretEnv: 'QQBOT_APP_SECRET',
+  groupMemberEvents: false,
   quietMs: 1_500, maxWaitMs: 10_000, minIntervalMs: 15_000,
 };
 export class ConfigError extends Error {
@@ -48,17 +50,18 @@ export function validateConfig(value: unknown): GroupConfig {
   const conversations = value.conversations.map(validateConversation);
   if (new Set(conversations.map(conversationKey)).size !== conversations.length) throw new Error('同一对话在对话组中只能出现一次。');
   const merged = { ...DEFAULTS, ...value };
-  if (typeof merged.wsUrl !== 'string') throw new Error('wsUrl 必须是 WebSocket 地址。');
-  let url: URL;
-  try { url = new URL(merged.wsUrl); } catch { throw new Error('wsUrl 必须是有效的 ws:// 或 wss:// 地址。'); }
-  if (!['ws:', 'wss:'].includes(url.protocol) || !url.hostname) throw new Error('wsUrl 必须使用 ws:// 或 wss://。');
-  if (url.username || url.password || url.search || url.hash) throw new Error('wsUrl 请只填写端点地址；凭据使用 accessTokenEnv 环境变量。');
-  if (typeof merged.accessTokenEnv !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(merged.accessTokenEnv)) throw new Error('accessTokenEnv 必须是有效的环境变量名。');
+  for (const field of ['appIdEnv', 'appSecretEnv'] as const) {
+    if (typeof merged[field] !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(merged[field])) {
+      throw new Error(`${field} 必须是有效的环境变量名；实际凭据不能写入 PIQ.md。`);
+    }
+  }
+  if (typeof merged.groupMemberEvents !== 'boolean') throw new Error('groupMemberEvents 必须是布尔值。');
   for (const key of ['quietMs', 'maxWaitMs', 'minIntervalMs'] as const) {
     if (typeof merged[key] !== 'number' || !Number.isInteger(merged[key]) || merged[key] < 0 || merged[key] > 3_600_000) throw new Error(`${key} 必须是 0 到 3600000 的整数毫秒。`);
   }
   if (merged.maxWaitMs === 0 || merged.quietMs > merged.maxWaitMs) throw new Error('maxWaitMs 必须大于 0，且不小于 quietMs。');
-  return { id, name: value.name.trim(), conversations, wsUrl: merged.wsUrl, accessTokenEnv: merged.accessTokenEnv,
+  return { id, name: value.name.trim(), conversations, appIdEnv: merged.appIdEnv, appSecretEnv: merged.appSecretEnv,
+    groupMemberEvents: merged.groupMemberEvents,
     quietMs: merged.quietMs, maxWaitMs: merged.maxWaitMs, minIntervalMs: merged.minIntervalMs };
 }
 
@@ -244,8 +247,8 @@ export async function assertAssignments(cwd: string, config: GroupConfig): Promi
 export interface InitializeOptions {
   name: string;
   conversations: Conversation[];
-  wsUrl?: string;
-  accessTokenEnv?: string;
+  appIdEnv?: string;
+  appSecretEnv?: string;
   extensionPath?: string;
 }
 
@@ -257,8 +260,8 @@ async function createIfMissing(path: string, content: string): Promise<void> {
 export async function initializeGroup(rootInput: string, idInput: string, options: InitializeOptions): Promise<string> {
   const id = validateGroupId(idInput);
   const requested = validateConfig({ id, name: options?.name, conversations: options?.conversations, ...DEFAULTS,
-    ...(options?.wsUrl === undefined ? {} : { wsUrl: options.wsUrl }),
-    ...(options?.accessTokenEnv === undefined ? {} : { accessTokenEnv: options.accessTokenEnv }),
+    ...(options?.appIdEnv === undefined ? {} : { appIdEnv: options.appIdEnv }),
+    ...(options?.appSecretEnv === undefined ? {} : { appSecretEnv: options.appSecretEnv }),
   });
   return withRootLock(resolve(rootInput), async root => {
     const cwd = join(root, id);
@@ -292,8 +295,8 @@ export async function initializeGroup(rootInput: string, idInput: string, option
       `# 对话组 ${requested.name}`, '',
       '本目录内的对话共用会话、人设、记忆和资料，成员对话见 PIQ.md。',
       'PERSONA.md 可记录人设；需要时自行读取、维护 MEMORY.md 或其他 Markdown。',
-      '群聊、好友私聊、群临时私聊的日志分别保存在 messages/group/<群号>/、messages/private/<QQ号>/、messages/temporary/<来源群>/<QQ号>/，各自按日期使用 JSONL。',
-      '新出现的群临时私聊默认归入来源群所在的对话组；已有归属优先，不自动添加好友。',
+      '官方机器人群聊和私聊使用 OpenID 标识，日志保存在 messages/v3/group/<OpenID哈希>/ 与 messages/v3/private/<OpenID哈希>/，各自按日期使用 JSONL。',
+      '消息保留官方事件原文，发送必须明确指定 PIQ.md 中配置的本组对话；实际 AppID 与 AppSecret 只从指定环境变量读取。',
       'PiQ 通知只表示有新消息。自行阅读记录，判断是否回应，也可以保持沉默。',
       '发消息时调用 qq_send，并明确指定本组中的目标对话。普通 Pi 回答只显示在当前会话。',
       '回复以目标对话的上下文为准；其他对话尤其私聊的内容，不因属于同组而自动转述。',
@@ -361,51 +364,4 @@ export async function claimConversations(cwd: string, input: GroupConfig): Promi
     });
     released = true;
   };
-}
-
-/** A new incoming temporary chat follows its source group unless already assigned. */
-export async function adoptTemporaryConversation(cwd: string, input: Conversation): Promise<GroupConfig | null> {
-  const temporary = validateConversation(input);
-  if (temporary.type !== 'temporary') throw new Error('自动归属只接受群临时私聊。');
-  const checked = await groupDirectory(cwd);
-  return withRootLock(checked.root, async root => {
-    const groups = await checkAssignments(root);
-    const current = groups.find(group => group.id === checked.id);
-    if (!current) return null;
-    const lock = await owner(checked.path);
-    if (!lock || lock.pid !== process.pid) return null;
-    const held = await activeClaims(checked.path);
-    const key = conversationKey(temporary);
-    for (const group of groups) {
-      if (group.id === checked.id) continue;
-      if (group.config.conversations.some(item => conversationKey(item) === key)
-        || (await activeClaims(group.path)).includes(key)) return null;
-    }
-    const configured = current.config.conversations.some(item => conversationKey(item) === key);
-    if (configured && held.includes(key)) return current.config;
-    const sourceKey = conversationKey({ type: 'group', id: temporary.sourceGroupId! });
-    if (!held.includes(sourceKey) || !current.config.conversations.some(item => conversationKey(item) === sourceKey)) return null;
-    const path = await localFile(checked.path, 'PIQ.md');
-    const original = await readFile(path, 'utf8');
-    if (JSON.stringify(parseMarkdown(original)) !== JSON.stringify(current.config)) throw new ConfigError(409, '对话组配置在自动归属期间变更，请重试。');
-    const candidate = configured ? current.config : validateConfig({ ...current.config, conversations: [...current.config.conversations, temporary] });
-    await checkAssignments(root, candidate);
-    const claimPath = await localFile(checked.path, '.piq/conversations.json');
-    const oldClaim = await readFile(claimPath, 'utf8');
-    const claim = JSON.parse(oldClaim);
-    if (claim.pid !== lock.pid || claim.ownerToken !== lock.token) return null;
-    const currentOwner = await owner(checked.path);
-    if (currentOwner?.pid !== lock.pid || currentOwner.token !== lock.token) return null;
-    const newClaim = JSON.stringify({ ...claim, keys: [...new Set([...held, key])] }, null, 2) + '\n';
-    const updated = original.replace(/^```json[ \t]*\r?\n[\s\S]*?^```[ \t]*\r?$/m, '```json\n' + JSON.stringify(candidate, null, 2) + '\n```');
-    await atomicFile(claimPath, newClaim);
-    try {
-      if (await readFile(path, 'utf8') !== original) throw new ConfigError(409, '配置在自动归属期间被修改，请重试。');
-      if (updated !== original) await atomicFile(path, updated);
-    } catch (error) {
-      await atomicFile(claimPath, oldClaim);
-      throw error;
-    }
-    return candidate;
-  });
 }

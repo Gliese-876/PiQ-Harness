@@ -22,13 +22,13 @@ export function defaultMessagesRoot(): string {
 }
 
 export interface CliOptions {
-  action: "init" | "open" | "path" | "help";
+  action: "init" | "open" | "discover" | "path" | "help";
   id?: string;
   name?: string;
   conversations?: Conversation[];
   root?: string;
-  wsUrl?: string;
-  accessTokenEnv?: string;
+  appIdEnv?: string;
+  appSecretEnv?: string;
   freshSession?: boolean;
   piArgs: string[];
 }
@@ -36,7 +36,7 @@ export interface CliOptions {
 export function parseArgs(args: string[]): CliOptions {
   if (!args.length || ["--help", "-h", "help"].includes(args[0]!)) return { action: "help", piArgs: [] };
   const action = args[0];
-  if (action !== "init" && action !== "open" && action !== "path") throw new Error("命令应为 init、open 或 path。");
+  if (action !== "init" && action !== "open" && action !== "discover" && action !== "path") throw new Error("命令应为 init、open、discover 或 path。");
   const result: CliOptions = { action, id: validateGroupId(args[1]), piArgs: [], ...(action === 'init' ? { conversations: [] } : {}) };
   for (let i = 2; i < args.length; i++) {
     const arg = args[i]!;
@@ -55,7 +55,7 @@ export function parseArgs(args: string[]): CliOptions {
       result.conversations!.push(parseConversationKey(args[++i]));
       continue;
     }
-    const key = arg === "--root" ? "root" : arg === "--url" ? "wsUrl" : arg === "--token-env" ? "accessTokenEnv" : arg === '--name' ? 'name' : null;
+    const key = arg === "--root" ? "root" : arg === "--app-id-env" ? "appIdEnv" : arg === "--app-secret-env" ? "appSecretEnv" : arg === '--name' ? 'name' : null;
     if (!key) throw new Error(`未知参数：${arg}`);
     const value = args[++i];
     if (!value || value.startsWith("--")) throw new Error(`${arg} 缺少值。`);
@@ -148,7 +148,11 @@ export async function openGroup(cwd: string, extraArgs: string[] = [], options: 
   if (!config) throw new Error("该对话组尚未初始化。请先运行 init <对话组标识> --name <名称>。");
   if (!config.conversations.length) throw new Error('请先向对话组添加至少一个对话。');
   await assertAssignments(cwd, config);
-  const env = await groupTemporaryEnvironment(cwd, { ...process.env, ...options.env });
+  const { resolveGroupEnvironment } = await import('./web-terminal.ts');
+  const inherited = options.env === undefined ? undefined : { ...process.env, ...options.env };
+  const credentials = await resolveGroupEnvironment(cwd, config, { env: inherited });
+  if (!credentials.credential.available) console.error(`PiQ: QQ 机器人连接未启用：${credentials.credential.source}。`);
+  const env = await groupTemporaryEnvironment(cwd, credentials.env);
   const launcher = await resolvePiCommand(env);
   const selectedModel = await modelArguments(cwd);
   const sessionFile = options.sessionFile ?? (options.freshSession ? await createFreshSession(cwd) : undefined);
@@ -184,13 +188,14 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   if (options.action === "help") {
     console.log([
       "PiQ — 让多个对话共用一个独立的 Pi 工作目录", "",
-      "node src/cli.ts init <对话组标识> --name <名称> [--conversation group:群号] [--conversation private:QQ号]",
-      "  [--conversation temporary:来源群:QQ号]",
-      "  [--root <目录>] [--url <WebSocket地址>] [--token-env <变量名>]",
+      "node src/cli.ts init <对话组标识> --name <名称> [--conversation group:group_openid] [--conversation private:user_openid]",
+      "  [--root <目录>] [--app-id-env <变量名>] [--app-secret-env <变量名>]",
       "node src/cli.ts open <对话组标识> [--root <目录>] [--new-session] [-- <Pi参数...>]",
+      "node src/cli.ts discover <对话组标识> [--root <目录>]",
       "node src/cli.ts path <对话组标识> [--root <目录>]", "",
       "默认目录：文档/PiQ-Messages/<对话组标识>。每个对话只能属于一个对话组。",
       "--conversation 可以重复使用；未添加对话的空组可先编辑配置。",
+      "discover 仅监听 QQ 机器人事件并显示对话标识，不发送消息、不输出正文；Ctrl+C 退出。",
       "open 继承当前终端、模型配置和环境变量，并继续本组 .pi/sessions 中的最近会话。",
       "--new-session 新建空上下文，保留已有会话、聊天日志、记忆与资料；关闭终端即停止运行。",
       "首次启动请在 Pi 中信任本组目录，以加载 .pi/settings.json 声明的扩展。",
@@ -203,14 +208,18 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     console.log(await initializeGroup(root, options.id!, {
       name: options.name!,
       conversations: options.conversations!,
-      wsUrl: options.wsUrl,
-      accessTokenEnv: options.accessTokenEnv,
+      appIdEnv: options.appIdEnv,
+      appSecretEnv: options.appSecretEnv,
     }));
     return 0;
   }
   if (options.action === "path") { console.log(cwd); return 0; }
   const config = await loadConfig(cwd);
   if (config && config.id !== options.id) throw new Error("目录中 PIQ.md 的对话组标识与请求不一致。");
+  if (options.action === 'discover') {
+    const { discoverGroup } = await import('./discover.ts');
+    return await discoverGroup(cwd);
+  }
   return await openGroup(cwd, options.piArgs, { freshSession: options.freshSession });
 }
 

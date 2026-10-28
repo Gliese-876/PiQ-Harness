@@ -39,7 +39,7 @@
       <section id="group-workspace" hidden aria-label="当前对话组工作空间">
         <header class="group-header">
           <div class="group-heading">
-            <div class="heading-row"><h1 id="group-title">对话组</h1><span id="run-status" class="run-status">Pi 未运行</span><span id="connection-status" class="connection-status">SnowLuma 未连接</span></div>
+            <div class="heading-row"><h1 id="group-title">对话组</h1><span id="run-status" class="run-status">Pi 未运行</span><span id="connection-status" class="connection-status">QQBot 未连接</span></div>
             <p id="group-path" class="group-path"></p>
             <p id="run-description" class="run-description" role="status" aria-live="polite"></p>
             <div id="pending-dialogs" class="pending-dialogs" aria-label="按对话分类的待处理消息" hidden></div>
@@ -64,11 +64,6 @@
           </div>
         </header>
 
-        <div id="service-recovery" class="service-recovery" hidden>
-          <div class="service-recovery-copy"><p id="service-message">启动 Pi 时会先检查 SnowLuma。</p><p id="service-diagnostic" class="service-diagnostic" hidden></p></div>
-          <div class="service-recovery-actions"><button id="recover-connection" class="button subtle" type="button">重试连接</button><button id="open-snowluma" class="button subtle" type="button">打开 SnowLuma</button></div>
-        </div>
-
         <div class="tabs" role="tablist" aria-label="管理内容">
           <button id="tab-conversations" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-conversations" data-tab="conversations" tabindex="-1">对话</button>
           <button id="tab-documents" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="panel-documents" data-tab="documents">文档</button>
@@ -87,7 +82,7 @@
               <p id="membership-lock" class="membership-lock" role="status" hidden>请先停止本对话组的 Pi，再调整对话归属；运行时可通过“管理对话组”重命名。</p>
               <div id="conversation-rows" class="conversation-rows" aria-label="本组对话"></div>
               <button id="add-conversation" class="button subtle" type="button" disabled>添加对话</button>
-              <p class="field-help membership-help">群聊填写群号，私聊填写对方 QQ 号；群临时私聊还包含来源群号。同组群聊产生的临时私聊会自动归入本组。移除对话会停止接收它的新消息，已有记录与记忆仍保留在本组。</p>
+              <p class="field-help membership-help">群聊填写 group_openid，私聊填写 user_openid。这些标识来自腾讯官方事件或开发平台，不是群号或 QQ 号码。移除对话后停止接收其新消息，已有记录与记忆保留。</p>
             </div>
             <div class="editor-footer"><span id="membership-state" class="save-state">正在读取…</span><button id="save-membership" class="button save-button" type="submit" disabled>保存对话组</button></div>
           </form>
@@ -116,7 +111,7 @@
           <div class="section-intro"><div><h2>对话消息</h2><p>每个对话独立保存消息。先选择对话，再查看对应日期的 JSONL 记录。</p></div><button id="refresh-logs" class="button subtle" type="button">刷新记录</button></div>
           <div class="messages-card">
             <div class="messages-toolbar"><label for="log-conversation">对话</label><select id="log-conversation"><option value="">暂无对话</option></select><label for="log-date">日期</label><select id="log-date" disabled><option value="">暂无记录</option></select><span id="log-note" class="muted"></span></div>
-            <div id="messages-empty" class="empty-state"><span aria-hidden="true">—</span><p>还没有消息记录</p><small>启动本对话组 Pi 并连接 SnowLuma 后，消息会出现在这里。</small></div>
+            <div id="messages-empty" class="empty-state"><span aria-hidden="true">—</span><p>还没有消息记录</p><small>启动本对话组 Pi 并连接腾讯官方 QQBot 后，消息会出现在这里。</small></div>
             <p id="log-error" class="inline-error" role="alert" hidden></p>
             <div id="message-list" class="message-list" hidden></div>
             <details id="raw-log" class="raw-log" hidden><summary>查看原始 JSONL</summary><pre id="log-content" tabindex="0"></pre></details>
@@ -127,9 +122,10 @@
           <div class="section-intro"><div><h2>连接与消息聚合</h2><p>设置保存在本对话组 PIQ.md 中，重启或 /reload 后生效。</p></div></div>
           <form id="connection-form" class="settings-card">
             <div class="settings-section">
-              <div class="setting-heading"><h3>SnowLuma</h3><span id="credential-status" class="credential-status"></span></div>
-              <div class="field"><label for="ws-url">WebSocket 地址</label><input id="ws-url" name="wsUrl" type="url" placeholder="ws://127.0.0.1:3000/" required autocomplete="off"><span class="field-help">使用 SnowLuma 的 Universal WebSocket 端点。</span></div>
-              <div class="field"><label for="token-env">Token 环境变量</label><input id="token-env" name="accessTokenEnv" type="text" required pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off"><span id="credential-source" class="field-help">填写变量名，凭据由本地服务读取。</span></div>
+              <div class="setting-heading"><h3>腾讯官方 QQBot</h3><span id="credential-status" class="credential-status"></span></div>
+              <div class="field"><label for="app-id-env">AppID 环境变量名</label><input id="app-id-env" name="appIdEnv" type="text" required pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off" placeholder="QQBOT_APP_ID"><span class="field-help">在本机环境中配置官方机器人 AppID，此处只填写变量名。</span></div>
+              <div class="field"><label for="app-secret-env">AppSecret 环境变量名</label><input id="app-secret-env" name="appSecretEnv" type="text" required pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off" placeholder="QQBOT_APP_SECRET"><span id="credential-source" class="field-help">在本机环境中配置 AppSecret，此处不输入密钥。连接由本组 Pi 终端持有。</span></div>
+              <div class="field"><label for="group-member-events">群成员事件</label><select id="group-member-events" name="groupMemberEvents"><option value="false">不订阅</option><option value="true">订阅群成员与入群申请事件</option></select><span class="field-help">仅在官方平台已授予群成员事件权限时启用；群管理查询和操作仍由工具显式执行。</span></div>
             </div>
             <div class="settings-section">
               <h3>聚合节奏</h3>
@@ -167,7 +163,8 @@
       <div class="field"><label for="new-group-name">对话组名称</label><input id="new-group-name" name="name" type="text" maxlength="80" required autocomplete="off" placeholder="例如 朋友们"></div>
       <div class="field"><label for="new-group-id">目录标识（可留空）</label><input id="new-group-id" name="id" type="text" maxlength="64" pattern="[a-z0-9][a-z0-9_\-]{0,63}" autocomplete="off" placeholder="留空自动生成"><span class="field-help">可填写小写字母、数字、下划线或短横线；创建后保持固定。</span></div>
       <div class="dialog-conversations"><h3>初始对话</h3><div id="new-conversation-rows" class="conversation-rows" aria-label="新对话组中的对话"></div><button id="add-new-conversation" class="button subtle" type="button">添加对话</button><p class="field-help membership-help">可以添加多个群聊和私聊，也可以创建后再添加。</p></div>
-      <div class="field"><label for="new-ws-url">WebSocket 地址</label><input id="new-ws-url" name="wsUrl" type="url" required autocomplete="off"></div>
+      <div class="field"><label for="new-app-id-env">AppID 环境变量名</label><input id="new-app-id-env" name="appIdEnv" type="text" pattern="[A-Za-z_][A-Za-z0-9_]*" required autocomplete="off"></div>
+      <div class="field"><label for="new-app-secret-env">AppSecret 环境变量名</label><input id="new-app-secret-env" name="appSecretEnv" type="text" pattern="[A-Za-z_][A-Za-z0-9_]*" required autocomplete="off"><span class="field-help">仅填写变量名；AppID 和 AppSecret 由主人配置在本机环境中。</span></div>
       <p id="add-error" class="inline-error" role="alert" hidden></p>
       <div class="dialog-actions"><button id="cancel-add" class="button subtle" type="button">取消</button><button id="confirm-add" class="button primary" type="submit">创建对话组</button></div>
     </form>

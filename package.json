@@ -1,13 +1,13 @@
 {
   "name": "piq-harness",
   "version": "0.1.0",
-  "description": "A minimal OneBot channel for shared Pi conversation groups",
+  "description": "Tencent official QQ Bot channel for shared Pi conversation groups",
   "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",
   "keywords": [
     "pi-package",
-    "snowluma",
+    "qqbot",
     "qq"
   ],
   "engines": {
@@ -34,5 +34,8 @@
     "@types/node": "^26.0.0",
     "typebox": "^1.1.3",
     "typescript": "^6.0.0"
+  },
+  "dependencies": {
+    "@tencent-connect/qqbot-nodejs": "1.0.5"
   }
 }

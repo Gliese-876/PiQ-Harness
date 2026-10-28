@@ -34,14 +34,6 @@
     "run_python": "ask",
     "sandbox_grant_write": "deny",
     "qq_send": "allow",
-    "qq_poke": "allow",
-    "qq_react": "allow",
-    "qq_recall": "allow",
-    "qq_sticker": "allow",
-    "qq_voice": "allow",
-    "qq_group_files": "allow",
-    "qq_album": "allow",
-    "qq_read_forward": "allow",
-    "qq_forward": "allow"
+    "qq_send_file": "allow"
   }
 }

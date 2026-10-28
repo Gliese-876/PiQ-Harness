@@ -3,12 +3,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { test, type TestContext } from 'node:test';
-import { conversationDirectory, conversationKey, parseConversationKey, validateConversation, validateQQId, type Conversation } from '../src/conversations.ts';
-import { adoptTemporaryConversation, assertAssignments, claimConversations, initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, type GroupConfig } from '../src/config.ts';
+import { conversationDirectory, conversationKey, parseConversationKey, validateConversation, validateOpenId, type Conversation } from '../src/conversations.ts';
+import { assertAssignments, claimConversations, initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, type GroupConfig } from '../src/config.ts';
 
 const group = (id: string): Conversation => ({ type: 'group', id });
 const person = (id: string): Conversation => ({ type: 'private', id });
-const temporary = (sourceGroupId: string, id: string): Conversation => ({ type: 'temporary', sourceGroupId, id });
 const revision = (text: string) => createHash('sha256').update(text).digest('hex');
 
 async function fixture(t: TestContext) {
@@ -33,45 +32,40 @@ async function own(cwd: string, token: string = randomUUID()) {
   return token;
 }
 
-test('conversation identities separate group, friend and source-specific temporary chats', () => {
-  assert.equal(conversationKey(group('123')), 'group:123');
-  assert.equal(conversationKey(person('123')), 'private:123');
-  assert.deepEqual(parseConversationKey('private:123'), person('123'));
-  assert.equal(conversationKey(temporary('456', '123')), 'temporary:456:123');
-  assert.notEqual(conversationKey(temporary('456', '123')), conversationKey(temporary('789', '123')));
-  assert.notEqual(conversationKey(temporary('456', '123')), conversationKey(person('123')));
-  assert.deepEqual(parseConversationKey('temporary:456:123'), temporary('456', '123'));
-  assert.deepEqual(validateConversation({ type: 'group', id: '123', name: '工作群' }), { type: 'group', id: '123', name: '工作群' });
-  assert.equal(validateQQId('123'), '123');
-  for (const value of ['0', '-1', '01', '1e3', '../1', '9007199254740992']) assert.throws(() => validateQQId(value));
-  for (const value of ['group:0', 'GROUP:123', 'other:123', 'group:1:2', '123', 'private:../1', 'temporary:123', 'temporary:0:123', 'temporary:123:0', 'temporary:1:2:3']) assert.throws(() => parseConversationKey(value));
+test('official conversation identities preserve opaque OpenIDs and reject legacy temporary shapes', () => {
+  assert.equal(conversationKey(group('A0_group-openid')), 'group:A0_group-openid');
+  assert.equal(conversationKey(person('A0_group-openid')), 'private:A0_group-openid');
+  assert.deepEqual(parseConversationKey('private:User_OpenID-1'), person('User_OpenID-1'));
+  assert.deepEqual(validateConversation({ type: 'group', id: 'GroupOpenID', name: '工作群' }), { type: 'group', id: 'GroupOpenID', name: '工作群' });
+  for (const value of ['0', '001', '9007199254740992', 'Ab_C-1', 'A'.repeat(128)]) assert.equal(validateOpenId(value), value);
+  for (const value of ['', 'with space', 'a.b', 'a/b', 'a\\b', 'A'.repeat(129), 123, null]) assert.throws(() => validateOpenId(value));
+  for (const value of ['GROUP:abc', 'other:abc', 'group:a:b', 'abc', 'private:../1', 'temporary:source:user']) assert.throws(() => parseConversationKey(value));
   for (const value of [
-    { type: 'group', groupId: '123' }, { type: 'channel', id: '123' }, { type: 'private', id: '123', unexpected: true },
-    { type: 'temporary', id: '123' }, { type: 'temporary', id: '123', sourceGroupId: '0' },
-    { type: 'group', id: '123', sourceGroupId: '456' }, { type: 'private', id: '123', sourceGroupId: '456' },
+    { type: 'group', groupId: 'abc' }, { type: 'channel', id: 'abc' }, { type: 'private', id: 'abc', unexpected: true },
+    { type: 'temporary', id: 'abc', sourceGroupId: 'source' }, { type: 'group', id: 'abc', sourceGroupId: 'source' },
   ]) assert.throws(() => validateConversation(value));
 });
 
-test('temporary conversation assignment is exclusive for one source group and peer pair', async t => {
-  const root = await fixture(t);
-  await create(root, 'alpha', [temporary('123', '456')]);
-  await create(root, 'beta', [temporary('789', '456'), person('456')]);
-  await assert.rejects(create(root, 'duplicate', [temporary('123', '456')]));
-});
-
-test('conversation directories preserve type and source and reject path-shaped QQ identifiers', () => {
-  assert.equal(conversationDirectory(group('123')), 'messages/group/123');
-  assert.equal(conversationDirectory(person('123')), 'messages/private/123');
-  assert.equal(conversationDirectory(temporary('456', '123')), 'messages/temporary/456/123');
-  for (const invalid of ['../123', '..\\123', '/123', 'C:\\123', '0', '-1']) {
+test('journal directories use v3 hashes so case-sensitive OpenIDs stay distinct on Windows', () => {
+  const hash = createHash('sha256').update('A0_group-openid').digest('hex');
+  assert.equal(conversationDirectory(group('A0_group-openid')), 'messages/v3/group/' + hash);
+  assert.equal(conversationDirectory(person('A0_group-openid')), 'messages/v3/private/' + hash);
+  assert.notEqual(conversationDirectory(group('CaseID')), conversationDirectory(group('caseid')));
+  assert.match(conversationDirectory(group('CON')), /^messages\/v3\/group\/[a-f0-9]{64}$/);
+  for (const invalid of ['../id', '..\\id', '/id', 'C:\\id', 'id.name', 'id:stream']) {
     assert.throws(() => conversationDirectory(group(invalid)));
     assert.throws(() => conversationDirectory(person(invalid)));
-    assert.throws(() => conversationDirectory(temporary(invalid, '123')));
-    assert.throws(() => conversationDirectory(temporary('456', invalid)));
   }
 });
 
-test('one conversation belongs to one group while different conversation kinds may share a QQ number', async t => {
+test('distinct casing of official OpenIDs remains distinct in the group registry', async t => {
+  const root = await fixture(t);
+  await create(root, 'alpha', [group('CaseID')]);
+  await create(root, 'beta', [group('caseid')]);
+  assert.equal((await listGroupConfigs(root)).length, 2);
+});
+
+test('one conversation belongs to one group while different conversation kinds may share an OpenID', async t => {
   const root = await fixture(t);
   await create(root, 'alpha', [group('123'), person('456')]);
   await create(root, 'beta', [person('123'), group('456')]);
@@ -204,114 +198,4 @@ test('registry rejects group-directory symlinks that escape the configured root'
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'EPERM') { t.skip('The OS sandbox does not permit symlinks.'); return; } throw error; }
   await assert.rejects(listGroupConfigs(root));
   await assert.rejects(create(root, 'beta', [group('456')]));
-});
-
-test('an active source group adopts one temporary conversation and preserves Markdown and ownership', async t => {
-  const root = await fixture(t); const cwd = await create(root, 'alpha', [group('123')]);
-  const initial = await current(cwd);
-  await writeFile(join(cwd, 'PIQ.md'), '# 共享配置\n\n保留说明。\n\n```json\n' + JSON.stringify(initial.config, null, 2) + '\n```\n\n保留结尾。\n');
-  const token = await own(cwd);
-  const release = await claimConversations(cwd, (await loadConfig(cwd))!);
-  try {
-    const target = { ...temporary('123', '456'), name: '临时来访者' };
-    const before = await current(cwd);
-    await assert.rejects(saveGroupConfig(cwd, { ...before.config, conversations: [...before.config.conversations, target] }, before.revision));
-    const adopted = await adoptTemporaryConversation(cwd, target);
-    assert.ok(adopted);
-    assert.deepEqual(adopted.conversations, [group('123'), target]);
-    const saved = await current(cwd);
-    assert.deepEqual(saved.config, adopted);
-    assert.match(saved.text, /保留说明。/); assert.match(saved.text, /保留结尾。/);
-    const claim = JSON.parse(await readFile(join(cwd, '.piq', 'conversations.json'), 'utf8'));
-    assert.equal(claim.ownerToken, token);
-    assert.deepEqual(claim.keys.sort(), ['group:123', 'temporary:123:456']);
-  } finally { await release(); }
-});
-
-test('duplicate and concurrent temporary events do not rewrite or duplicate membership', async t => {
-  const root = await fixture(t); const cwd = await create(root, 'alpha', [group('123')]);
-  await own(cwd); const release = await claimConversations(cwd, (await loadConfig(cwd))!);
-  try {
-    const target = temporary('123', '456');
-    const results = await Promise.all(Array.from({ length: 4 }, () => adoptTemporaryConversation(cwd, target)));
-    for (const result of results) assert.deepEqual(result?.conversations, [group('123'), target]);
-    const before = await current(cwd);
-    const claimBefore = await readFile(join(cwd, '.piq', 'conversations.json'), 'utf8');
-    assert.deepEqual(await adoptTemporaryConversation(cwd, { ...target, name: '之后的事件名称' }), before.config);
-    assert.equal((await current(cwd)).text, before.text);
-    assert.equal(await readFile(join(cwd, '.piq', 'conversations.json'), 'utf8'), claimBefore);
-  } finally { await release(); }
-});
-
-test('simultaneous temporary visitors are both retained without losing a configuration update', async t => {
-  const root = await fixture(t); const cwd = await create(root, 'alpha', [group('123')]);
-  await own(cwd); const release = await claimConversations(cwd, (await loadConfig(cwd))!);
-  try {
-    await Promise.all([adoptTemporaryConversation(cwd, temporary('123', '456')), adoptTemporaryConversation(cwd, temporary('123', '789'))]);
-    assert.deepEqual((await loadConfig(cwd))!.conversations.map(conversationKey).sort(), ['group:123', 'temporary:123:456', 'temporary:123:789']);
-    const claim = JSON.parse(await readFile(join(cwd, '.piq', 'conversations.json'), 'utf8'));
-    assert.deepEqual(claim.keys.sort(), ['group:123', 'temporary:123:456', 'temporary:123:789']);
-  } finally { await release(); }
-});
-
-test('explicit assignment to another group takes precedence over temporary auto adoption', async t => {
-  const root = await fixture(t); const target = temporary('123', '456');
-  const source = await create(root, 'source', [group('123')]);
-  const explicit = await create(root, 'explicit', [target]);
-  await own(source); const release = await claimConversations(source, (await loadConfig(source))!);
-  try {
-    const before = await current(source);
-    const claimBefore = await readFile(join(source, '.piq', 'conversations.json'), 'utf8');
-    assert.equal(await adoptTemporaryConversation(source, target), null);
-    assert.equal((await current(source)).text, before.text);
-    assert.equal(await readFile(join(source, '.piq', 'conversations.json'), 'utf8'), claimBefore);
-    assert.deepEqual((await loadConfig(explicit))!.conversations, [target]);
-  } finally { await release(); }
-});
-
-test('temporary auto adoption requires current owner and a live source-group claim', async t => {
-  const root = await fixture(t); const cwd = await create(root, 'alpha', [group('123')]);
-  const target = temporary('123', '456');
-  const before = await current(cwd);
-  assert.equal(await adoptTemporaryConversation(cwd, target), null);
-  await own(cwd);
-  assert.equal(await adoptTemporaryConversation(cwd, target), null);
-  const release = await claimConversations(cwd, before.config);
-  try {
-    assert.equal(await adoptTemporaryConversation(cwd, temporary('789', '456')), null);
-    await own(cwd, 'replacement-owner');
-    assert.equal(await adoptTemporaryConversation(cwd, target), null);
-    assert.equal((await current(cwd)).text, before.text);
-  } finally { await release(); }
-  await assert.rejects(adoptTemporaryConversation(cwd, person('456')));
-  await assert.rejects(adoptTemporaryConversation(cwd, { type: 'temporary', id: '456' }));
-});
-
-test('removing the source group from disk prevents new temporary adoption despite an old runtime claim', async t => {
-  const root = await fixture(t); const cwd = await create(root, 'alpha', [group('123')]);
-  await own(cwd); const before = await current(cwd);
-  const release = await claimConversations(cwd, before.config);
-  try {
-    await manuallyWrite(cwd, { ...before.config, conversations: [] });
-    const edited = await current(cwd);
-    assert.equal(await adoptTemporaryConversation(cwd, temporary('123', '456')), null);
-    assert.equal((await current(cwd)).text, edited.text);
-  } finally { await release(); }
-});
-
-test('an already claimed explicit temporary chat works without a source-group membership', async t => {
-  const root = await fixture(t); const target = temporary('123', '456');
-  const cwd = await create(root, 'alpha', [target]);
-  await own(cwd); const before = await current(cwd);
-  const release = await claimConversations(cwd, before.config);
-  try {
-    const claimBefore = await readFile(join(cwd, '.piq', 'conversations.json'), 'utf8');
-    assert.deepEqual(await adoptTemporaryConversation(cwd, target), before.config);
-    assert.equal((await current(cwd)).text, before.text);
-    assert.equal(await readFile(join(cwd, '.piq', 'conversations.json'), 'utf8'), claimBefore);
-
-    const notClaimed = temporary('789', '456');
-    await manuallyWrite(cwd, { ...before.config, conversations: [target, notClaimed] });
-    assert.equal(await adoptTemporaryConversation(cwd, notClaimed), null);
-  } finally { await release(); }
 });

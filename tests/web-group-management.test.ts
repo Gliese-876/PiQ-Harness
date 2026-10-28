@@ -44,7 +44,7 @@ function page() {
   let confirmed = true;
   let responder = async (_path: string, _options: RequestInit): Promise<unknown> => ({});
   const context = createContext({
-    URL, console,
+    URL, console, TextEncoder, TextDecoder,
     document: { getElementById: get, createElement: (tag: string) => new Element(tag), querySelectorAll: () => [] },
     window: {
       prompt: () => prompts.shift() ?? null,
@@ -59,8 +59,8 @@ function page() {
   });
   const run = (code: string) => runInContext(code, context);
   run(source);
-  run(`state.selected='one'; state.detail={config:{id:'one',name:'原组',conversations:[{type:'group',id:'123456'}]},configRevision:'revision-1'};
-    state.configRevision='revision-1'; state.groups=[{id:'one',name:'原组',running:false,conversations:[{type:'group',id:'123456'}]}];
+  run(`state.selected='one'; state.detail={config:{id:'one',name:'原组',conversations:[{type:'group',id:'GROUP_OpenID-1'}]},configRevision:'revision-1'};
+    state.configRevision='revision-1'; state.groups=[{id:'one',name:'原组',running:false,conversations:[{type:'group',id:'GROUP_OpenID-1'}]}];
     state.configText=JSON.stringify(connectionFields()); state.csrfToken='test-token';`);
   return {
     get, run, requests, prompts, confirmations,
@@ -96,11 +96,11 @@ test('a running group can be renamed with its revision but cannot be deleted', a
   await ui.run("manageGroup('delete')");
   assert.equal(ui.requests.length, 0);
   ui.prompts.push('新名称');
-  ui.respond(async () => ({ config: { id: 'one', name: '新名称', conversations: [{ type: 'group', id: '123456' }] }, revision: 'revision-2' }));
+  ui.respond(async () => ({ config: { id: 'one', name: '新名称', conversations: [{ type: 'group', id: 'GROUP_OpenID-1' }] }, revision: 'revision-2' }));
   await ui.run("manageGroup('rename')");
   assert.equal(ui.requests[0]!.path, '/api/groups/one/config');
   assert.deepEqual(JSON.parse(String(ui.requests[0]!.options.body)), {
-    config: { id: 'one', name: '新名称', conversations: [{ type: 'group', id: '123456' }] }, revision: 'revision-1',
+    config: { id: 'one', name: '新名称', conversations: [{ type: 'group', id: 'GROUP_OpenID-1' }] }, revision: 'revision-1',
   });
   assert.equal(ui.run('state.configRevision'), 'revision-2');
   assert.equal(ui.get('group-title').textContent, '新名称');
@@ -108,7 +108,7 @@ test('a running group can be renamed with its revision but cannot be deleted', a
 
 test('group mutations respect unsaved settings and deletion cancellation', async () => {
   const ui = page();
-  ui.run("$('ws-url').value='ws://changed.example';");
+  ui.run("$('app-id-env').value='CHANGED_APP_ID';");
   ui.prompts.push('未保存时不能改名');
   await ui.run("manageGroup('rename')");
   assert.equal(ui.requests.length, 0);
@@ -235,4 +235,92 @@ test('a state response from before deletion cannot resurrect the removed group',
   assert.equal(ui.run('state.groups.length'), 0);
   assert.equal(ui.run('state.selected'), null);
   assert.equal(reads, 2);
+});
+
+test('conversation forms preserve opaque OpenIDs and reject unsupported kinds or path-shaped identifiers', () => {
+  const ui = page();
+  const input = [{ type: 'group', id: 'Group_OpenID-X' }, { type: 'private', id: 'User_OpenID-y' }];
+  assert.deepEqual(JSON.parse(ui.run(`JSON.stringify(validateConversations(${JSON.stringify(input)}))`)), input);
+  assert.equal(ui.run("conversationKey({type:'group',id:'Aa_Bb-1'})"), 'group:Aa_Bb-1');
+  assert.equal(ui.run("conversationFromKey('private:User_OpenID-y').id"), 'User_OpenID-y');
+  for (const value of [{ type: 'temporary', id: 'Old' }, { type: 'group', id: '../escape' }, { type: 'private', id: 'id with spaces' }]) {
+    assert.throws(() => ui.run(`validateConversations([${JSON.stringify(value)}])`));
+  }
+  assert.throws(() => ui.run("validateConversations([{type:'group',id:'Aa'},{type:'group',id:'Aa'}])"), /重复/);
+  assert.equal(ui.run("validateConversations([{type:'group',id:'Aa'},{type:'group',id:'aa'}]).length"), 2);
+});
+
+test('connection settings submit credential variable names and display configuration separately from connection', async () => {
+  const ui = page();
+  ui.run("state.detail.config={...state.detail.config,appIdEnv:'QQBOT_APP_ID',appSecretEnv:'QQBOT_APP_SECRET',groupMemberEvents:false,quietMs:1500,maxWaitMs:10000,minIntervalMs:15000}; state.detail.config.conversations=[]; setConfig(state.detail); $('app-secret-env').value='OTHER_APP_SECRET'; $('group-member-events').value='true';");
+  ui.respond(async (_path, options) => ({ config: JSON.parse(String(options.body)).config, revision: 'official-revision', credential: { available: true, source: '环境变量 QQBOT_APP_ID、OTHER_APP_SECRET' } }));
+  await ui.run('saveConfig({preventDefault(){}})');
+  const payload = JSON.parse(String(ui.requests[0]!.options.body));
+  assert.equal(payload.config.appIdEnv, 'QQBOT_APP_ID');
+  assert.equal(payload.config.groupMemberEvents, true);
+  assert.equal(ui.run('configDirty()'), false, 'saving the event subscription must clear the dirty state');
+  assert.equal(payload.config.appSecretEnv, 'OTHER_APP_SECRET');
+  assert.equal('wsUrl' in payload.config, false);
+  assert.equal('accessTokenEnv' in payload.config, false);
+  assert.equal(ui.get('credential-status').textContent, '凭据已配置');
+  ui.run('renderRunStatus()');
+  assert.equal(ui.get('connection-status').textContent, 'QQBot 未连接');
+});
+
+test('the log view accepts official opaque message IDs and attachments without a OneBot envelope', () => {
+  const ui = page();
+  const record = { v: 3, seq: 1, receivedAt: 1793000000000, conversation: { type: 'group', id: 'Group_OpenID-X' },
+    messageId: 'official_message_ABC-1', time: 1793000000, sender: 'Member', userId: 'User_OpenID', selfId: 'APP_ID',
+    rawText: '官方消息', attachments: [{ filename: '<img onerror=bad>.png', content_type: 'image/png' }], outgoing: false };
+  ui.run(`state.logConversation='group:Group_OpenID-X'; renderMessages(${JSON.stringify(JSON.stringify(record) + '\n')},false);`);
+  assert.match(ui.get('message-list').textContent, /官方消息/);
+  assert.match(ui.get('message-list').textContent, /official_message_ABC-1/);
+  assert.match(ui.get('message-list').textContent, /<img onerror=bad>\.png/);
+  assert.throws(() => ui.run(`parseMessages(${JSON.stringify(JSON.stringify({ ...record, v: 2 }) + '\n')},'group:Group_OpenID-X')`));
+  assert.throws(() => ui.run(`parseMessages(${JSON.stringify(JSON.stringify(record) + '\n')},'private:Group_OpenID-X')`));
+});
+
+test('the log view labels platform message variants and exposes nested conversation records as inert text', () => {
+  const ui = page();
+  const base = { v: 3, seq: 1, receivedAt: 1793000000000, conversation: { type: 'group', id: 'Group_OpenID-X' },
+    messageId: 'official_message_1', time: 1793000000, sender: 'Forwarder', userId: 'User_OpenID', selfId: 'APP_ID', rawText: ' ', outgoing: false };
+  const raw = { message_type: 102, msg_elements: [{ author: { username: '原作者 <img src=x onerror=bad>' }, message_type: 103,
+    content: '引用内容', msg_elements: [{ author: { username: '嵌套作者' }, message_type: 0, content: '<script>alert(1)</script>最内层原文' }] }] };
+  const original = JSON.stringify({ ...base, raw }) + '\n';
+  ui.run(`state.logConversation='group:Group_OpenID-X'; renderMessages(${JSON.stringify(original)},false);`);
+  assert.match(ui.get('message-list').textContent, /聊天记录/);
+  const flatten = (node: Element): Element[] => [node, ...node.children.flatMap(flatten)];
+  const nodes = flatten(ui.get('message-list'));
+  const details = nodes.find(node => node.tagName === 'details')!;
+  assert.equal(details.open, false);
+  const pre = nodes.find(node => node.tagName === 'pre')!;
+  assert.deepEqual(JSON.parse(pre.textContent), raw);
+  assert.match(pre.textContent, /原作者|嵌套作者|最内层原文/);
+  assert.match(pre.textContent, /<script>alert\(1\)<\/script>/);
+  assert.ok(!nodes.some(node => ['img', 'script', 'iframe'].includes(node.tagName)));
+  assert.equal(ui.get('log-content').textContent, original, 'the original JSONL view must remain byte-for-byte unchanged');
+  assert.equal(ui.requests.length, 0, 'rendering raw platform events never downloads attachments or fetches nested content');
+  for (const [type, label] of [[0, '文本消息'], [3, 'ARK 卡片'], [101, '并行消息'], [102, '聊天记录'], [103, '引用消息']] as const) {
+    assert.equal(ui.run(`platformMessageLabel({raw:{message_type:${type}}})`), label);
+  }
+  assert.equal(ui.run("platformMessageLabel({raw:{eventType:'GROUP_MEMBER_ADD'}})"), '平台事件 · GROUP_MEMBER_ADD');
+  assert.equal(ui.run("platformMessageLabel({eventType:'FRIEND_ADD',raw:{}})"), '平台事件 · FRIEND_ADD');
+  assert.equal(ui.run('platformMessageLabel({raw:{message_type:999}})'), '消息类型 999');
+});
+
+test('large platform previews are bounded and marked without truncating the underlying JSONL', () => {
+  const ui = page();
+  const raw = { message_type: 103, msg_elements: [{ author: { username: '原作者' }, content: '中文原文'.repeat(30_000) }] };
+  const record = { v: 3, seq: 1, receivedAt: 1793000000000, conversation: { type: 'group', id: 'Group_OpenID-X' },
+    messageId: 'official-long', time: 1793000000, rawText: '', outgoing: false, raw };
+  const original = JSON.stringify(record) + '\n';
+  ui.run(`state.logConversation='group:Group_OpenID-X'; renderMessages(${JSON.stringify(original)},false);`);
+  const article = ui.get('message-list').children[0]!;
+  const details = article.children.find(node => node.tagName === 'details')!;
+  assert.match(details.children[0]!.textContent, /64 KiB/);
+  assert.match(details.children[1]!.textContent, /预览已截断/);
+  assert.doesNotMatch(details.children[1]!.textContent, /\ufffd/);
+  assert.ok(Buffer.byteLength(details.children[1]!.textContent) < 64 * 1024 + 256);
+  assert.equal(ui.get('log-content').textContent, original);
+  assert.equal(ui.requests.length, 0);
 });

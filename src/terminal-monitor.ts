@@ -1,45 +1,21 @@
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { loadConfig } from './config.ts';
 
 interface Lease {
   version: 1;
-  kind?: 'terminal-only';
+  kind: 'terminal-only';
   token: string;
   createdAt: number;
   launcherPid: number;
-  monitorPid?: number;
   wrapperPid?: number;
   piPid?: number;
-  ownerToken?: string;
-  recoveryDisabled?: boolean;
-  state: 'starting' | 'watching' | 'recovering' | 'error';
+  state: 'starting' | 'watching' | 'disabled';
 }
 
 interface Lock { pid: number; token: string }
-
-export interface TerminalMonitorLaunch {
-  command: string;
-  args: string[];
-  cwd: string;
-  env: NodeJS.ProcessEnv;
-}
-
-export interface TerminalReturnOptions {
-  env?: NodeJS.ProcessEnv;
-  launch?: (specification: TerminalMonitorLaunch) => Promise<{ pid: number }>;
-  readyTimeoutMs?: number;
-}
-
-export interface TerminalMonitorOptions {
-  token?: string;
-  start?: (cwd: string) => Promise<unknown>;
-  pollMs?: number;
-  registrationTimeoutMs?: number;
-}
 
 const LEASE = 'terminal-return.json';
 const LOCK = 'terminal-return.lock';
@@ -113,10 +89,10 @@ async function leaseAt(directory: string): Promise<Lease | null> {
   if (value === null) return null;
   if (!object(value) || value.version !== 1 || typeof value.token !== 'string' || !value.token
     || !pid(value.launcherPid) || typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt)
-    || (value.kind !== undefined && value.kind !== 'terminal-only')
-    || (value.recoveryDisabled !== undefined && typeof value.recoveryDisabled !== 'boolean')
-    || !['starting', 'watching', 'recovering', 'error'].includes(String(value.state))
-    || [value.monitorPid, value.wrapperPid, value.piPid].some(value => value !== undefined && !pid(value))) {
+    || value.kind !== 'terminal-only' || value.createdAt < 0
+    || Object.keys(value).some(key => !['version', 'kind', 'token', 'createdAt', 'launcherPid', 'wrapperPid', 'piPid', 'state'].includes(key))
+    || !['starting', 'watching', 'disabled'].includes(String(value.state))
+    || [value.wrapperPid, value.piPid].some(value => value !== undefined && !pid(value))) {
     throw new Error(SAFE_ERROR);
   }
   return value as unknown as Lease;
@@ -173,14 +149,12 @@ function status(lease: Lease | null): { running: boolean; starting: boolean; pid
   if (!lease) return { running: false, starting: false, pid: null };
   if (alive(lease.piPid)) return { running: true, starting: false, pid: lease.piPid! };
   if (alive(lease.wrapperPid)) return { running: false, starting: true, pid: lease.wrapperPid! };
-  const starting = lease.kind === 'terminal-only'
-    ? lease.state === 'starting' && Date.now() - lease.createdAt < TERMINAL_START_TIMEOUT_MS && alive(lease.launcherPid)
-    : lease.state !== 'error' && (alive(lease.monitorPid) || alive(lease.launcherPid));
-  return { running: false, starting, pid: starting ? lease.monitorPid ?? lease.launcherPid : null };
+  const starting = lease.state === 'starting' && Date.now() - lease.createdAt < TERMINAL_START_TIMEOUT_MS && alive(lease.launcherPid);
+  return { running: false, starting, pid: starting ? lease.launcherPid : null };
 }
 
-/** A launch lease only. No detached monitor or background recovery is created. */
-export async function prepareTerminalReturn(cwd: string, _options: TerminalReturnOptions = {}): Promise<{ token: string; alreadyRunning?: boolean }> {
+/** Publish one terminal launch lease before opening its window. */
+export async function prepareTerminalLaunch(cwd: string): Promise<{ token: string; alreadyRunning?: boolean }> {
   const root = await realpath(resolve(cwd));
   const config = await loadConfig(root);
   if (!config?.conversations.length) throw new Error('请先配置本对话组的对话，再打开终端。');
@@ -201,8 +175,8 @@ export async function registerTerminal(cwd: string, token: string, wrapperPid = 
   await withLock(join(directory, LOCK), async () => {
     const lease = await leaseAt(directory);
     if (!lease || lease.token !== token || !['starting', 'watching'].includes(lease.state)
-      || (lease.kind === 'terminal-only' && lease.state === 'starting' && Date.now() - lease.createdAt >= TERMINAL_START_TIMEOUT_MS)
-      || (lease.kind === 'terminal-only' && lease.state === 'watching' && !alive(lease.wrapperPid) && !alive(lease.piPid))) {
+      || (lease.state === 'starting' && Date.now() - lease.createdAt >= TERMINAL_START_TIMEOUT_MS)
+      || (lease.state === 'watching' && !alive(lease.wrapperPid) && !alive(lease.piPid))) {
       throw new Error('终端启动登记已失效，请从 WebUI 重新打开。');
     }
     if (lease.wrapperPid !== undefined && lease.wrapperPid !== wrapperPid) throw new Error('本次终端已由另一进程接管。');
@@ -211,7 +185,7 @@ export async function registerTerminal(cwd: string, token: string, wrapperPid = 
   });
 }
 
-export async function cancelTerminalReturn(cwd: string, expectedToken?: string): Promise<void> {
+export async function clearTerminalLaunch(cwd: string, expectedToken?: string): Promise<void> {
   let directory: string;
   try { directory = await directoryFor(cwd); } catch (error) { if (missing(error)) return; throw error; }
   await withLock(join(directory, LOCK), async () => {
@@ -220,14 +194,14 @@ export async function cancelTerminalReturn(cwd: string, expectedToken?: string):
   });
 }
 
-/** Stop old recovery and late registration while retaining every PID until it exits. */
-export async function disableTerminalRecovery(cwd: string, expectedToken?: string): Promise<string | undefined> {
+/** Reject late registration while retaining every running PID until it exits. */
+export async function stopTerminalRegistration(cwd: string, expectedToken?: string): Promise<string | undefined> {
   let directory: string;
   try { directory = await directoryFor(cwd); } catch (error) { if (missing(error)) return; throw error; }
   return withLock(join(directory, LOCK), async () => {
     const lease = await leaseAt(directory);
     if (!lease || (expectedToken !== undefined && lease.token !== expectedToken)) return;
-    await write(join(directory, LEASE), { ...lease, state: 'error', recoveryDisabled: true });
+    await write(join(directory, LEASE), { ...lease, state: 'disabled' });
     return lease.token;
   });
 }
@@ -240,7 +214,7 @@ export async function finishTerminal(cwd: string, expectedToken: string): Promis
     const lease = await leaseAt(directory);
     if (!lease || lease.token !== expectedToken) return;
     if (alive(lease.piPid)) {
-      await write(join(directory, LEASE), { ...lease, state: 'error', recoveryDisabled: true });
+      await write(join(directory, LEASE), { ...lease, state: 'disabled' });
     } else await fileTransition(() => unlink(join(directory, LEASE)));
   });
 }
@@ -250,20 +224,7 @@ export async function getTerminalLaunchStatus(cwd: string): Promise<{ running: b
   catch (error) { if (missing(error)) return { running: false, starting: false, pid: null }; throw error; }
 }
 
-export async function getTerminalReturnError(cwd: string): Promise<string | undefined> {
-  try { const lease = await leaseAt(await directoryFor(cwd)); return lease?.state === 'error' && !lease.recoveryDisabled ? SAFE_ERROR : undefined; }
+export async function getTerminalLaunchError(cwd: string): Promise<string | undefined> {
+  try { await leaseAt(await directoryFor(cwd)); return undefined; }
   catch (error) { if (missing(error)) return undefined; return SAFE_ERROR; }
-}
-
-/** Compatibility for an old launcher: retiring its marker can never restart Pi. */
-export async function runTerminalMonitor(cwd: string, options: TerminalMonitorOptions = {}): Promise<void> {
-  const token = options.token ?? process.env.PIQ_TERMINAL_RETURN_TOKEN;
-  if (!token) throw new Error('终端启动缺少登记标识。');
-  const disabled = await disableTerminalRecovery(cwd, token);
-  const current = await getTerminalLaunchStatus(cwd);
-  if (disabled && !current.running && !current.starting) await cancelTerminalReturn(cwd, token);
-}
-
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  runTerminalMonitor(process.argv[2] ?? '').catch(() => { process.exitCode = 1; });
 }

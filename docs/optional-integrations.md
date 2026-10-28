@@ -10,7 +10,7 @@ PiQ 只提供 QQ 通道和对话组管理。以下包由用户独立安装到 Pi
 | 权限 | `@gotgenes/pi-permission-system` | `40.3.0` | 文件和工具的允许、拒绝、人工批准规则 |
 | 写入隔离 | `@yuru7/pi-sandbox` | `0.4.1` | 标准文件工具的写入检查，以及受限命令进程 |
 | 联网 | `pi-web-access` | `0.45.0` | 按需搜索、读取网页和取回缓存内容 |
-| 语音 | `mimo-v2-5-tts` 技能 | 使用主人已安装的技能 | 合成音频后由 `qq_voice` 显式发送 |
+| 语音 | `mimo-v2-5-tts` 技能 | 使用主人已安装的技能 | 合成音频后由 `qq_send_file` 以 `kind: "voice"` 显式发送 |
 
 两个包声明的 Pi 版本范围包含 PiQ 使用的 Pi 1.4.0。更新包之前应重新核对配置与行为；npm 固定版本和上游 GitHub `main` 可能不同。
 
@@ -20,6 +20,8 @@ PiQ 只提供 QQ 通道和对话组管理。以下包由用户独立安装到 Pi
 
 在每个需要启用的对话组中独立配置。Pi 的工作目录必须是该组目录，例如 `文档/PiQ-Messages/friends`，不能是整个 `PiQ-Messages`。同一组终端里的人工审批由本机操作者作出；普通 QQ 发言不能充当批准。
 
+外部扩展的配置按组保存，机器人连接仍遵守同 AppID 仅一个活动组的规则。一个机器人需要处理多个群聊或私聊时，将这些会话放在同组；更换 AppID 时新建组，保留旧组作为原账号的记录。
+
 示例配置采用以下规则：
 
 - 文件读取允许，组外读取也允许。
@@ -28,6 +30,8 @@ PiQ 只提供 QQ 通道和对话组管理。以下包由用户独立安装到 Pi
 - 标准工具写入 `.pi/` 配置、`.piq/` 运行状态和 `messages/` 日志时拒绝；这些目录仍由可信 Pi/PiQ 代码正常维护。
 - Windows 的 `powershell` 每次执行前询问，`bash` 禁用。未知扩展工具默认询问。PiQ 已明确限制本地路径的 QQ 工具可以正常使用。
 - 关闭模型自动审批和目录扩权，配套可选 hook 拒绝 Agent 的无沙箱重试。
+
+权限示例只默认放行基础发送 `qq_send` 和 `qq_send_file`；结构化发送、撤回、流式发送和群管理等其他工具仍按默认 `ask` 由人确认。对话使用官方 OpenID，不要从旧权限文件沿用个人号、OneBot 或旧媒体工具的说明。
 
 ### 用原生读取工具减少审批
 
@@ -163,13 +167,13 @@ npm run web
 - `MIMO_API_KEY` 通过启动 Pi 的环境提供，不写入 `PIQ.md`、技能文档或仓库。
 - 音色克隆样本建议放在本组 `assets/voices/`。
 - 生成结果显式指定本组相对路径，例如 `--output assets/voices/reply.wav`。
-- Windows 下通过 `powershell` 调用 Python，执行前在 Pi 终端批准该次命令。生成后由 `qq_voice` 的 `send_file` 按本组路径显式发送。
+- Windows 下通过 `powershell` 调用 Python，执行前在 Pi 终端批准该次命令。生成后由 `qq_send_file` 按本组路径显式发送，例如 `{"conversation":"group:GROUP_OPENID","kind":"voice","path":"assets/voices/reply.wav","replyTo":"PLATFORM_MESSAGE_ID"}`。官方 SDK 1.0.5 可直接上传 WAV、MP3、SILK；其他格式先转换或以 `kind: "file"` 发送。
 
 MiMo API 和 QQ 后端需要网络连接。这个 yuru7 版本不限制网络。读取不限也意味着这套配置没有阻止 Agent 读取当前用户可访问的数据；文件写入规则不承担数据外发控制。
 
 ## 实际保护范围
 
-gotgenes 对标准文件路径进行规则检查，yuru7 对自己接管的 `write`、`edit` 和受限 PowerShell 提供写入约束。PiQ 的群文件、图片和本地语音工具另有本组路径校验。其他扩展直接执行的文件或网络操作使用它们自己的实现；审批一个未知工具前，应了解它会访问哪些资源。
+gotgenes 对标准文件路径进行规则检查，yuru7 对自己接管的 `write`、`edit` 和受限 PowerShell 提供写入约束。PiQ 的 `qq_send` 与 `qq_send_file` 对本地图片、语音、视频和文件另有本组路径校验。其他扩展直接执行的文件或网络操作使用它们自己的实现；审批一个未知工具前，应了解它会访问哪些资源。
 
 `PERSONA.md` 的保护分两种情况：标准 `write/edit` 命中路径规则后询问；任意 PowerShell/Python 脚本则在整个命令执行前询问。两个包不会准确推导任意脚本将修改哪些文件。因此，批准脚本前需要确认它不会私自修改保护文件或权限配置。若需要“即使批准任意脚本也绝不能修改 PERSONA”的强约束，还需要操作系统级文件只读策略及批准后的受控写入机制；此配置没有宣称提供这项能力。
 

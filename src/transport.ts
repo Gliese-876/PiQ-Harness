@@ -1,554 +1,482 @@
-import { open, readFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
-import { OneBotApiError, OneBotClient } from './onebot-client.ts';
-import { conversationKey, validateConversation, type Conversation } from './conversations.ts';
-import { listVoiceCharacters, sendAiVoice, transcribeVoice, type VoiceCategory } from './voice.ts';
-import type { ResourceRequest } from './resource-tools.ts';
+import { open, realpath } from 'node:fs/promises';
+import { basename, extname } from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  ApiError, CHUNKED_UPLOAD_MAX_SIZE, MediaFileType, MsgType, QQBot, getMaxUploadSize,
+  type QQBotEventMap, type QQBotOptions, type ReplyTarget, type SendMessageOptions,
+} from '@tencent-connect/qqbot-nodejs';
+import { validateConversation, type Conversation } from './conversations.ts';
 
 export interface ConversationEvent {
   conversation: Conversation;
-  selfId: string;
-  userId: string;
   messageId: string;
-  messageSeq?: string;
-  time: number;
-  sender: string;
-  segments: Array<{ type: string; data: Record<string, unknown> }>;
-  rawText: string;
-  outgoing: boolean;
-}
-
-export interface PokeEvent {
-  kind: 'poke';
-  eventId: string;
-  source: 'notice' | 'action';
-  conversation: Conversation;
   selfId: string;
   userId: string;
-  targetId: string;
   time: number;
   sender: string;
   rawText: string;
-  segments: Array<{ type: string; data: Record<string, unknown> }>;
   outgoing: boolean;
+  botAuthored?: boolean;
+  eventType?: string;
+  attachments: Array<Record<string, unknown>>;
+  raw: Record<string, unknown>;
 }
 
-export interface HistoryCursor {
-  messageId: string;
-  messageSeq?: string;
-  time: number;
-}
-
-export function messageCursor(event: HistoryCursor): HistoryCursor {
-  return { messageId: event.messageId, messageSeq: event.messageSeq, time: event.time };
-}
-
-export function compareCursors(left: HistoryCursor, right: HistoryCursor, type: Conversation['type'] = 'group'): number {
-  if (type === 'group' && left.messageSeq !== undefined && right.messageSeq !== undefined) {
-    return Number(left.messageSeq) - Number(right.messageSeq);
-  }
-  return left.time - right.time;
-}
-
+export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'error';
+export type QQBotSdk = Pick<QQBot, 'on' | 'off' | 'start' | 'stop' | 'send' | 'uploadMedia' | 'api'> & Partial<Pick<QQBot, 'apiClient'>>;
 export interface TransportOptions {
-  url: string;
-  accessToken?: string;
-  /** Maximum time to wait for the socket before dispatching a new message. */
+  appId: string;
+  appSecret: string;
+  onMessage(event: ConversationEvent): void | Promise<void>;
+  onStatus?(status: ConnectionState): void;
+  onError?(error: Error): void;
   connectionTimeoutMs?: number;
-  onMessage: (event: ConversationEvent) => void;
-  onPoke?: (event: PokeEvent) => void;
-  onStatus: (status: 'connected' | 'disconnected' | 'error', error?: unknown) => void;
+  groupMemberEvents?: boolean;
+  sdkFactory?: (options: QQBotOptions) => QQBotSdk;
 }
-
-export interface SendInput {
-  text?: string;
-  images?: string[];
-  replyTo?: number;
-}
-
-function id(value: unknown, signed = false): string | undefined {
-  if (typeof value !== 'number' && typeof value !== 'string') return undefined;
-  if (typeof value === 'string' && !/^-?\d+$/.test(value)) return undefined;
-  const number = Number(value);
-  if (!Number.isSafeInteger(number) || number === 0 || (!signed && number < 0)) return undefined;
-  return String(number);
-}
-
-function object(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function messageId(value: number): number {
-  if (!id(value, true) || value < -2_147_483_648 || value > 2_147_483_647) {
-    throw new Error('Message ID must be a non-zero signed 32-bit integer.');
+export interface SentMessage { messageId: string; raw: Record<string, unknown> }
+export type RichMessageInput = Omit<SendMessageOptions, 'target'> & { replyTo?: string };
+export type MediaKind = 'image' | 'voice' | 'video' | 'file';
+export interface MediaInput { kind: MediaKind; path: string; fileName?: string; text?: string; replyTo?: string }
+export const MAX_MEDIA_BYTES = CHUNKED_UPLOAD_MAX_SIZE;
+const mediaTypes = { image: MediaFileType.IMAGE, voice: MediaFileType.VOICE, video: MediaFileType.VIDEO, file: MediaFileType.FILE } as const;
+export const MEDIA_LIMITS: Readonly<Record<MediaKind, number>> = Object.fromEntries(
+  Object.entries(mediaTypes).map(([kind, type]) => [kind, Math.min(CHUNKED_UPLOAD_MAX_SIZE, getMaxUploadSize(type))]),
+) as Record<MediaKind, number>;
+const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const id = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\s\x00-\x1f\x7f]/.test(value);
+class TransportError extends Error {}
+export class QQBotApiError extends Error {
+  readonly httpStatus: number;
+  readonly bizCode?: number;
+  readonly resultUnknown: boolean;
+  constructor(message: string, httpStatus: number, bizCode: number | undefined, resultUnknown: boolean) {
+    super(message);
+    this.name = 'QQBotApiError'; this.httpStatus = httpStatus; this.bizCode = bizCode; this.resultUnknown = resultUnknown;
   }
-  return value;
 }
 
-function emojiId(value: unknown): string {
-  if (typeof value !== 'string' || !value.trim() || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) {
-    throw new Error('Emoji ID must be a non-empty string without control characters.');
-  }
-  return value;
+/** Preserve the original platform payload, including nested message elements and future fields. */
+export function normalizeMessageEvent(input: unknown, appId: string): ConversationEvent | undefined {
+  if (!object(input) || !object(input.raw) || !id(appId) || !id(input.senderId) || !id(input.messageId)) return;
+  const eventType = input.rawEventType;
+  if (input.kind === 'c2c' ? eventType !== 'C2C_MESSAGE_CREATE'
+    : input.kind === 'group' ? !['GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE'].includes(String(eventType)) : true) return;
+  const targetId = input.kind === 'group' ? input.groupOpenid : input.senderId;
+  if (!id(targetId) || typeof input.timestamp !== 'string') return;
+  const timestamp = Date.parse(input.timestamp);
+  if (!Number.isFinite(timestamp) || timestamp < 0) return;
+  let conversation: Conversation;
+  try { conversation = validateConversation({ type: input.kind === 'group' ? 'group' : 'private', id: targetId }); }
+  catch { return; }
+  const raw = structuredClone(input.raw);
+  const attachments = Array.isArray(raw.attachments) ? raw.attachments.filter(object).map(item => structuredClone(item)) : [];
+  return {
+    conversation, messageId: input.messageId, selfId: appId, userId: input.senderId,
+    time: timestamp / 1_000, sender: typeof input.senderName === 'string' && input.senderName ? input.senderName : input.senderId,
+    rawText: typeof raw.content === 'string' ? raw.content : typeof input.content === 'string' ? input.content : '',
+    outgoing: false, botAuthored: input.senderIsBot === true || (object(raw.author) && raw.author.bot === true),
+    eventType: String(eventType), attachments, raw,
+  };
 }
 
-async function recordBytes(file: string, signal: AbortSignal): Promise<Buffer> {
-  if (typeof file !== 'string' || !file.trim() || /[\u0000-\u001f\u007f]/.test(file)
-    || (/^[a-z][a-z\d+.-]*:/i.test(file) && !/^[a-z]:[\\/]/i.test(file))) {
-    throw new Error('语音需要本地音频文件路径。');
-  }
-  signal.throwIfAborted();
-  const handle = await open(file, 'r');
+/** Notice identifiers are namespaced so they cannot be mistaken for replyable chat messages. */
+export function normalizePlatformEvent(eventType: string, input: unknown, appId: string): ConversationEvent | undefined {
+  if (!object(input) || !id(appId) || !/^[A-Z][A-Z0-9_]{0,79}$/.test(eventType)) return;
+  let conversation: Conversation;
   try {
-    const entry = await handle.stat();
-    if (!entry.isFile()) throw new Error('语音须为普通音频文件。');
-    const limit = 32 * 1024 * 1024;
-    if (entry.size > limit) throw new Error('语音文件不能超过 32 MiB。');
-    const chunks: Buffer[] = [];
-    let length = 0;
-    while (true) {
-      signal.throwIfAborted();
-      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, limit - length + 1));
-      const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, null);
-      signal.throwIfAborted();
-      if (!bytesRead) break;
-      length += bytesRead;
-      if (length > limit) throw new Error('语音文件不能超过 32 MiB。');
-      chunks.push(chunk.subarray(0, bytesRead));
-    }
-    if (!length) throw new Error('语音文件不能为空。');
-    return Buffer.concat(chunks, length);
-  } finally { await handle.close(); }
-}
-
-export function normalizePokeEvent(event: Record<string, unknown>): PokeEvent | undefined {
-  if (event.post_type !== 'notice' || event.notice_type !== 'notify' || event.sub_type !== 'poke') return;
-  const selfId = id(event.self_id);
-  const targetId = id(event.target_id);
-  const reportedUser = id(event.user_id);
-  if (!selfId || !reportedUser || !targetId || typeof event.time !== 'number' || !Number.isFinite(event.time) || event.time < 0) return;
-  const groupId = id(event.group_id);
-  if (!groupId && event.group_id !== undefined && event.group_id !== 0 && event.group_id !== '0') return;
-  let conversation: Conversation;
-  let userId: string;
-  if (groupId) {
-    conversation = { type: 'group', id: groupId };
-    userId = reportedUser;
-  } else {
-    // SnowLuma's private notice uses user_id for the peer, sender_id for the actor.
-    if (reportedUser === selfId) return;
-    const actor = event.sender_id === undefined ? (targetId === selfId ? reportedUser : undefined) : id(event.sender_id);
-    if (!actor || ![selfId, reportedUser].includes(actor) || ![selfId, reportedUser].includes(targetId)) return;
-    conversation = { type: 'private', id: reportedUser };
-    userId = actor;
-  }
-  const sender = object(event.sender) ? event.sender.card || event.sender.nickname : undefined;
+    if (eventType === 'INTERACTION_CREATE') {
+      if ((input.scene === undefined || input.scene === 'group') && id(input.group_openid)) conversation = validateConversation({ type: 'group', id: input.group_openid });
+      else if (input.scene === 'c2c' && id(input.user_openid)) conversation = validateConversation({ type: 'private', id: input.user_openid });
+      else return;
+    } else if (eventType.startsWith('GROUP_') && id(input.group_openid)) {
+      conversation = validateConversation({ type: 'group', id: input.group_openid });
+    } else if (['FRIEND_ADD', 'FRIEND_DEL', 'C2C_MSG_REJECT', 'C2C_MSG_RECEIVE'].includes(eventType)) {
+      const peer = input.user_openid ?? input.openid;
+      if (!id(peer)) return;
+      conversation = validateConversation({ type: 'private', id: peer });
+    } else return;
+  } catch { return; }
+  const actualId = eventType === 'GROUP_JOIN_REQUEST' ? input.join_request_id : input.id ?? input.event_id;
+  const stable = id(actualId) ? actualId : undefined;
+  let messageId = `event:${eventType}:${stable ?? randomUUID()}`;
+  if (messageId.length > 512) messageId = `event:${eventType}:sha256:${createHash('sha256').update(stable!).digest('hex')}`;
+  const actor = [input.member_openid, input.group_member_openid, input.op_member_openid, input.user_openid, input.openid].find(id);
+  const raw = structuredClone(input);
+  const parsedTime = typeof input.timestamp === 'number' ? input.timestamp
+    : typeof (input.apply_at ?? input.timestamp) === 'string' ? Date.parse(String(input.apply_at ?? input.timestamp)) / 1_000 : Number.NaN;
   return {
-    kind: 'poke', eventId: randomUUID(), source: 'notice', conversation, selfId, userId, targetId,
-    time: event.time, sender: typeof sender === 'string' ? sender : userId,
-    rawText: `${userId} 戳了戳 ${targetId}`, segments: [], outgoing: userId === selfId,
+    conversation, messageId, selfId: appId, userId: actor ?? appId,
+    time: Number.isFinite(parsedTime) && parsedTime >= 0 ? parsedTime : Date.now() / 1_000,
+    sender: typeof input.username === 'string' && input.username ? input.username : actor ?? 'QQ 平台',
+    rawText: typeof input.content === 'string' ? input.content : `[QQ 平台事件 ${eventType}]`,
+    outgoing: false, eventType, raw,
+    attachments: Array.isArray(input.attachments) ? input.attachments.filter(object).map(item => structuredClone(item)) : [],
   };
 }
 
-export function normalizeMessageEvent(event: Record<string, unknown>): ConversationEvent | undefined {
-  if (!['message', 'message_sent'].includes(String(event.post_type)) || !['group', 'private'].includes(String(event.message_type))) return;
-  const selfId = id(event.self_id);
-  const userId = id(event.user_id);
-  const messageId = id(event.message_id, true);
-  if (!selfId || !userId || !messageId || typeof event.time !== 'number' || !Number.isFinite(event.time) || event.time < 0) return;
-  const outgoing = event.post_type === 'message_sent' || userId === selfId;
-  const peerId = event.message_type === 'group' ? id(event.group_id)
-    : outgoing ? id(event.target_id) ?? id(event.session_id) : userId;
-  // A private self echo without a destination cannot be attributed to a peer safely.
-  if (!peerId) return;
-  const senderObject = object(event.sender) ? event.sender : {};
-  let conversation: Conversation;
-  if (event.message_type === 'private' && event.sub_type === 'group') {
-    const sourceGroupId = id(senderObject.group_id) ?? id(event.group_id);
-    if (!sourceGroupId) return;
-    conversation = { type: 'temporary', id: peerId, sourceGroupId };
-  } else {
-    conversation = { type: event.message_type as 'group' | 'private', id: peerId };
-  }
-  const segments: ConversationEvent['segments'] = Array.isArray(event.message)
-    ? event.message.flatMap(segment => object(segment) && typeof segment.type === 'string' && object(segment.data)
-      ? [{ type: segment.type, data: segment.data }] : []) : [];
-  const sender = senderObject.card || senderObject.nickname || userId;
-  const rawText = typeof event.raw_message === 'string' ? event.raw_message
-    : typeof event.message === 'string' ? event.message
-      : segments.filter(segment => segment.type === 'text').map(segment => segment.data.text).join('');
-  return {
-    conversation, selfId, userId, messageId, messageSeq: id(event.message_seq), time: event.time,
-    sender: typeof sender === 'string' ? sender : userId, segments, rawText,
-    outgoing,
-  };
+function targetFor(input: Conversation, replyTo?: string): ReplyTarget {
+  const conversation = validateConversation(input);
+  if (conversation.type !== 'group' && conversation.type !== 'private') throw new TransportError('官方机器人仅支持已配置的群聊和机器人单聊。');
+  if (replyTo !== undefined && !id(replyTo)) throw new TransportError('replyTo 须为有效的官方消息 ID 字符串。');
+  return { scope: conversation.type === 'group' ? 'group' : 'c2c', targetId: encodeURIComponent(conversation.id),
+    ...(replyTo === undefined ? {} : { msgId: replyTo }) };
 }
 
-/** One connection serves the conversations assigned to one Pi workspace. */
-export class SnowLumaTransport {
-  private readonly client: OneBotClient;
-  private readonly unsubscribe: Array<() => void>;
-  private readonly shutdown = new AbortController();
-  private readonly connectionTimeoutMs: number;
-  private readonly endpoint: string;
-  private closed = false;
-  private selfId?: string;
-  private connectionVersion = 0;
+function textValue(value: unknown, required: boolean): string | undefined {
+  if (value === undefined && !required) return;
+  if (typeof value !== 'string' || (required && !value.trim()) || value.length > 4_500 || value.includes('\0')) {
+    throw new TransportError('文字须为最多 4500 个字符的有效文本。');
+  }
+  return value;
+}
 
-  constructor(options: TransportOptions, client?: OneBotClient) {
-    this.connectionTimeoutMs = options.connectionTimeoutMs ?? 5_000;
-    if (!Number.isFinite(this.connectionTimeoutMs) || this.connectionTimeoutMs <= 0 || this.connectionTimeoutMs > 60_000) {
-      throw new Error('Connection timeout must be between 1 and 60000 milliseconds.');
-    }
-    // Diagnostics never include credentials or query parameters from an endpoint.
-    const endpoint = new URL(options.url);
-    this.endpoint = `${endpoint.protocol}//${endpoint.host}${endpoint.pathname}`;
-    this.client = client ?? new OneBotClient({
-      url: options.url,
-      accessToken: options.accessToken,
-      reconnect: true,
-      requestTimeoutMs: 30_000,
+function safeFailure(error: unknown, operation: string, uncertain: boolean): Error {
+  if (error instanceof ApiError) {
+    const business = Number.isSafeInteger(error.bizCode) ? `，业务码 ${error.bizCode}` : '';
+    const permission = error.httpStatus === 403 || error.bizCode === 11253 || error.bizCode === 11282;
+    const rejected = permission || (error.httpStatus >= 400 && error.httpStatus < 500)
+      || (Number.isSafeInteger(error.bizCode) && error.bizCode !== 0);
+    const message = rejected
+      ? `QQ 机器人接口拒绝${operation}（HTTP ${error.httpStatus}${business}）${permission ? '：机器人未获得该能力或操作权限，请检查平台能力和目标群权限。' : '，未自动重试。'}`
+      : uncertain ? `${operation}结果未知（HTTP ${error.httpStatus}${business}），请先确认目标对话；未自动重发。` : `${operation}失败（HTTP ${error.httpStatus}${business}），本次尚未发送 QQ 消息。`;
+    return new QQBotApiError(message, error.httpStatus, Number.isSafeInteger(error.bizCode) ? error.bizCode : undefined, uncertain && !rejected);
+  }
+  return new TransportError(uncertain ? `${operation}结果未知，请先确认目标对话；未自动重发。` : `${operation}失败，本次尚未发送 QQ 消息。`);
+}
+
+function checkBusinessResult(value: unknown): void {
+  if (!object(value)) return;
+  for (const field of ['err_code', 'code']) {
+    const raw = value[field];
+    if (raw === undefined) continue;
+    const code = typeof raw === 'number' ? raw : typeof raw === 'string' && /^-?\d+$/.test(raw) ? Number(raw) : undefined;
+    if (Number.isSafeInteger(code) && code !== 0) throw new ApiError('QQ business request rejected', 200, '', code);
+  }
+}
+
+function allowsEmptySuccess(method: string, path: string): boolean {
+  return (method === 'DELETE' && (/^\/v2\/(?:groups|users)\/[^/?#]+\/messages\/[^/?#]+$/.test(path)
+    || /^\/v2\/groups\/join_approval_strategy\/[^/?#]+$/.test(path)))
+    || (method === 'POST' && /^\/v2\/groups\/join_approval_strategy\/[^/?#]+\/execute$/.test(path));
+}
+
+/** SDK 1.0.5 discards failed JSON bodies; inspect these documented empty-success responses directly. */
+async function requestAllowingEmpty(token: string, method: string, path: string, body: unknown, signal: AbortSignal): Promise<unknown> {
+  signal.throwIfAborted();
+  try {
+    const response = await fetch(`https://api.bot.qq.com${path}`, {
+      method, headers: { Authorization: `QQBot ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'PiQ-Harness/0.1.0' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
     });
-    const receive = (event: Record<string, unknown>) => {
-      const normalized = normalizeMessageEvent(event);
-      if (normalized) { this.selfId = normalized.selfId; options.onMessage(normalized); }
-      const poke = normalizePokeEvent(event);
-      if (poke) { this.selfId = poke.selfId; options.onPoke?.(poke); }
-    };
-    this.unsubscribe = [
-      this.client.on('open', () => { this.connectionVersion++; this.selfId = undefined; options.onStatus('connected'); }),
-      this.client.on('close', () => { this.connectionVersion++; this.selfId = undefined; options.onStatus('disconnected'); }),
-      this.client.on('error', error => options.onStatus('error', error)),
-      this.client.on('message', receive),
-    ];
+    const raw = await response.text();
+    if ((response.status === 200 || response.status === 204) && raw === '') return null;
+    let value: unknown;
+    try { value = JSON.parse(raw); }
+    catch { throw new ApiError('Invalid QQ response body', response.status, path); }
+    if (!response.ok) {
+      let code: number | undefined;
+      try { checkBusinessResult(value); }
+      catch (error) { if (error instanceof ApiError) code = error.bizCode; }
+      throw new ApiError('QQ request rejected', response.status, path, code);
+    }
+    checkBusinessResult(value);
+    return value;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('QQ request interrupted', 0, path);
+  }
+}
+
+function waitFor<T>(start: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => reject(new TransportError('操作已取消。'));
+    signal.addEventListener('abort', aborted, { once: true });
+    let operation: Promise<T>;
+    try { operation = start(); }
+    catch (error) { signal.removeEventListener('abort', aborted); reject(error); return; }
+    operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
+    if (signal.aborted) aborted();
+  });
+}
+
+/** The SDK owns token refresh, WebSocket authentication, heartbeat and reconnect. */
+export class QQBotTransport {
+  private readonly options: TransportOptions;
+  private readonly sdk: QQBotSdk;
+  private readonly shutdown = new AbortController();
+  private readonly timeoutMs: number;
+  private readonly waiters = new Set<{ resolve(): void; reject(error: Error): void }>();
+  private readonly listeners: Array<() => void> = [];
+  private readonly sentIds = new Set<string>();
+  private readonly requestSignals = new AsyncLocalStorage<AbortSignal>();
+  private readonly uploadNames = new AsyncLocalStorage<{ path: string; fileName: string }>();
+  private status: ConnectionState = 'disconnected';
+  private connected = false;
+  private started = false;
+  private closed = false;
+  private terminalError?: Error;
+
+  constructor(options: TransportOptions) {
+    if (!id(options.appId) || typeof options.appSecret !== 'string' || !options.appSecret.trim()) throw new TransportError('请配置 QQ 机器人 AppID 和 AppSecret 环境变量。');
+    this.options = options;
+    this.timeoutMs = options.connectionTimeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 300_000) throw new TransportError('连接超时须为 1 到 300000 毫秒。');
+    this.sdk = (options.sdkFactory ?? (settings => new QQBot(settings)))({
+      appId: options.appId, appSecret: options.appSecret, transport: 'websocket',
+      baseUrl: 'https://api.bot.qq.com', tokenBaseUrl: 'https://bots.qq.com',
+      userAgent: 'PiQ-Harness/0.1.0',
+      intents: (1 << 25) | (1 << 26) | (options.groupMemberEvents ? 1 << 24 : 0),
+    });
+    // The public SDK has no per-send AbortSignal. Recheck before each REST call,
+    // including calls delayed by token refresh or an SDK upload retry.
+    if (this.sdk.apiClient) {
+      const client = this.sdk.apiClient;
+      const original = client.request.bind(client);
+      client.request = ((...args: Parameters<QQBot['apiClient']['request']>) => {
+        this.shutdown.signal.throwIfAborted();
+        const active = this.requestSignals.getStore() ?? this.shutdown.signal;
+        active.throwIfAborted();
+        const [token, method, path, body] = args;
+        if (allowsEmptySuccess(method, path)) return requestAllowingEmpty(token, method, path, body, active);
+        const upload = this.uploadNames.getStore();
+        // Current QQ binary and chunk-completion uploads require file_name for every media kind.
+        if (upload && method === 'POST' && path === upload.path && object(body)
+          && (typeof body.file_data === 'string' || typeof body.upload_id === 'string') && body.file_name === undefined) {
+          args[3] = { ...body, file_name: upload.fileName };
+        }
+        return original(...args);
+      }) as QQBot['apiClient']['request'];
+    }
+    this.listen('ready', () => this.ready());
+    this.listen('resumed', () => this.ready());
+    this.listen('disconnected', event => {
+      if (this.closed) return;
+      this.connected = false;
+      this.updateStatus(event.willReconnect ? 'disconnected' : 'error');
+      if (!event.willReconnect) this.failRun(new TransportError('QQ 机器人连接已停止，请检查凭据和平台权限后重新打开会话。'));
+    });
+    this.listen('error', () => {
+      if (!this.closed && !this.connected) this.updateStatus('error');
+      this.report(new TransportError('QQ 机器人网关暂时异常；请检查连接与平台权限。'));
+    });
+    this.listen('message', async (_ctx, message) => {
+      if (this.closed) return;
+      const event = normalizeMessageEvent(message, options.appId);
+      if (!event) return;
+      const scope = event.conversation.type === 'group' ? 'group' : 'c2c';
+      if (this.sentIds.has(JSON.stringify([scope, encodeURIComponent(event.conversation.id), event.messageId]))) event.outgoing = true;
+      try { await options.onMessage(event); }
+      catch { this.report(new TransportError('QQ 消息已收到，但本地处理失败；请检查对话日志和目录权限。')); }
+    });
+    this.listen('rawEvent', async ctx => {
+      if (this.closed) return;
+      const event = normalizePlatformEvent(ctx.eventType, ctx.data, options.appId);
+      if (!event) return;
+      try { await options.onMessage(event); }
+      catch { this.report(new TransportError('QQ 事件已收到，但本地记录失败。')); }
+    });
+    this.listen('interaction', async (_ctx, data) => {
+      if (this.closed) return;
+      const event = normalizePlatformEvent('INTERACTION_CREATE', data, options.appId);
+      let code = 3;
+      if (event) {
+        try { await options.onMessage(event); code = 0; }
+        catch { this.report(new TransportError('QQ 互动事件已收到，但本地记录失败。')); }
+      }
+      // This only confirms protocol delivery, never evaluates or executes button_data.
+      if (!this.closed && id(data.id)) {
+        try { await this.request('PUT', `/interactions/${encodeURIComponent(data.id)}`, { code }); }
+        catch { if (!this.closed) this.report(new TransportError('QQ 互动事件的平台接收确认失败；未自动重试。')); }
+      }
+    });
   }
 
-  async connect(): Promise<void> {
-    if (this.closed) throw new Error('SnowLuma transport is closed.');
-    await this.client.connect();
+  private listen<K extends keyof QQBotEventMap>(event: K, listener: QQBotEventMap[K]): void {
+    this.sdk.on(event, listener);
+    this.listeners.push(() => { this.sdk.off(event, listener); });
   }
 
-  get isConnected(): boolean {
-    return !this.closed && this.client.isConnected;
+  private report(error: Error): void { try { this.options.onError?.(error); } catch { /* Diagnostics cannot interrupt transport. */ } }
+  private updateStatus(status: ConnectionState): void {
+    if (this.status === status) return;
+    this.status = status;
+    try { this.options.onStatus?.(status); } catch { /* Status observers do not own the connection. */ }
+  }
+  private ready(): void {
+    if (this.closed) return;
+    this.connected = true;
+    this.updateStatus('connected');
+    for (const waiter of this.waiters) waiter.resolve();
+    this.waiters.clear();
+  }
+  private failRun(error: Error): void {
+    if (this.closed) return;
+    this.connected = false;
+    this.terminalError = error;
+    this.updateStatus('error');
+    for (const waiter of this.waiters) waiter.reject(error);
+    this.waiters.clear();
+    this.report(error);
+  }
+  private ensureStarted(): void {
+    if (this.closed) throw new TransportError('QQ 机器人连接已关闭。');
+    if (this.terminalError) throw this.terminalError;
+    if (this.started) return;
+    this.started = true;
+    this.updateStatus('connecting');
+    void Promise.resolve().then(() => {
+      if (this.closed) return;
+      return this.sdk.start(this.shutdown.signal);
+    }).then(() => {
+      if (!this.closed) this.failRun(new TransportError('QQ 机器人网关已结束，请重新打开会话。'));
+    }, () => this.failRun(new TransportError('QQ 机器人启动或连接失败，请检查 AppID、AppSecret 和平台权限。')));
   }
 
-  /** Wait only before dispatch. Once a message action is sent it is never replayed. */
-  async waitForConnection(signal?: AbortSignal): Promise<void> {
-    const waitingSignal = signal ? AbortSignal.any([signal, this.shutdown.signal]) : this.shutdown.signal;
-    waitingSignal.throwIfAborted();
+  get isConnected(): boolean { return this.connected && !this.closed; }
+  connect(): Promise<void> { return this.waitUntilConnected(this.shutdown.signal); }
+
+  private async waitUntilConnected(signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    this.ensureStarted();
     if (this.isConnected) return;
-    await new Promise<void>((resolve, reject) => {
-      let finished = false;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let unsubscribe = () => {};
-      const finish = (error?: unknown) => {
-        if (finished) return;
-        finished = true;
+    return new Promise<void>((resolve, reject) => {
+      const finish = (error?: Error) => {
         clearTimeout(timer);
-        unsubscribe();
-        waitingSignal.removeEventListener('abort', aborted);
+        signal.removeEventListener('abort', aborted);
+        this.waiters.delete(waiter);
         if (error) reject(error); else resolve();
       };
-      const aborted = () => finish(waitingSignal.reason ?? new Error('SnowLuma connection wait aborted.'));
-      unsubscribe = this.client.on('open', () => { if (this.isConnected) finish(); });
-      waitingSignal.addEventListener('abort', aborted, { once: true });
-      timer = setTimeout(() => finish(new Error(
-        `无法连接 SnowLuma（${this.endpoint}），消息未发送。请确认 SnowLuma 服务和 QQ 已运行、WebSocket 已启用，且地址与 token 正确。`,
-      )), this.connectionTimeoutMs);
-      if (waitingSignal.aborted) { aborted(); return; }
-      // An explicit send can connect immediately while automatic reconnect is backing off.
-      void this.client.connect().then(() => {
-        if (this.isConnected) finish();
-      }).catch(() => {});
+      const waiter = { resolve: () => finish(), reject: (error: Error) => finish(error) };
+      const aborted = () => finish(new TransportError('等待 QQ 连接已取消。'));
+      const timer = setTimeout(() => finish(new TransportError('等待 QQ 机器人连接超时，请检查网络和凭据。')), this.timeoutMs);
+      this.waiters.add(waiter);
+      signal.addEventListener('abort', aborted, { once: true });
+      if (signal.aborted) aborted();
     });
   }
 
   close(): void {
+    if (this.closed) return;
     this.closed = true;
-    this.shutdown.abort(new Error('SnowLuma transport is closed.'));
-    for (const unsubscribe of this.unsubscribe) unsubscribe();
-    this.client.close();
+    this.connected = false;
+    this.shutdown.abort();
+    for (const remove of this.listeners) remove();
+    this.listeners.length = 0;
+    try { this.sdk.stop(); } finally { this.updateStatus('disconnected'); }
   }
 
-  private requestSignal(signal?: AbortSignal): AbortSignal {
-    const combined = signal ? AbortSignal.any([signal, this.shutdown.signal]) : this.shutdown.signal;
-    combined.throwIfAborted();
-    return combined;
+  private signal(signal?: AbortSignal): AbortSignal {
+    const active = signal ? AbortSignal.any([signal, this.shutdown.signal]) : this.shutdown.signal;
+    active.throwIfAborted();
+    return active;
   }
 
-  private async getSelfId(signal: AbortSignal): Promise<string> {
-    if (this.selfId) return this.selfId;
-    const version = this.connectionVersion;
-    const result = await this.client.raw('get_login_info', {}, { signal });
-    const account = object(result) ? id(result.user_id) : undefined;
-    if (!account) throw new Error('SnowLuma returned an invalid login account.');
+  private async dispatch(message: SendMessageOptions, signal: AbortSignal): Promise<SentMessage> {
     signal.throwIfAborted();
-    if (version !== this.connectionVersion || !this.isConnected) throw new Error('SnowLuma connection changed while reading the login account.');
-    this.selfId = account;
-    return account;
+    let value: unknown;
+    try {
+      value = await this.requestSignals.run(signal, () => waitFor(() => this.sdk.send(message), signal));
+      checkBusinessResult(value);
+    }
+    catch (error) { throw safeFailure(error, '消息发送', true); }
+    if (!object(value) || !id(value.id)) throw new TransportError('QQ 消息发送回执无效，结果未知；请检查目标对话，未自动重发。');
+    this.sentIds.add(JSON.stringify([message.target.scope, message.target.targetId, value.id]));
+    if (this.sentIds.size > 10_000) this.sentIds.delete(this.sentIds.values().next().value!);
+    return { messageId: value.id, raw: structuredClone(value) };
   }
 
-  /** Resource tools retain their explicit scope; the connection owns cancellation and receipts. */
-  async resources<T>(operation: (request: ResourceRequest) => Promise<T>, signal?: AbortSignal): Promise<T> {
-    const requestSignal = this.requestSignal(signal);
-    await this.waitForConnection(requestSignal);
-    const version = this.connectionVersion;
-    const request: ResourceRequest = async (action, params, mutating = false) => {
-      requestSignal.throwIfAborted();
-      this.assertConnection(version);
-      if (mutating) return this.mutate(action, params, requestSignal, version);
-      const result = await this.client.raw<unknown>(action, params, { signal: requestSignal });
-      this.assertConnection(version);
+  async send(conversation: Conversation, input: { text?: string; images?: string[]; replyTo?: string }, signal?: AbortSignal): Promise<SentMessage> {
+    const target = targetFor(conversation, input.replyTo);
+    if (input.images !== undefined && (!Array.isArray(input.images) || input.images.length > 1)) throw new TransportError('每次最多发送一张图片，请分次调用。');
+    const images = input.images ?? [];
+    const content = textValue(input.text, images.length === 0);
+    if (images.length) return this.sendMedia(conversation, { kind: 'image', path: images[0]!, text: content, replyTo: input.replyTo }, signal);
+    const active = this.signal(signal);
+    await this.waitUntilConnected(active);
+    return this.dispatch({ target, msgType: MsgType.TEXT, content }, active);
+  }
+
+  async sendRich(conversation: Conversation, input: RichMessageInput, signal?: AbortSignal): Promise<SentMessage> {
+    const { replyTo, ...message } = input;
+    const target = targetFor(conversation, replyTo);
+    textValue(message.content, false);
+    const active = this.signal(signal);
+    await this.waitUntilConnected(active);
+    return this.dispatch({ ...message, target }, active);
+  }
+
+  async sendMedia(conversation: Conversation, input: MediaInput, signal?: AbortSignal): Promise<SentMessage> {
+    const target = targetFor(conversation, input.replyTo);
+    if (!Object.hasOwn(mediaTypes, input.kind)) throw new TransportError('媒体类型须为 image、voice、video 或 file。');
+    if (typeof input.path !== 'string' || !input.path.trim() || /[\x00-\x1f\x7f]/.test(input.path)) throw new TransportError('请提供有效的本地媒体文件路径。');
+    if (input.kind === 'voice' && !['.wav', '.mp3', '.silk'].includes(extname(input.path).toLowerCase())) {
+      throw new TransportError('语音仅支持 WAV、MP3、SILK；其他格式请先转换或作为普通文件发送。');
+    }
+    const fileName = input.fileName ?? basename(input.path);
+    if (!fileName.trim() || fileName.length > 255 || /[\\/\x00-\x1f\x7f]/.test(fileName)) throw new TransportError('文件名须为不含路径分隔符的有效名称。');
+    const content = textValue(input.text, false);
+    const active = this.signal(signal);
+    const maxBytes = MEDIA_LIMITS[input.kind];
+    let buffer: Buffer;
+    try {
+      const handle = await open(await realpath(input.path), 'r');
+      try {
+        const before = await handle.stat();
+        if (!before.isFile() || before.size < 1 || before.size > maxBytes) throw new TransportError(`媒体须为非空普通文件，${input.kind} 上限 ${maxBytes / 1024 / 1024} MiB。`);
+        buffer = Buffer.alloc(before.size);
+        let offset = 0;
+        while (offset < buffer.length) {
+          active.throwIfAborted();
+          const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+          if (!bytesRead) throw new TransportError('媒体文件读取期间发生变化，请重试。');
+          offset += bytesRead;
+        }
+        const after = await handle.stat();
+        if (after.size !== buffer.length || buffer.byteLength > maxBytes) throw new TransportError('媒体文件读取期间发生变化或超出大小上限。');
+      } finally { await handle.close(); }
+    } catch (error) {
+      if (error instanceof TransportError) throw error;
+      throw new TransportError(active.aborted ? '媒体读取已取消，尚未发送。' : '无法读取本地媒体文件，尚未发送。');
+    }
+    await this.waitUntilConnected(active);
+    let upload: unknown;
+    try {
+      upload = await this.uploadNames.run({ path: `/v2/${target.scope === 'group' ? 'groups' : 'users'}/${target.targetId}/files`, fileName },
+        () => this.requestSignals.run(active, () => waitFor(() => this.sdk.uploadMedia({ target, fileType: mediaTypes[input.kind], buffer, fileName, srvSendMsg: false }), active)));
+      checkBusinessResult(upload);
+    }
+    catch (error) { throw safeFailure(error, '媒体上传', false); }
+    active.throwIfAborted();
+    if (!object(upload) || typeof upload.file_info !== 'string' || !upload.file_info) throw new TransportError('媒体上传回执无效，尚未发送 QQ 消息。');
+    return this.dispatch({ target, msgType: MsgType.MEDIA, media: { file_info: upload.file_info }, ...(content === undefined ? {} : { content }) }, active);
+  }
+
+  /** Internal fixed-host REST access for explicit official capabilities, never a model-facing URL tool. */
+  async request(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method) || typeof path !== 'string' || !path.startsWith('/')
+      || path.startsWith('//') || /[\\\x00-\x20\x7f]/.test(path) || path.split(/[/?#]/).some(part => part === '..')) throw new TransportError('官方 API 路径无效。');
+    const active = this.signal(signal);
+    await this.waitUntilConnected(active);
+    let operation: () => Promise<unknown>;
+    if (method === 'GET') {
+      if (body !== undefined && (!object(body) || Object.values(body).some(value => !['string', 'number', 'boolean'].includes(typeof value)))) throw new TransportError('GET 查询参数无效。');
+      operation = () => this.sdk.api.get(path, body as Record<string, string | number | boolean> | undefined);
+    } else if (method === 'DELETE') operation = () => this.sdk.api.delete(path);
+    else if (method === 'POST') operation = () => this.sdk.api.post(path, body);
+    else if (method === 'PUT') operation = () => this.sdk.api.put(path, body);
+    else operation = () => this.sdk.api.patch(path, body);
+    try {
+      const result = await this.requestSignals.run(active, () => waitFor(operation, active));
+      checkBusinessResult(result);
       return result;
-    };
-    return operation(request);
-  }
-
-  private assertConnection(version: number): void {
-    if (version !== this.connectionVersion || !this.isConnected) throw new Error('核验消息后连接已变化，请重新确认消息归属。');
-  }
-
-  private async mutate<T = unknown>(action: string, params: Record<string, unknown>, signal: AbortSignal, version?: number): Promise<T> {
-    await this.waitForConnection(signal);
-    signal.throwIfAborted();
-    if (version !== undefined) this.assertConnection(version);
-    try {
-      return await this.client.raw<T>(action, params, {
-        signal: AbortSignal.any([signal, AbortSignal.timeout(30_000 + this.connectionTimeoutMs)]),
-      });
-    } catch (cause) {
-      if (cause instanceof OneBotApiError) throw cause;
-      throw new Error(`Action ${action} result is unknown. Check the conversation before deciding to retry.`, { cause });
-    }
-  }
-
-  /** Fetch a message only when its routing fields prove the explicitly selected conversation. */
-  private async scopedMessage(conversation: Conversation, value: number, signal: AbortSignal): Promise<{ record: Record<string, unknown>; selfId: string; senderId: string; version: number }> {
-    await this.waitForConnection(signal);
-    const version = this.connectionVersion;
-    const selfId = await this.getSelfId(signal);
-    const result = await this.client.raw('get_msg', { message_id: value }, { signal });
-    if (!object(result) || id(result.message_id, true) !== String(value)) throw new Error('无法确认消息归属：get_msg 返回的消息 ID 无效。');
-    const sender = object(result.sender) ? result.sender : {};
-    const senderId = id(result.user_id) ?? id(sender.user_id);
-    if (!senderId || (result.user_id !== undefined && !id(result.user_id)) || (sender.user_id !== undefined && !id(sender.user_id))
-      || (id(result.user_id) && id(sender.user_id) && id(result.user_id) !== id(sender.user_id))
-      || (result.self_id !== undefined && id(result.self_id) !== selfId)) {
-      throw new Error('无法确认消息归属：发件者或账号信息无效。');
-    }
-    let belongs = false;
-    if (conversation.type === 'group') {
-      belongs = result.message_type === 'group' && id(result.group_id) === conversation.id;
-    } else if (result.message_type === 'private') {
-      const sourceGroup = id(sender.group_id) ?? id(result.group_id);
-      const temporary = result.sub_type === 'group';
-      const peer = senderId === selfId ? id(result.target_id) ?? id(result.session_id) : senderId;
-      const target = id(result.target_id);
-      const contradictorySource = id(sender.group_id) && id(result.group_id) && id(sender.group_id) !== id(result.group_id);
-      const contradictoryPeer = id(result.target_id) && id(result.session_id) && senderId === selfId && id(result.target_id) !== id(result.session_id);
-      const endpointsMatch = peer === conversation.id && !contradictorySource && !contradictoryPeer
-        && (result.target_id === undefined || (target !== undefined && target === (senderId === selfId ? peer : selfId)));
-      belongs = endpointsMatch && (conversation.type === 'temporary'
-        ? temporary && sourceGroup === conversation.sourceGroupId
-        : !temporary && !sourceGroup);
-    }
-    if (!belongs) throw new Error('无法确认消息属于指定对话，已拒绝操作。');
-    signal.throwIfAborted();
-    this.assertConnection(version);
-    return { record: result, selfId, senderId, version };
-  }
-
-  async poke(conversationInput: Conversation, userId?: string, signal?: AbortSignal): Promise<{ selfId: string; userId: string }> {
-    const conversation = validateConversation(conversationInput);
-    if (conversation.type === 'temporary') throw new Error('临时会话不支持戳一戳。');
-    const target = userId === undefined && conversation.type === 'private' ? conversation.id : id(userId);
-    if (!target || (conversation.type === 'private' && target !== conversation.id)) throw new Error('群聊必须指定有效目标；私聊只能戳当前对话的对方。');
-    const requestSignal = this.requestSignal(signal);
-    await this.waitForConnection(requestSignal);
-    const selfId = await this.getSelfId(requestSignal);
-    const version = this.connectionVersion;
-    await this.mutate(conversation.type === 'group' ? 'group_poke' : 'friend_poke',
-      conversation.type === 'group' ? { group_id: Number(conversation.id), user_id: Number(target) } : { user_id: Number(target) }, requestSignal, version);
-    return { selfId, userId: target };
-  }
-
-  async react(conversationInput: Conversation, value: number, reaction: string, set = true, signal?: AbortSignal): Promise<void> {
-    const conversation = validateConversation(conversationInput);
-    messageId(value); emojiId(reaction);
-    if (typeof set !== 'boolean') throw new Error('Reaction set must be a boolean.');
-    if (conversation.type !== 'group') throw new Error('SnowLuma 仅支持为群聊消息添加表情回应。');
-    const requestSignal = this.requestSignal(signal);
-    const message = await this.scopedMessage(conversation, value, requestSignal);
-    await this.mutate('set_msg_emoji_like', { message_id: value, emoji_id: reaction, set }, requestSignal, message.version);
-  }
-
-  async recall(conversationInput: Conversation, value: number, signal?: AbortSignal): Promise<void> {
-    const conversation = validateConversation(conversationInput);
-    messageId(value);
-    const requestSignal = this.requestSignal(signal);
-    const message = await this.scopedMessage(conversation, value, requestSignal);
-    if (message.senderId !== message.selfId) throw new Error('只能撤回当前 QQ 账号发送的消息。');
-    await this.mutate('delete_msg', { message_id: value }, requestSignal, message.version);
-  }
-
-  async listStickers(count = 48, signal?: AbortSignal): Promise<Array<{ emojiId: string; md5?: string; description?: string; url?: string }>> {
-    if (!Number.isSafeInteger(count) || count < 0) throw new Error('Sticker count must be a non-negative safe integer.');
-    const requestSignal = this.requestSignal(signal);
-    await this.waitForConnection(requestSignal);
-    const result = await this.client.raw<unknown>('fetch_custom_face_detail', { count }, { signal: requestSignal });
-    if (!Array.isArray(result)) throw new Error('SnowLuma returned an invalid sticker list.');
-    return result.map(item => {
-      if (!object(item)) throw new Error('SnowLuma returned an invalid sticker entry.');
-      const identity = typeof item.emoji_id === 'number' && Number.isSafeInteger(item.emoji_id) ? String(item.emoji_id) : item.emoji_id;
-      return { emojiId: emojiId(identity),
-        ...(typeof item.md5 === 'string' ? { md5: item.md5 } : {}),
-        ...(typeof item.desc === 'string' ? { description: item.desc } : {}),
-        ...(typeof item.url === 'string' ? { url: item.url } : {}),
-      };
-    });
-  }
-
-  async sendSticker(conversationInput: Conversation, sticker: string, replyTo?: number, signal?: AbortSignal): Promise<{ messageId: string }> {
-    const conversation = validateConversation(conversationInput);
-    emojiId(sticker);
-    if (replyTo !== undefined) messageId(replyTo);
-    if (conversation.type === 'temporary') throw new Error('临时会话不支持发送收藏表情。');
-    const requestSignal = this.requestSignal(signal);
-    const result = await this.mutate<Record<string, unknown> | null>('send_custom_face', {
-      emoji_id: sticker,
-      ...(conversation.type === 'group' ? { group_id: Number(conversation.id) } : { user_id: Number(conversation.id) }),
-      ...(replyTo === undefined ? {} : { reply_to: replyTo }),
-    }, requestSignal);
-    const receiptId = id(result?.message_id, true);
-    if (!receiptId || Number(receiptId) < -2_147_483_648 || Number(receiptId) > 2_147_483_647) {
-      throw new Error('Sticker send result is unknown: SnowLuma returned an invalid message receipt.');
-    }
-    return { messageId: receiptId };
-  }
-
-  async getVoices(conversationInput: Conversation, signal?: AbortSignal): Promise<VoiceCategory[]> {
-    const conversation = validateConversation(conversationInput);
-    if (conversation.type !== 'group') throw new Error('QQ AI 语音仅支持群聊。');
-    const requestSignal = this.requestSignal(signal);
-    await this.waitForConnection(requestSignal);
-    return listVoiceCharacters(this.client, conversation.id, requestSignal);
-  }
-
-  async speak(conversationInput: Conversation, text: string, characterId: string, signal?: AbortSignal): Promise<{ messageId: string }> {
-    const conversation = validateConversation(conversationInput);
-    if (conversation.type !== 'group') throw new Error('QQ AI 语音仅支持群聊。');
-    if (!text?.trim() || !characterId?.trim()) throw new Error('AI 语音需要非空文字和语音角色。');
-    const requestSignal = this.requestSignal(signal);
-    await this.waitForConnection(requestSignal);
-    requestSignal.throwIfAborted();
-    try {
-      return await sendAiVoice(this.client, conversation.id, text, characterId,
-        AbortSignal.any([requestSignal, AbortSignal.timeout(30_000 + this.connectionTimeoutMs)]));
-    } catch (cause) {
-      if (cause instanceof OneBotApiError) throw cause;
-      throw new Error('AI voice send result is unknown. Check the conversation before deciding to retry.', { cause });
-    }
-  }
-
-  async transcribe(conversationInput: Conversation, value: number, signal?: AbortSignal): Promise<{ text: string }> {
-    const conversation = validateConversation(conversationInput);
-    messageId(value);
-    const requestSignal = this.requestSignal(signal);
-    const { record, version } = await this.scopedMessage(conversation, value, requestSignal);
-    if (!Array.isArray(record.message) || !record.message.some(segment => object(segment) && segment.type === 'record' && object(segment.data))) {
-      throw new Error('指定消息不包含 QQ 语音。');
-    }
-    this.assertConnection(version);
-    return transcribeVoice(this.client, value, requestSignal);
-  }
-
-  /** Send file bytes as one voice message; the backend never receives a local filesystem path. */
-  async sendRecord(conversationInput: Conversation, file: string, signal?: AbortSignal): Promise<{ messageId: string }> {
-    const conversation = validateConversation(conversationInput);
-    const requestSignal = this.requestSignal(signal);
-    const bytes = await recordBytes(file, requestSignal);
-    requestSignal.throwIfAborted();
-    const message = [{ type: 'record', data: { file: `base64://${bytes.toString('base64')}` } }];
-    const result = await this.mutate<Record<string, unknown> | null>(conversation.type === 'group' ? 'send_group_msg' : 'send_private_msg', {
-      ...(conversation.type === 'group' ? { group_id: Number(conversation.id) } : { user_id: Number(conversation.id) }),
-      ...(conversation.type === 'temporary' ? { group_id: Number(conversation.sourceGroupId) } : {}),
-      message,
-    }, requestSignal);
-    const receipt = id(result?.message_id, true);
-    if (!receipt || Number(receipt) < -2_147_483_648 || Number(receipt) > 2_147_483_647) {
-      throw new Error('Voice send result is unknown: SnowLuma returned an invalid message receipt.');
-    }
-    return { messageId: receipt };
-  }
-
-  /** The anchor is inclusive. No anchor requests the most recent available records. */
-  async fetchHistory(conversationInput: Conversation, cursor: HistoryCursor | null, count: number, signal?: AbortSignal): Promise<ConversationEvent[]> {
-    const conversation = validateConversation(conversationInput);
-    if (conversation.type === 'temporary') throw new Error('临时会话不支持历史补拉。');
-    if ((cursor && !id(cursor.messageId, true)) || !Number.isSafeInteger(count) || count < 1) throw new Error('Invalid history cursor or count.');
-    if (this.closed || !this.client.isConnected) throw new Error('SnowLuma is disconnected; history is unavailable.');
-    const requestSignal = signal ? AbortSignal.any([signal, this.shutdown.signal]) : this.shutdown.signal;
-    requestSignal.throwIfAborted();
-    await this.getSelfId(requestSignal);
-    requestSignal.throwIfAborted();
-    const paging = { count, ...(cursor ? { message_id: Number(cursor.messageId), reverse_order: false } : {}) };
-    // History paging is a backend extension to the OneBot 11 action envelope.
-    const result = conversation.type === 'group'
-      ? await this.client.raw('get_group_msg_history', { group_id: Number(conversation.id), ...paging }, { signal: requestSignal })
-      : await this.client.raw('get_friend_msg_history', { user_id: Number(conversation.id), ...paging }, { signal: requestSignal });
-    if (!Array.isArray(result?.messages)) throw new Error('SnowLuma returned invalid conversation history.');
-    return result.messages.flatMap(record => {
-      if (!object(record)) throw new Error('SnowLuma returned an invalid history record.');
-      const normalized = normalizeMessageEvent({ ...record,
-        message_type: record.message_type ?? conversation.type,
-        post_type: record.post_type ?? (id(record.user_id) === this.selfId ? 'message_sent' : 'message'),
-        ...(conversation.type === 'group' ? { group_id: record.group_id ?? Number(conversation.id) }
-          : { target_id: record.target_id ?? record.session_id ?? Number(conversation.id) }),
-        self_id: this.selfId,
-      });
-      // SnowLuma's local private-history cache can also contain incoming
-      // temporary sessions. They have their own source-scoped conversation.
-      if (conversation.type === 'private' && normalized?.conversation.type === 'temporary'
-        && normalized.conversation.id === conversation.id) return [];
-      if (!normalized || conversationKey(normalized.conversation) !== conversationKey(conversation)) throw new Error('SnowLuma returned a history record for another conversation.');
-      return [normalized];
-    }).sort((left, right) => compareCursors(left, right, conversation.type));
-  }
-
-  async send(conversationInput: Conversation, input: SendInput, signal?: AbortSignal): Promise<{ messageId: string }> {
-    const conversation = validateConversation(conversationInput);
-    if (input.replyTo !== undefined && (!id(input.replyTo, true)
-      || input.replyTo < -2_147_483_648 || input.replyTo > 2_147_483_647)) {
-      throw new Error('Reply message ID must be a non-zero signed 32-bit integer.');
-    }
-    if (!input.text && !input.images?.length) throw new Error('A message needs text or an image.');
-    const requestSignal = signal ? AbortSignal.any([signal, this.shutdown.signal]) : this.shutdown.signal;
-    requestSignal.throwIfAborted();
-    await this.waitForConnection(requestSignal);
-    const segments: ConversationEvent['segments'] = [];
-    if (input.replyTo !== undefined) segments.push({ type: 'reply', data: { id: String(input.replyTo) } });
-    if (input.text) segments.push({ type: 'text', data: { text: input.text } });
-    // OneBot's base64 image form works even when the backend runs on another machine.
-    for (const path of input.images ?? []) {
-      const bytes = await readFile(path, { signal: requestSignal });
-      requestSignal.throwIfAborted();
-      segments.push({ type: 'image', data: { file: `base64://${bytes.toString('base64')}` } });
-    }
-    requestSignal.throwIfAborted();
-    await this.waitForConnection(requestSignal);
-    try {
-      const dispatchSignal = AbortSignal.any([requestSignal, AbortSignal.timeout(30_000 + this.connectionTimeoutMs)]);
-      const result = conversation.type === 'group'
-        ? await this.client.raw('send_group_msg', { group_id: Number(conversation.id), message: segments }, { signal: dispatchSignal })
-        : conversation.type === 'temporary'
-          ? await this.client.raw('send_private_msg', { user_id: Number(conversation.id), group_id: Number(conversation.sourceGroupId), message: segments }, { signal: dispatchSignal })
-          : await this.client.raw('send_private_msg', { user_id: Number(conversation.id), message: segments }, { signal: dispatchSignal });
-      const messageId = id(result?.message_id, true);
-      if (!messageId) throw new Error('SnowLuma returned an invalid message receipt.');
-      return { messageId };
-    } catch (cause) {
-      if (cause instanceof OneBotApiError) throw cause;
-      throw new Error('Send result is unknown. Check the group message history before deciding to send again.', { cause });
+    } catch (error) {
+      // SDK 1.0.5 parses every successful body as JSON, including valid HTTP 204.
+      if (error instanceof ApiError && error.httpStatus === 204) return null;
+      throw safeFailure(error, '官方接口请求', method !== 'GET');
     }
   }
 }

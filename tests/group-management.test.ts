@@ -10,7 +10,7 @@ import { deleteGroup, listDeletedGroups, restoreGroup } from '../src/group-manag
 import { GroupStore } from '../src/store.ts';
 import { registerTerminal } from '../src/terminal-monitor.ts';
 
-const conversation = { type: 'group' as const, id: '123456' };
+const conversation = { type: 'group' as const, id: 'Group_OpenID-A' };
 const deadPid = 2_147_483_647;
 
 async function fixture(t: TestContext) {
@@ -117,11 +117,8 @@ test('live runtime and launcher leases refuse deletion without changing their re
     ['owner.lock', { version: 1, pid: process.pid, token: 'live' }],
     ['start.lock', { pid: process.pid, token: 'live' }],
     ['terminal-return.lock', { pid: process.pid, token: 'live' }],
-    ['worker.json', { version: 1, mode: 'background', pid: process.pid, launchId: 'live', startedAt: Date.now(), state: 'running' }],
-    ['worker-launch.json', { version: 1, pid: process.pid, launchId: 'live', startedAt: Date.now() }],
-    ['launch.json', { version: 1, pid: process.pid, launchId: 'live', startedAt: Date.now() }],
-    ['terminal-return.json', { version: 1, token: 'live', launcherPid: process.pid, createdAt: Date.now(), state: 'starting' }],
-    ['terminal-return.json', { version: 1, token: 'live', launcherPid: deadPid, piPid: process.pid, createdAt: Date.now(), state: 'error' }],
+    ['terminal-return.json', { version: 1, kind: 'terminal-only', token: 'live', launcherPid: process.pid, createdAt: Date.now(), state: 'starting' }],
+    ['terminal-return.json', { version: 1, kind: 'terminal-only', token: 'live', launcherPid: deadPid, piPid: process.pid, createdAt: Date.now(), state: 'disabled' }],
   ] as const) {
     const { cwd } = await fixture(t);
     await runtime(cwd, file, value);
@@ -154,15 +151,8 @@ test('dead owner and startup locks are recovered, while incomplete recovery mark
   }
 });
 
-test('finished worker records supersede old pending launches and damaged records never disappear', async t => {
-  const { cwd } = await fixture(t);
-  const startedAt = Date.now();
-  await runtime(cwd, 'worker-launch.json', { version: 1, pid: process.pid, launchId: 'finished', startedAt });
-  await runtime(cwd, 'worker.json', { version: 1, mode: 'background', pid: deadPid, launchId: 'finished', startedAt, state: 'stopped' });
-  await runtime(cwd, 'terminal-return.json', { version: 1, token: 'finished', launcherPid: process.pid, createdAt: startedAt, state: 'error' });
-  const deleted = await deleteGroup(cwd);
-  assert.ok(await readFile(join(deleted.recoveryPath, '.piq', 'worker.json')));
-  for (const file of ['owner.lock', 'worker.json', 'worker-launch.json', 'terminal-return.json']) {
+test('damaged current runtime locks and terminal leases remain inspectable', async t => {
+  for (const file of ['owner.lock', 'start.lock', 'terminal-return.lock', 'terminal-return.json']) {
     const next = await fixture(t);
     await runtime(next.cwd, file, '{broken');
     await assert.rejects(deleteGroup(next.cwd), conflict);

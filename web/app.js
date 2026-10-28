@@ -2,7 +2,7 @@
 
 const $ = id => document.getElementById(id);
 const state = {
-  csrfToken: '', groups: [], selected: null, detail: null, defaultWsUrl: 'ws://127.0.0.1:3001/',
+  csrfToken: '', groups: [], selected: null, detail: null, defaultAppIdEnv: 'QQBOT_APP_ID', defaultAppSecretEnv: 'QQBOT_APP_SECRET',
   tab: 'documents', document: 'PERSONA.md', documentText: '', documentRevision: '', documentLoaded: false,
   configText: '', configRevision: '', detailSequence: 0, documentSequence: 0, logSequence: 0,
   membershipSaved: '', membershipLoaded: false, membershipOutdated: false, configLoading: false, logConversation: '',
@@ -11,7 +11,6 @@ const state = {
   busy: false, loadingState: false, poll: null, registryVersion: 0,
   groupPending: new Map(), trashEntries: [], trashLoading: false, trashSequence: 0, trashPending: new Set(), trashError: '',
   runPending: new Map(), runPoll: null, terminalPending: new Set(),
-  serviceCache: new Map(), servicePending: new Map(),
 };
 
 function notice(message, error = false) {
@@ -43,20 +42,20 @@ const documentLabel = filename => filename === 'ROOT_AGENTS.md' ? '公共 AGENTS
 function documentDirty() { return state.documentLoaded && $('document-content').value !== state.documentText; }
 function connectionFields() {
   return {
-    wsUrl: $('ws-url').value.trim(), accessTokenEnv: $('token-env').value.trim(),
+    appIdEnv: $('app-id-env').value.trim(), appSecretEnv: $('app-secret-env').value.trim(),
+    groupMemberEvents: $('group-member-events').value === 'true',
     quietMs: Number($('quiet-ms').value), maxWaitMs: Number($('max-wait-ms').value),
     minIntervalMs: Number($('min-interval-ms').value),
   };
 }
 function configValue() { return { ...state.detail?.config, ...connectionFields() }; }
 function configDirty() { return !!state.detail && JSON.stringify(connectionFields()) !== state.configText; }
-const conversationKey = conversation => conversation.type === 'temporary' ? `temporary:${conversation.sourceGroupId}:${conversation.id}` : `${conversation.type}:${conversation.id}`;
-const conversationLabel = conversation => `${conversation.name ? `${conversation.name} · ` : ''}${conversation.type === 'group' ? '群聊' : conversation.type === 'temporary' ? '临时私聊' : '私聊'} ${conversation.id}${conversation.type === 'temporary' ? `（来自群 ${conversation.sourceGroupId}）` : ''}`;
+const validOpenId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+const conversationKey = conversation => `${conversation.type}:${conversation.id}`;
+const conversationLabel = conversation => `${conversation.name ? `${conversation.name} · ` : ''}${conversation.type === 'group' ? '群聊' : '私聊'} ${conversation.id}`;
 function conversationFromKey(key) {
-  const temporary = /^temporary:([1-9]\d*):([1-9]\d*)$/.exec(key);
-  if (temporary) return { type: 'temporary', sourceGroupId: temporary[1], id: temporary[2] };
-  const match = /^(group|private):([1-9]\d*)$/.exec(key);
-  return match ? { type: match[1], id: match[2] } : null;
+  const match = /^(group|private):(.+)$/.exec(key);
+  return match && validOpenId(match[2]) ? { type: match[1], id: match[2] } : null;
 }
 function pendingByConversation() {
   const group = state.groups.find(item => item.id === state.selected);
@@ -77,7 +76,6 @@ function logConversationLabel(key) {
 function readConversationRows(container) {
   return [...$(container).querySelectorAll('.conversation-row')].map(row => {
     const value = { type: row.querySelector('[data-field="type"]').value, id: row.querySelector('[data-field="id"]').value.trim() };
-    if (value.type === 'temporary') value.sourceGroupId = row.querySelector('[data-field="sourceGroupId"]').value.trim();
     const name = row.querySelector('[data-field="name"]').value.trim();
     if (name) value.name = name;
     return value;
@@ -92,9 +90,8 @@ function membershipLocked() {
 function validateConversations(values) {
   const result = [], keys = new Set();
   for (const value of values) {
-    if (!value.id && !value.name && !value.sourceGroupId) continue;
-    if (!['group', 'private', 'temporary'].includes(value.type) || !/^[1-9]\d*$/.test(value.id) || !Number.isSafeInteger(Number(value.id))) throw new Error('请为每个对话填写有效的群号或 QQ 号。');
-    if (value.type === 'temporary' && (!/^[1-9]\d*$/.test(value.sourceGroupId) || !Number.isSafeInteger(Number(value.sourceGroupId)))) throw new Error('临时私聊还需要填写有效的来源群号。');
+    if (!value.id && !value.name) continue;
+    if (!['group', 'private'].includes(value.type) || !validOpenId(value.id)) throw new Error('请为每个对话填写有效的官方 group_openid 或 user_openid。');
     const key = conversationKey(value);
     if (keys.has(key)) throw new Error(`${conversationLabel(value)} 在本组重复了，请只保留一项。`);
     keys.add(key); result.push(value);
@@ -112,19 +109,10 @@ function addConversationRow(container, value = { type: 'group', id: '' }) {
     wrapper.append(caption, element); row.append(wrapper); return element;
   };
   const type = document.createElement('select');
-  for (const [id, name] of [['group', '群聊'], ['private', '私聊'], ['temporary', '群临时私聊']]) { const option = document.createElement('option'); option.value = id; option.textContent = name; type.append(option); }
+  for (const [id, name] of [['group', '群聊'], ['private', '私聊']]) { const option = document.createElement('option'); option.value = id; option.textContent = name; type.append(option); }
   type.value = value.type; addField('类型', type, 'type');
-  const id = document.createElement('input'); id.type = 'text'; id.inputMode = 'numeric'; id.autocomplete = 'off'; id.maxLength = 16; id.pattern = '[1-9][0-9]*'; id.value = value.id;
-  id.placeholder = '群号或 QQ 号'; addField('对话号码', id, 'id');
-  const sourceGroupId = document.createElement('input'); sourceGroupId.type = 'text'; sourceGroupId.inputMode = 'numeric'; sourceGroupId.autocomplete = 'off'; sourceGroupId.maxLength = 16; sourceGroupId.pattern = '[1-9][0-9]*'; sourceGroupId.value = value.sourceGroupId || '';
-  sourceGroupId.placeholder = '来源群号'; addField('来源群号', sourceGroupId, 'sourceGroupId');
-  const updateTemporary = () => {
-    const temporary = type.value === 'temporary';
-    row.classList.toggle('temporary', temporary);
-    sourceGroupId.parentElement.hidden = !temporary;
-    sourceGroupId.disabled = !temporary;
-  };
-  type.addEventListener('change', updateTemporary); updateTemporary();
+  const id = document.createElement('input'); id.type = 'text'; id.autocomplete = 'off'; id.maxLength = 128; id.pattern = String.raw`[A-Za-z0-9_\-]{1,128}`; id.value = value.id;
+  id.placeholder = 'group_openid 或 user_openid'; addField('官方 OpenID', id, 'id');
   const name = document.createElement('input'); name.type = 'text'; name.autocomplete = 'off'; name.maxLength = 80; name.value = value.name || ''; name.placeholder = '可选'; addField('备注名称', name, 'name');
   const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button subtle remove-conversation'; remove.textContent = '移除'; remove.setAttribute('aria-label', '移除此对话');
   remove.addEventListener('click', () => { row.remove(); if (container === 'conversation-rows') updateMembershipState(); });
@@ -144,9 +132,8 @@ function updateMembershipState() {
   $('group-name').disabled = !enabled;
   $('add-conversation').disabled = !enabled;
   for (const row of $('conversation-rows').querySelectorAll('.conversation-row')) {
-    const temporary = row.querySelector('[data-field="type"]').value === 'temporary';
     row.querySelectorAll('input,select,button').forEach(input => {
-      input.disabled = !enabled || (input.dataset.field === 'sourceGroupId' && !temporary);
+      input.disabled = !enabled;
     });
   }
   $('save-membership').disabled = !enabled || !dirty;
@@ -214,25 +201,23 @@ function renderRunStatus() {
   const paused = running && !!runtime?.paused;
   const pending = state.runPending.get(state.selected);
   const terminalPending = state.terminalPending.has(state.selected);
-  const service = current?.service || state.serviceCache.get(state.selected) || state.detail?.service;
-  const servicePending = state.servicePending.get(state.selected);
   $('run-status').textContent = starting ? 'Pi 启动中' : !running ? 'Pi 未运行' : paused ? 'Pi 已暂停' : 'Pi 已运行';
   $('run-status').classList.toggle('running', running && !paused);
   $('run-status').classList.toggle('paused', paused);
   $('run-status').title = running && current.pid ? `进程 ${current.pid}` : '';
-  const connection = running ? runtime?.connection : service?.ok ? 'ready' : 'disconnected';
-  const connectionLabels = { connected: 'SnowLuma 已连接', ready: 'SnowLuma 已就绪', connecting: 'SnowLuma 连接中', disconnected: 'SnowLuma 未连接', error: 'SnowLuma 连接异常' };
+  const connection = running ? runtime?.connection : 'disconnected';
+  const connectionLabels = { connected: 'QQBot 已连接', connecting: 'QQBot 连接中', disconnected: 'QQBot 未连接', error: 'QQBot 连接异常' };
   $('connection-status').textContent = connectionLabels[connection] || '连接状态待更新';
   $('connection-status').className = `connection-status ${connection || 'unknown'}`;
-  $('connection-status').title = ['connected', 'ready'].includes(connection) ? '' : runtime?.lastError || service?.diagnostic || '';
-  $('terminal-note').textContent = !running ? '打开终端继续最近会话' : runtime?.mode === 'background' ? '旧实例运行中，请先停止再打开终端' : '关闭终端即停止本组 Pi';
+  $('connection-status').title = ['connected', 'ready'].includes(connection) ? '' : runtime?.lastError || '';
+  $('terminal-note').textContent = !running ? '打开终端继续最近会话' : '关闭终端即停止本组 Pi';
   const descriptions = [];
   if (state.detail && !running && !starting && !state.detail.config.conversations.length) descriptions.push('添加并保存至少一个对话后即可启动 Pi');
   if (paused) descriptions.push('暂停中，消息继续保存');
-  else if (running) descriptions.push(runtime?.mode === 'background' ? '检测到旧实例，请停止后通过终端运行' : 'Pi 在终端运行，关窗即停止');
+  else if (running) descriptions.push('Pi 在终端运行，关窗即停止');
   if (running && Number.isFinite(runtime?.pendingCount) && runtime.pendingCount > 0) descriptions.push(`待处理 ${runtime.pendingCount} 条消息`);
   if (running && runtime?.lastError) descriptions.push(runtime.lastError);
-  else if (running && ['disconnected', 'error'].includes(connection)) descriptions.push('等待 SnowLuma 连接，暂时无法发送 QQ 消息');
+  else if (running && ['disconnected', 'error'].includes(connection)) descriptions.push('等待腾讯官方 QQBot 连接，暂时无法发送消息');
   else if (running && !runtime) descriptions.push('等待会话状态；旧终端请执行 /reload');
   $('run-description').textContent = descriptions.join(' · ');
   $('run-description').classList.toggle('error', running && (connection === 'error' || !!runtime?.lastError));
@@ -251,27 +236,13 @@ function renderRunStatus() {
   $('run-action').dataset.action = action;
   $('run-action').textContent = terminalPending ? '正在打开终端…' : pending ? ({ start: '正在打开终端…', pause: '正在暂停…', resume: '正在恢复…', stop: '正在停止…' }[pending.action]) : ({ start: '打开 Pi 终端', pause: '暂停', resume: '恢复运行' }[action]);
   const noConversations = !state.detail?.config.conversations.length;
-  $('run-action').disabled = !state.detail || !!pending || starting || terminalPending || !!servicePending || (!running && noConversations);
+  $('run-action').disabled = !state.detail || !!pending || starting || terminalPending || (!running && noConversations);
   $('stop-run').hidden = !running;
-  $('stop-run').disabled = !running || !!pending || terminalPending || !!servicePending;
+  $('stop-run').disabled = !running || !!pending || terminalPending;
   $('stop-run').textContent = pending?.action === 'stop' ? '正在停止…' : '停止';
-  $('open-terminal').disabled = !state.detail || !!pending || starting || terminalPending || !!servicePending || noConversations;
+  $('open-terminal').disabled = !state.detail || !!pending || starting || terminalPending || noConversations;
   $('open-terminal').hidden = !running;
-  $('open-terminal').title = runtime?.mode === 'background' ? '请先停止旧实例，再打开 Pi 终端' : '查看已有 Pi 终端';
-  if (runtime?.mode === 'background') $('open-terminal').disabled = true;
-  $('service-recovery').hidden = !state.detail || runtime?.connection === 'connected';
-  $('service-recovery').classList.toggle('error', service?.ok === false && !servicePending);
-  $('service-message').textContent = servicePending
-    ? servicePending === 'recover' ? '正在检查并尝试连接 SnowLuma…' : '正在打开 SnowLuma…'
-    : service?.message || (running ? 'SnowLuma 尚未连接，可以重试或打开启动窗口检查。' : '启动 Pi 时会先检查 SnowLuma，也可以在这里检查服务。');
-  $('service-diagnostic').textContent = service?.diagnostic || '';
-  $('service-diagnostic').hidden = !service?.diagnostic;
-  $('recover-connection').disabled = !state.detail || !!servicePending || !!pending || terminalPending;
-  const cannotOpenManual = service?.canOpenManual === false && !service?.manualUrl;
-  $('open-snowluma').disabled = !state.detail || !!servicePending || !!pending || terminalPending || cannotOpenManual;
-  $('recover-connection').textContent = servicePending === 'recover' ? '正在重试…' : '重试连接';
-  $('open-snowluma').textContent = servicePending === 'snowluma' ? '正在打开…' : '打开 SnowLuma';
-  $('open-snowluma').title = cannotOpenManual ? service.diagnostic || service.message || '此连接没有可打开的本机界面，请检查 SnowLuma 安装或远端服务。' : '打开 SnowLuma 界面或启动窗口，查看登录和运行情况';
+  $('open-terminal').title = '查看已有 Pi 终端';
   if (current?.name) $('group-title').textContent = current.name;
   updateMembershipState();
   renderGroupManagement();
@@ -284,11 +255,11 @@ function renderGroupManagement() {
   $('rename-group').disabled = unavailable;
   $('delete-group').disabled = unavailable || membershipLocked();
   $('new-session').disabled = unavailable || !!current?.starting || state.runPending.has(state.selected)
-    || state.terminalPending.has(state.selected) || state.servicePending.has(state.selected) || !state.detail?.config.conversations.length;
+    || state.terminalPending.has(state.selected) || !state.detail?.config.conversations.length;
   $('group-menu-help').textContent = pending ? '正在处理，请稍候…' : membershipLocked()
     ? '删除前请先停止本组 Pi。重开会话会先结束当前会话。' : '删除后可从回收站恢复；重开会话保留文档和历史记录。';
   if (pending) {
-    for (const id of ['run-action', 'stop-run', 'open-terminal', 'recover-connection', 'open-snowluma']) $(id).disabled = true;
+    for (const id of ['run-action', 'stop-run', 'open-terminal']) $(id).disabled = true;
   }
   updateDocumentState(); updateConfigState(); updateModelState();
 }
@@ -340,7 +311,7 @@ async function manageGroup(action) {
       await api(groupUrl(id), { method: 'DELETE' });
       state.registryVersion++;
       state.groups = state.groups.filter(group => group.id !== id);
-      state.serviceCache.delete(id); state.runPending.delete(id);
+      state.runPending.delete(id);
       if (id === state.selected) {
         clearGroupSelection();
         const next = state.groups[0]?.id;
@@ -365,7 +336,7 @@ async function newSession() {
   state.groupPending.set(id, 'new-session'); renderRunStatus();
   try {
     const result = await api(groupUrl(id) + '/new-session', { method: 'POST', body: {} });
-    rememberService(id, result);
+
     if (id === state.selected && sequence === state.detailSequence) {
       state.modelRuntime = null; state.modelLoaded = false; state.modelSequence++;
       state.modelPendingRequestId = null; state.modelAwaitTimedOut = false;
@@ -374,7 +345,7 @@ async function newSession() {
     }
     await refreshState();
   } catch (error) {
-    rememberService(id, error.response);
+
     if (id === state.selected && sequence === state.detailSequence) notice(error.message, true);
   } finally { state.groupPending.delete(id); renderRunStatus(); }
 }
@@ -442,34 +413,6 @@ async function restoreGroup(entry) {
   finally { state.trashPending.delete(entry.token); renderTrash(); }
 }
 
-function rememberService(id, result) {
-  if (!result || typeof result !== 'object') return;
-  const service = result.service && typeof result.service === 'object' ? result.service
-    : typeof result.ok === 'boolean' || typeof result.canStart === 'boolean' || typeof result.canOpenManual === 'boolean' || typeof result.manualUrl === 'string' || typeof result.diagnostic === 'string'
-      ? { ...result, ok: result.ok === true } : null;
-  if (!service) return;
-  state.serviceCache.set(id, service);
-  const group = state.groups.find(item => item.id === id);
-  if (group) group.service = service;
-  if (id === state.selected && state.detail) state.detail.service = service;
-}
-
-async function recoverService(action) {
-  const id = state.selected;
-  const button = action === 'recover' ? $('recover-connection') : $('open-snowluma');
-  if (!id || button.disabled) return;
-  state.servicePending.set(id, action); renderRunStatus();
-  try {
-    const result = await api(`${groupUrl(id)}/${action}`, { method: 'POST', body: {} });
-    rememberService(id, result);
-    if (id === state.selected) notice(result.message || (result.ok ? 'SnowLuma 服务已就绪。' : result.started ? '已请求打开 SnowLuma，请在启动窗口查看运行情况。' : 'SnowLuma 尚未连接，请查看下方原因。'), result.ok === false && !result.started);
-    await refreshState();
-  } catch (error) {
-    rememberService(id, error.response);
-    if (id === state.selected) notice(error.message, true);
-  } finally { state.servicePending.delete(id); renderRunStatus(); }
-}
-
 function acceptRunStates() {
   for (const [id, pending] of state.runPending) {
     if (pending.submitting) continue;
@@ -513,7 +456,7 @@ async function controlRun(requestedAction) {
   notice({ start: '正在启动本对话组 Pi…', pause: '正在请求暂停…', resume: '正在请求恢复运行…', stop: '正在正常关闭本对话组 Pi…' }[action]);
   try {
     const result = await api(`${groupUrl(id)}/${action}`, { method: 'POST', body: {} });
-    rememberService(id, result);
+
     pending.requestId = result.requestId || null;
     pending.startedAt = Date.now(); pending.submitting = false;
     if (state.selected === id) notice({ start: '已请求启动，正在等待 Pi 就绪…', pause: '暂停请求已提交，正在等待 Pi 确认…', resume: '恢复请求已提交，正在等待 Pi 确认…', stop: '停止请求已提交，正在等待会话退出…' }[action]);
@@ -521,7 +464,7 @@ async function controlRun(requestedAction) {
     acceptRunStates();
     scheduleRunPoll();
   } catch (error) {
-    rememberService(id, error.response);
+
     state.runPending.delete(id);
     if (state.selected === id) notice(error.message, true);
     renderRunStatus();
@@ -537,8 +480,8 @@ async function refreshState(initial = false) {
     if (registryVersion !== state.registryVersion) return;
     state.csrfToken = next.csrfToken;
     state.groups = next.groups;
-    for (const group of next.groups) if (group.service) state.serviceCache.set(group.id, group.service);
-    state.defaultWsUrl = next.defaultWsUrl || state.defaultWsUrl;
+    state.defaultAppIdEnv = next.defaultAppIdEnv || state.defaultAppIdEnv;
+    state.defaultAppSecretEnv = next.defaultAppSecretEnv || state.defaultAppSecretEnv;
     $('root-path').textContent = next.root;
     $('root-path').title = next.root;
     renderGroups();
@@ -586,7 +529,7 @@ async function selectGroup(id, force = false) {
   $('document-content').value = ''; $('document-content').disabled = true;
   $('open-terminal').disabled = true;
   $('run-action').disabled = true;
-  document.querySelectorAll('#connection-form input').forEach(input => { input.disabled = true; });
+  document.querySelectorAll('#connection-form input, #connection-form select').forEach(input => { input.disabled = true; });
   $('save-config').disabled = true;
   $('model-choice').disabled = true; $('thinking-choice').disabled = true; $('save-model').disabled = true;
   renderGroups(); updateDocumentState(); notice('');
@@ -596,8 +539,7 @@ async function selectGroup(id, force = false) {
     if (sequence !== state.detailSequence) return;
     state.detail = detail;
     const summary = state.groups.find(group => group.id === id);
-    if (summary) Object.assign(summary, { name: detail.config.name, conversations: detail.config.conversations, running: detail.running, starting: detail.starting, pid: detail.pid, runtime: detail.runtime, service: detail.service });
-    if (detail.service) state.serviceCache.set(id, detail.service);
+    if (summary) Object.assign(summary, { name: detail.config.name, conversations: detail.config.conversations, running: detail.running, starting: detail.starting, pid: detail.pid, runtime: detail.runtime });
     $('group-path').textContent = detail.path;
     renderRunStatus();
     setConfig(detail);
@@ -612,9 +554,10 @@ async function selectGroup(id, force = false) {
 
 function setConfig(detail) {
   const config = detail.config;
-  $('ws-url').value = config.wsUrl; $('token-env').value = config.accessTokenEnv;
+  $('app-id-env').value = config.appIdEnv; $('app-secret-env').value = config.appSecretEnv;
+  $('group-member-events').value = String(config.groupMemberEvents === true);
   $('quiet-ms').value = config.quietMs; $('max-wait-ms').value = config.maxWaitMs; $('min-interval-ms').value = config.minIntervalMs;
-  document.querySelectorAll('#connection-form input').forEach(input => { input.disabled = false; });
+  document.querySelectorAll('#connection-form input, #connection-form select').forEach(input => { input.disabled = false; });
   state.configRevision = detail.configRevision || '';
   state.configText = JSON.stringify(connectionFields());
   $('group-name').value = config.name;
@@ -622,12 +565,16 @@ function setConfig(detail) {
   for (const conversation of config.conversations) addConversationRow('conversation-rows', conversation);
   state.membershipSaved = JSON.stringify(membershipValue()); state.membershipLoaded = true;
   state.membershipOutdated = false;
-  const credential = detail.credential || {};
-  $('credential-status').textContent = credential.available ? '凭据已就绪' : '等待本地凭据';
-  $('credential-status').classList.toggle('available', !!credential.available);
-  $('credential-source').textContent = credential.source || '填写变量名，凭据由本地服务读取。';
+  renderCredential(detail.credential);
   updateConfigState();
   updateMembershipState();
+}
+
+function renderCredential(value) {
+  const credential = value || {};
+  $('credential-status').textContent = credential.available ? '凭据已配置' : '等待官方 QQBot 凭据';
+  $('credential-status').classList.toggle('available', !!credential.available);
+  $('credential-source').textContent = credential.source || '填写 AppID 与 AppSecret 的环境变量名，值由本机环境提供。';
 }
 
 async function reloadConfiguration(automatic = false) {
@@ -635,7 +582,7 @@ async function reloadConfiguration(automatic = false) {
   if (!id || !state.detail || state.configLoading || state.busy) return;
   if (!automatic && (membershipDirty() || configDirty()) && !window.confirm('重新读取会丢弃尚未保存的对话归属和连接设置。继续吗？')) return;
   state.configLoading = true; updateMembershipState();
-  document.querySelectorAll('#connection-form input').forEach(input => { input.disabled = true; });
+  document.querySelectorAll('#connection-form input, #connection-form select').forEach(input => { input.disabled = true; });
   updateConfigState();
   try {
     const detail = await api(groupUrl(id));
@@ -643,14 +590,14 @@ async function reloadConfiguration(automatic = false) {
     state.detail = detail;
     const summary = state.groups.find(item => item.id === id);
     if (summary) Object.assign(summary, { name: detail.config.name, conversations: detail.config.conversations, running: detail.running,
-      starting: detail.starting, pid: detail.pid, runtime: detail.runtime, service: detail.service });
+      starting: detail.starting, pid: detail.pid, runtime: detail.runtime });
     setConfig(detail); setLogOptions(detail.logs || {}); renderGroups();
     if (!automatic) notice('已重新读取对话组配置。');
   } catch (error) { if (id === state.selected && sequence === state.detailSequence) notice(error.message, true); }
   finally {
     if (id === state.selected && sequence === state.detailSequence) {
       state.configLoading = false;
-      if (state.detail) document.querySelectorAll('#connection-form input').forEach(input => { input.disabled = false; });
+      if (state.detail) document.querySelectorAll('#connection-form input, #connection-form select').forEach(input => { input.disabled = false; });
       updateMembershipState(); updateConfigState();
     }
   }
@@ -714,9 +661,11 @@ async function saveConfig(event) {
     const result = await api(`${groupUrl(id)}/config`, { method: 'PUT', body: { config, revision: state.configRevision } });
     if (id === state.selected && sequence === state.detailSequence) {
       state.detail.config = result.config;
-      state.configText = JSON.stringify({ wsUrl: config.wsUrl, accessTokenEnv: config.accessTokenEnv,
+      state.configText = JSON.stringify({ appIdEnv: config.appIdEnv, appSecretEnv: config.appSecretEnv, groupMemberEvents: config.groupMemberEvents === true,
         quietMs: config.quietMs, maxWaitMs: config.maxWaitMs, minIntervalMs: config.minIntervalMs });
       state.configRevision = result.revision;
+      state.detail.credential = result.credential;
+      renderCredential(result.credential);
       notice('设置已保存。重启本对话组 Pi 或执行 /reload 后生效。');
     }
   } catch (error) {
@@ -976,33 +925,35 @@ function parseMessages(content, expectedConversation) {
   return content.slice(0, -1).split(/\r?\n/).map((line, index) => {
     try {
       const record = JSON.parse(line);
-      if (!record || record.v !== 2 || !Number.isSafeInteger(record.seq) || record.seq < 1
+      if (!record || record.v !== 3 || !Number.isSafeInteger(record.seq) || record.seq < 1
         || typeof record.receivedAt !== 'number' || !Number.isFinite(record.receivedAt) || record.receivedAt < 0
         || typeof record.rawText !== 'string'
-        || !record.conversation || !['group', 'private', 'temporary'].includes(record.conversation.type)
-        || typeof record.conversation.id !== 'string' || !/^[1-9]\d*$/.test(record.conversation.id)
-        || !Number.isSafeInteger(Number(record.conversation.id))
-        || (record.conversation.type === 'temporary' && (typeof record.conversation.sourceGroupId !== 'string'
-          || !/^[1-9]\d*$/.test(record.conversation.sourceGroupId) || !Number.isSafeInteger(Number(record.conversation.sourceGroupId))))
-        || conversationKey(record.conversation) !== expectedConversation || !Array.isArray(record.segments)) throw new Error();
-      if (record.kind === 'poke') {
-        const qqId = value => typeof value === 'string' && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
-        if (!['group', 'private'].includes(record.conversation.type)
-          || typeof record.eventId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(record.eventId)
-          || !['notice', 'action'].includes(record.source)
-          || !qqId(record.userId) || !qqId(record.selfId) || !qqId(record.targetId)
-          || typeof record.time !== 'number' || !Number.isFinite(record.time) || record.time < 0
-          || typeof record.sender !== 'string' || typeof record.outgoing !== 'boolean'
-          || record.outgoing !== (record.userId === record.selfId)
-          || (record.source === 'action' && !record.outgoing)
-          || 'messageId' in record || 'messageSeq' in record
-          || 'groupId' in record || 'sourceGroupId' in record || 'sourceGroupId' in record.conversation
-          || record.segments.some(segment => !segment || typeof segment.type !== 'string' || !segment.type
-            || !segment.data || typeof segment.data !== 'object' || Array.isArray(segment.data))) throw new Error();
-      } else if ((record.kind !== undefined && record.kind !== 'message') || typeof record.messageId !== 'string') throw new Error();
+        || !record.conversation || !['group', 'private'].includes(record.conversation.type)
+        || !validOpenId(record.conversation.id)
+        || conversationKey(record.conversation) !== expectedConversation
+        || (record.attachments !== undefined && !Array.isArray(record.attachments))) throw new Error();
+      if ('kind' in record || typeof record.messageId !== 'string' || !record.messageId || record.messageId.length > 512
+        || /[\x00-\x20\x7f]/.test(record.messageId) || typeof record.outgoing !== 'boolean') throw new Error();
       return record;
     } catch { throw new Error(`JSONL 日志第 ${index + 1} 条记录无效，请检查文件。`); }
   });
+}
+
+function platformMessageLabel(record) {
+  const raw = record.raw && typeof record.raw === 'object' && !Array.isArray(record.raw) ? record.raw : {};
+  const eventType = typeof raw.eventType === 'string' ? raw.eventType : record.eventType;
+  if (typeof eventType === 'string' && !['C2C_MESSAGE_CREATE', 'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE'].includes(eventType)) {
+    return '平台事件 · ' + eventType.slice(0, 100);
+  }
+  const labels = { 0: '文本消息', 3: 'ARK 卡片', 101: '并行消息', 102: '聊天记录', 103: '引用消息' };
+  if (['number', 'string'].includes(typeof raw.message_type) && Object.hasOwn(labels, raw.message_type)) return labels[raw.message_type];
+  return Number.isSafeInteger(raw.message_type) ? '消息类型 ' + raw.message_type : '消息';
+}
+
+function platformEventPreview(raw) {
+  const bytes = new TextEncoder().encode(JSON.stringify(raw, null, 2));
+  const limit = 64 * 1024;
+  return { text: new TextDecoder().decode(bytes.subarray(0, limit), { stream: bytes.length > limit }), truncated: bytes.length > limit };
 }
 
 function renderMessages(content, truncated) {
@@ -1016,32 +967,41 @@ function renderMessages(content, truncated) {
   list.hidden = !records.length;
   $('log-note').textContent = truncated ? `显示末尾 ${records.length} 条完整记录` : records.length ? `${records.length} 条记录` : '';
   for (const record of records) {
-    const poke = record.kind === 'poke';
     const article = document.createElement('article'); article.className = 'message-entry';
     const meta = document.createElement('div'); meta.className = 'message-meta';
     const source = document.createElement('span'); source.className = 'message-source';
     const known = state.detail.config.conversations.find(conversation => conversationKey(conversation) === conversationKey(record.conversation));
     source.textContent = conversationLabel(known || record.conversation);
     const sender = document.createElement('span'); sender.className = 'message-author'; sender.textContent = record.sender || record.userId || '未知发送人';
-    const id = document.createElement('span'); id.textContent = poke ? '戳一戳' : record.messageId ? `#${record.messageId}` : '';
+    const type = document.createElement('span'); type.className = 'message-direction';
+    const label = platformMessageLabel(record); type.textContent = label;
+    const id = document.createElement('span'); id.textContent = record.messageId ? `#${record.messageId}` : '';
     const time = document.createElement('time'); time.className = 'message-time';
     const date = new Date(Number(record.time) * 1000);
     time.textContent = Number.isFinite(date.getTime()) ? date.toLocaleTimeString('zh-CN', { hour12: false }) : '';
-    meta.append(source, sender);
-    if (poke || record.outgoing) {
+    meta.append(source, sender, type);
+    if (record.outgoing) {
       const sent = document.createElement('span'); sent.className = 'message-direction';
-      sent.textContent = poke ? record.source === 'action' ? '已发起' : '事件通知' : '已发送'; meta.append(sent);
+      sent.textContent = '已发送'; meta.append(sent);
     }
     meta.append(id, time);
     const text = document.createElement('div'); text.className = 'message-text';
-    text.textContent = poke ? `${record.userId} 戳了 ${record.targetId}` : record.rawText || '（非文字消息）';
+    text.textContent = record.rawText.trim() ? record.rawText : `（${label}，可展开原始平台事件查看内容）`;
     article.append(meta, text);
-    const attachments = !poke && Array.isArray(record.segments) ? record.segments.filter(segment => segment?.type && segment.type !== 'text') : [];
+    const attachments = Array.isArray(record.attachments) ? record.attachments : [];
     if (attachments.length) {
       const extra = document.createElement('div'); extra.className = 'message-attachments';
-      const labels = { image: '图片', face: '表情', reply: '引用', at: '提及', file: '文件', record: '语音', video: '视频', forward: '转发' };
-      extra.textContent = attachments.map(segment => labels[segment.type] || segment.type).join(' · ');
+      extra.textContent = attachments.map(item => item?.filename || item?.content_type || '附件').join(' · ');
       article.append(extra);
+    }
+    if (record.raw && typeof record.raw === 'object') {
+      const preview = platformEventPreview(record.raw);
+      const details = document.createElement('details'); details.className = 'raw-log';
+      const summary = document.createElement('summary');
+      summary.textContent = preview.truncated ? '原始平台事件（预览已截断为前 64 KiB）' : '原始平台事件';
+      const pre = document.createElement('pre'); pre.tabIndex = 0;
+      pre.textContent = preview.text + (preview.truncated ? '\n\n[预览已截断；完整平台事件仍保存在原始 JSONL 文件中。]' : '');
+      details.append(summary, pre); article.append(details);
     }
     list.append(article);
   }
@@ -1075,15 +1035,15 @@ async function openTerminal() {
   state.terminalPending.add(id); renderRunStatus();
   try {
     const result = await api(`${groupUrl(id)}/open`, { method: 'POST', body: {} });
-    rememberService(id, result);
+
     if (id === state.selected && sequence === state.detailSequence) notice(result.message || (result.alreadyRunning ? '本对话组 Pi 已在运行，请切换到对应终端。' : '已请求打开终端，将继续本对话组最近的会话；关闭终端即停止。'));
     await refreshState();
-  } catch (error) { rememberService(id, error.response); if (id === state.selected && sequence === state.detailSequence) notice(error.message, true); }
+  } catch (error) { if (id === state.selected && sequence === state.detailSequence) notice(error.message, true); }
   finally { state.terminalPending.delete(id); renderRunStatus(); }
 }
 
 function showAdd() {
-  $('new-group-name').value = ''; $('new-group-id').value = ''; $('new-ws-url').value = state.detail?.config.wsUrl || state.defaultWsUrl;
+  $('new-group-name').value = ''; $('new-group-id').value = ''; $('new-app-id-env').value = state.detail?.config.appIdEnv || state.defaultAppIdEnv; $('new-app-secret-env').value = state.detail?.config.appSecretEnv || state.defaultAppSecretEnv;
   $('new-conversation-rows').replaceChildren(); addConversationRow('new-conversation-rows');
   $('add-error').hidden = true; $('add-dialog').showModal(); $('new-group-name').focus();
 }
@@ -1093,7 +1053,7 @@ async function addGroup(event) {
   if (!$('add-form').reportValidity()) return;
   $('confirm-add').disabled = true; $('add-error').hidden = true;
   try {
-    const body = { name: $('new-group-name').value.trim(), conversations: validateConversations(readConversationRows('new-conversation-rows')), wsUrl: $('new-ws-url').value.trim() };
+    const body = { name: $('new-group-name').value.trim(), conversations: validateConversations(readConversationRows('new-conversation-rows')), appIdEnv: $('new-app-id-env').value.trim(), appSecretEnv: $('new-app-secret-env').value.trim() };
     if ($('new-group-id').value.trim()) body.id = $('new-group-id').value.trim();
     const result = await api('/api/groups', { method: 'POST', body });
     state.registryVersion++;
@@ -1128,8 +1088,6 @@ $('thinking-choice').addEventListener('change', updateModelState);
 $('open-terminal').addEventListener('click', openTerminal);
 $('run-action').addEventListener('click', controlRun);
 $('stop-run').addEventListener('click', () => controlRun('stop'));
-$('recover-connection').addEventListener('click', () => recoverService('recover'));
-$('open-snowluma').addEventListener('click', () => recoverService('snowluma'));
 $('refresh-logs').addEventListener('click', refreshLogs);
 $('log-date').addEventListener('change', loadLog);
 $('log-conversation').addEventListener('change', () => {

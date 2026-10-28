@@ -2,12 +2,12 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openGroup } from './cli.ts';
-import { cancelTerminalReturn, finishTerminal, registerTerminal } from './terminal-monitor.ts';
+import { clearTerminalLaunch, finishTerminal, registerTerminal } from './terminal-monitor.ts';
 
 interface TerminalEntryOptions {
   env?: NodeJS.ProcessEnv;
   register?: typeof registerTerminal;
-  cancel?: typeof cancelTerminalReturn;
+  cancel?: typeof clearTerminalLaunch;
   open?: typeof openGroup;
 }
 

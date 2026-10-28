@@ -5,21 +5,21 @@ import { dirname, join, relative, isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { defaultMessagesRoot } from './cli.ts';
-import { initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, validateConfig, validateGroupId, type GroupConfig } from './config.ts';
+import { DEFAULTS, initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, validateConfig, validateGroupId, type GroupConfig } from './config.ts';
 import { deleteGroup, listDeletedGroups, restoreGroup } from './group-management.ts';
 import { conversationKey, conversationDirectory, parseConversationKey, type Conversation } from './conversations.ts';
 import { credentialStatus, getRunningOwner, openGroupTerminal } from './web-terminal.ts';
 import { getModelPreference, listModels, saveModelPreference, type ModelCatalog } from './web-models.ts';
 import { readModelStatus, requestModelChange } from './model-control.ts';
 import { clearInterruptedWork, readRuntimeStatus, requestRunAction } from './run-control.ts';
-import { cancelTerminalReturn, disableTerminalRecovery } from './terminal-monitor.ts';
+import { clearTerminalLaunch, stopTerminalRegistration } from './terminal-monitor.ts';
 import { getProcessStatus } from './process-manager.ts';
-import { ensureSnowLuma, openSnowLumaManual, type SnowLumaServiceResult } from './snowluma-service.ts';
 import { parseStoredRecord } from './store.ts';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const DOCS = new Set(['AGENTS.md', 'PERSONA.md', 'MEMORY.md']);
 const MAX_BODY = 512 * 1024;
+const MAX_INDEX_RECORD = 8 * 1024 * 1024;
 
 class HttpError extends Error {
   status: number;
@@ -79,8 +79,6 @@ export interface WebOptions {
   credentials?: typeof credentialStatus;
   models?: () => Promise<ModelCatalog>;
   action?: typeof requestRunAction;
-  ensure?: typeof ensureSnowLuma;
-  manual?: typeof openSnowLumaManual;
 }
 
 export async function startWebServer(options: WebOptions = {}): Promise<{ server: Server; url: string; close(): Promise<void> }> {
@@ -91,9 +89,6 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
   const credentials = options.credentials ?? credentialStatus;
   const models = options.models ?? (() => listModels());
   const action = options.action ?? requestRunAction;
-  const ensure = options.ensure ?? ensureSnowLuma;
-  const manual = options.manual ?? openSnowLumaManual;
-  const services = new Map<string, SnowLumaServiceResult>();
   const launching = new Map<string, number>();
   const operations = new Map<string, Promise<unknown>>();
   let port = 0;
@@ -101,13 +96,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
   async function runtime(cwd: string) {
     const process = await getProcessStatus(cwd);
     const status = process.running ? await readRuntimeStatus(cwd) : null;
-    return { ...process, runtime: status ? { ...status, mode: process.mode ?? status.mode } : null, service: services.get(cwd) };
-  }
-
-  async function ensureService(cwd: string): Promise<SnowLumaServiceResult> {
-    const result = await ensure(cwd);
-    services.set(cwd, result);
-    return result;
+    return { ...process, runtime: status ? { ...status, mode: process.mode ?? status.mode } : null };
   }
 
   async function groupPath(id: string): Promise<string> {
@@ -127,8 +116,8 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
   }
 
   async function stopSession(cwd: string, preserveContext = false): Promise<{ requestId?: string }> {
-    // Disable legacy recovery but retain live terminal PIDs until they exit.
-    const terminalToken = await disableTerminalRecovery(cwd);
+    // Reject late terminal registration while retaining live PIDs until they exit.
+    const terminalToken = await stopTerminalRegistration(cwd);
     const deadline = Date.now() + 10_000;
     while (!(await getRunningOwner(cwd)).running && (await getProcessStatus(cwd)).starting) {
       if (Date.now() >= deadline) throw new HttpError(409, 'Pi 仍在启动，请稍后重试停止。');
@@ -137,7 +126,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
     if (!(await getRunningOwner(cwd)).running) {
       const status = await getProcessStatus(cwd);
       if (status.running || status.starting) throw new HttpError(409, 'Pi 终端进程仍在运行但尚未取得本组运行锁，请关闭原终端后重试。');
-      if (terminalToken) await cancelTerminalReturn(cwd, terminalToken);
+      if (terminalToken) await clearTerminalLaunch(cwd, terminalToken);
       if (!preserveContext) await clearInterruptedWork(cwd);
       return {};
     }
@@ -146,7 +135,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       if (Date.now() >= deadline) throw new HttpError(409, 'Pi 尚未退出，请在原终端结束会话后重试。');
       await delay(100);
     }
-    if (terminalToken) await cancelTerminalReturn(cwd, terminalToken);
+    if (terminalToken) await clearTerminalLaunch(cwd, terminalToken);
     if (!preserveContext) await clearInterruptedWork(cwd);
     return result;
   }
@@ -159,15 +148,14 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       return { alreadyRunning: true, message: '终端正在打开，请稍候。' };
     }
     const process = await getProcessStatus(cwd);
-    if (!freshSession && process.running && process.mode !== 'background') {
+    if (!freshSession && process.running) {
       return { alreadyRunning: true, message: `本组 Pi 已在终端运行（PID ${process.pid}），请切换到原终端。` };
     }
     if (process.starting) throw new HttpError(409, 'Pi 正在启动，请等启动完成后重试。');
-    const service = await ensureService(cwd);
     if (freshSession || process.running) await stopSession(cwd, !freshSession);
     const result = await launch(cwd, { freshSession });
     if (!result.alreadyRunning) launching.set(id, Date.now() + 10_000);
-    return { ...result, service, ...(freshSession ? { freshSession: true } : {}) };
+    return { ...result, ...(freshSession ? { freshSession: true } : {}) };
   }
 
   async function save(cwd: string, filename: string, content: unknown, expected: unknown): Promise<string> {
@@ -196,20 +184,44 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
 
   async function logIndex(cwd: string, config: GroupConfig): Promise<Record<string, string[]>> {
     const logs: Record<string,string[]> = Object.fromEntries(config.conversations.map(item => [conversationKey(item), []]));
+    const known = new Map(config.conversations.map(item => [conversationDirectory(item), item]));
     const directories = async (path: string) => {
-      try { return (await readdir(await safeFile(cwd,path), {withFileTypes:true})).filter(item=>item.isDirectory() && /^[1-9]\d*$/.test(item.name)); }
+      try { return (await readdir(await safeFile(cwd,path), {withFileTypes:true})).filter(item=>item.isDirectory() && /^[a-f0-9]{64}$/.test(item.name)); }
       catch(error) { if(missing(error)) return []; throw error; }
     };
-    const add = async (conversation: Conversation) => {
-      const path = await safeFile(cwd, conversationDirectory(conversation));
+    const add = async (directory: string) => {
+      const path = await safeFile(cwd, directory);
       const files = (await readdir(path)).filter(file=>/^\d{4}-\d{2}-\d{2}\.jsonl$/.test(file)).sort().reverse();
-      logs[conversationKey(conversation)] = files;
+      let conversation = known.get(directory);
+      // Removed members retain their logs. Their opaque OpenID cannot be inferred
+      // from the hashed directory; recover it from one complete stored record.
+      if (!conversation) {
+        for (const file of files) {
+          const handle = await open(await safeFile(cwd, `${directory}/${file}`), 'r');
+          try {
+            const buffer = Buffer.alloc(Math.min((await handle.stat()).size, MAX_INDEX_RECORD));
+            let read = 0;
+            while (read < buffer.length && buffer.subarray(0, read).indexOf(10) < 0) {
+              const result = await handle.read(buffer, read, buffer.length - read, read);
+              if (!result.bytesRead) break;
+              read += result.bytesRead;
+            }
+            const end = buffer.subarray(0, read).indexOf(10);
+            if (end < 0) {
+              if (read === MAX_INDEX_RECORD) throw new HttpError(413, '历史日志首条记录超过 8 MiB，请在本地检查该日志。');
+              continue;
+            }
+            const record = parseStoredRecord(new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, end)), file);
+            if (conversationDirectory(record.conversation) !== directory) throw new HttpError(400, '日志目录与来源 OpenID 不一致。');
+            conversation = record.conversation;
+            break;
+          } finally { await handle.close(); }
+        }
+      }
+      if (conversation) logs[conversationKey(conversation)] = files;
     };
     for (const type of ['group','private'] as const) {
-      for (const item of await directories(`messages/${type}`)) await add({type,id:item.name});
-    }
-    for (const source of await directories('messages/temporary')) {
-      for (const peer of await directories(`messages/temporary/${source.name}`)) await add({type:'temporary',id:peer.name,sourceGroupId:source.name});
+      for (const item of await directories(`messages/v3/${type}`)) await add(`messages/v3/${type}/${item.name}`);
     }
     return logs;
   }
@@ -241,10 +253,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       }
       if (method === 'GET' && url.pathname === '/api/state') {
         const list = await groups();
-        let defaultWsUrl = 'ws://127.0.0.1:3001/';
-        const first = list.find(group => !group.error);
-        if (first) defaultWsUrl = (await loadConfig(first.path))!.wsUrl;
-        json(response, { root, csrfToken, groups: list, defaultWsUrl }); return;
+        json(response, { root, csrfToken, groups: list, defaultAppIdEnv: DEFAULTS.appIdEnv, defaultAppSecretEnv: DEFAULTS.appSecretEnv }); return;
       }
       if (method === 'GET' && url.pathname === '/api/models') { json(response, await models()); return; }
       if (method === 'GET' && url.pathname === '/api/trash') {
@@ -266,14 +275,13 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       }
       if (method === 'POST' && url.pathname === '/api/groups') {
         const body = await readBody(request);
-        if (Object.keys(body).some(key=>!['id','name','conversations','wsUrl','accessTokenEnv'].includes(key))) throw new HttpError(400,'请使用对话组创建格式。');
+        if (Object.keys(body).some(key=>!['id','name','conversations','appIdEnv','appSecretEnv'].includes(key))) throw new HttpError(400,'请使用对话组创建格式。');
         const id = validateGroupId(body.id ?? `cg-${randomBytes(4).toString('hex')}`);
         await exclusive(`init:${id}`, async () => {
           try { await lstat(join(root, id)); throw new HttpError(409, '该群目录已存在。'); }
           catch (error) { if (!missing(error)) throw error; }
-          if (body.wsUrl !== undefined && typeof body.wsUrl !== 'string') throw new HttpError(400, '连接地址无效。');
-          await initializeGroup(root, id, { name: body.name as string, conversations: body.conversations as Conversation[], wsUrl: body.wsUrl as string | undefined,
-            accessTokenEnv: body.accessTokenEnv as string | undefined });
+          await initializeGroup(root, id, { name: body.name as string, conversations: body.conversations as Conversation[],
+            appIdEnv: body.appIdEnv as string | undefined, appSecretEnv: body.appSecretEnv as string | undefined });
         });
         json(response, { id }, 201); return;
       }
@@ -283,7 +291,6 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
         await exclusive(`run:${id}`, async () => {
           if ((launching.get(id) ?? 0) > Date.now()) throw new HttpError(409, '终端正在打开，请等启动完成并停止后重试。');
           const result = await deleteGroup(join(root, id));
-          services.delete(join(root, id));
           launching.delete(id);
           json(response, result);
         });
@@ -363,7 +370,8 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
         const body = await readBody(request);
         const config = validateConfig(body.config);
         if (config.id !== id) throw new HttpError(400, '此处不能更改对话组标识。');
-        json(response, await saveGroupConfig(cwd,config,body.revision as string)); return;
+        const saved = await saveGroupConfig(cwd,config,body.revision as string);
+        json(response, { ...saved, credential: await credentials(saved.config) }); return;
       }
       if (method === 'POST' && parts.length === 4 && ['open', 'start', 'new-session'].includes(parts[3]!)) {
         const body = await readBody(request);
@@ -371,12 +379,6 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
           || (body.freshSession !== undefined && typeof body.freshSession !== 'boolean')) throw new HttpError(400, '终端参数无效。');
         const fresh = parts[3] === 'new-session' || body.freshSession === true;
         await exclusive(`run:${id}`, async () => { json(response, await openSession(id, fresh)); });
-        return;
-      }
-      if (method === 'POST' && parts.length === 4 && ['recover', 'snowluma'].includes(parts[3]!)) {
-        await readBody(request);
-        if (parts[3] === 'recover') json(response, await ensureService(cwd));
-        else json(response, await manual(cwd));
         return;
       }
       if (method === 'POST' && parts.length === 4 && ['pause', 'resume', 'stop'].includes(parts[3]!)) {

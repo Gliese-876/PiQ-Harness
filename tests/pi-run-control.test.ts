@@ -4,255 +4,221 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
-  type ExtensionError } from '@earendil-works/pi-coding-agent';
-import { fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore,
-  type FauxResponseStep } from '@earendil-works/pi-ai';
+  type AgentSession, type ExtensionError } from '@earendil-works/pi-coding-agent';
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore, type FauxResponseStep } from '@earendil-works/pi-ai';
 import { initializeGroup } from '../src/config.ts';
-import { GroupStore } from '../src/store.ts';
-import { normalizeMessageEvent } from '../src/transport.ts';
+import { conversationDirectory, type Conversation } from '../src/conversations.ts';
+import piq, { type PiQOptions } from '../src/extension.ts';
+import { GroupStore, type IncomingRecord } from '../src/store.ts';
 import { readRuntimeStatus, requestRunAction } from '../src/run-control.ts';
-import { cancelTerminalReturn, prepareTerminalReturn } from '../src/terminal-monitor.ts';
+import { clearTerminalLaunch, prepareTerminalLaunch } from '../src/terminal-monitor.ts';
 
-function message(id: number, text = 'The same text is allowed twice') {
-  return { post_type: 'message', message_type: 'group', self_id: 99999, group_id: 123455,
-    user_id: 88888, message_id: id, message_seq: id, time: 1_700_000_000,
-    sender: { nickname: 'Local test' }, message: [{ type: 'text', data: { text } }], raw_message: text };
+type ChannelSettings = Parameters<NonNullable<PiQOptions['createTransport']>>[0];
+type Channel = ReturnType<NonNullable<PiQOptions['createTransport']>>;
+const conversation: Conversation = { type: 'group', id: 'opaque-control-group' };
+const target = 'group:opaque-control-group';
+function message(id: string, text = 'Independent incoming text'): IncomingRecord {
+  return { conversation, messageId: id, selfId: 'synthetic-application', userId: 'opaque-member', sender: 'Member',
+    time: Math.floor(Date.now() / 1000), rawText: text, outgoing: false, raw: { id, content: text } };
 }
 
-class LocalSocket extends EventTarget {
-  static instances: LocalSocket[] = [];
-  static autoOpen = true;
-  static history: ReturnType<typeof message>[] = [];
-  readyState = 0;
-  sent: Array<{ action: string; params: Record<string, unknown>; echo: string }> = [];
-  constructor(_url: string) {
-    super(); LocalSocket.instances.push(this);
-    if (LocalSocket.autoOpen) queueMicrotask(() => this.open());
+class FakeChannel implements Channel {
+  isConnected = false; closed = false;
+  sent = 0; mediaSent = 0; mediaStarted = 0; mediaSignal?: AbortSignal;
+  readonly options: ChannelSettings;
+  readonly offline: boolean;
+  readonly holdMedia: boolean;
+  constructor(options: ChannelSettings, offline: boolean, holdMedia: boolean) {
+    this.options = options; this.offline = offline; this.holdMedia = holdMedia;
   }
-  open() { this.readyState = 1; this.dispatchEvent(new Event('open')); }
-  close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
-  receive(value: unknown) { this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(value) })); }
-  send(data: string) {
-    const packet = JSON.parse(data); this.sent.push(packet);
-    const index = LocalSocket.history.findIndex(record => record.message_id === packet.params.message_id);
-    const records = packet.params.message_id ? LocalSocket.history.slice(Math.max(0, index)) : LocalSocket.history.slice(-20);
-    const result = packet.action === 'get_login_info' ? { user_id: 99999 }
-      : packet.action === 'get_group_msg_history' ? { messages: records } : { message_id: -900 };
-    queueMicrotask(() => this.receive({ status: 'ok', retcode: 0, data: result, echo: packet.echo }));
+  async connect() { if (!this.offline) this.status('connected'); }
+  close() { this.closed = true; this.isConnected = false; this.options.onStatus?.('disconnected'); }
+  status(value: 'connected' | 'disconnected' | 'error') { this.isConnected = value === 'connected'; this.options.onStatus?.(value); }
+  receive(event: IncomingRecord) { this.options.onMessage?.({ ...event, attachments: event.attachments ?? [], raw: event.raw ?? {} }); }
+  async send(_conversation: Conversation, _input: Parameters<Channel['send']>[1], signal?: AbortSignal) {
+    signal?.throwIfAborted(); assert.ok(this.isConnected); this.sent++; return { messageId: `text-${this.sent}`, raw: {} };
   }
+  async sendMedia(_conversation: Conversation, _input: Parameters<Channel['sendMedia']>[1], signal?: AbortSignal) {
+    signal?.throwIfAborted(); this.mediaStarted++; this.mediaSignal = signal;
+    if (this.holdMedia) {
+      assert.ok(signal, 'PiQ must pass its cancellation signal into the channel');
+      await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    }
+    signal?.throwIfAborted(); assert.ok(this.isConnected); this.mediaSent++; return { messageId: `file-${this.mediaSent}`, raw: {} };
+  }
+  async request(): Promise<never> { assert.fail('This control suite does not dispatch raw QQ API requests'); }
+  async sendRich(): Promise<never> { assert.fail('This control suite does not dispatch rich QQ messages'); }
 }
 
 async function eventually(check: () => boolean | Promise<boolean>, label: string) {
-  const deadline = Date.now() + 5_000;
-  while (!await check()) {
-    if (Date.now() > deadline) assert.fail(`Timed out waiting for ${label}`);
-    await delay(10);
-  }
+  const deadline = Date.now() + 8_000;
+  while (!await check()) { if (Date.now() >= deadline) assert.fail(`Timed out waiting for ${label}`); await delay(10); }
 }
 
-async function fixture(t: TestContext, responses: FauxResponseStep[], options: { offline?: boolean; pending?: boolean; managedTerminal?: boolean; background?: boolean } = {}) {
-  const oldAutostart = process.env.PIQ_SNOWLUMA_AUTOSTART;
-  process.env.PIQ_SNOWLUMA_AUTOSTART = '0';
-  t.after(() => { if (oldAutostart === undefined) delete process.env.PIQ_SNOWLUMA_AUTOSTART; else process.env.PIQ_SNOWLUMA_AUTOSTART = oldAutostart; });
-  LocalSocket.instances = []; LocalSocket.autoOpen = !options.offline; LocalSocket.history = [];
+async function fixture(t: TestContext, responses: FauxResponseStep[], options: {
+  offline?: boolean; pending?: boolean; holdMedia?: boolean; managedTerminal?: boolean;
+} = {}) {
+  const keys = ['PIQ_TEST_APP_ID', 'PIQ_TEST_APP_SECRET', 'PIQ_TERMINAL_RETURN_TOKEN', 'PIQ_TERMINAL_WRAPPER_PID', 'PIQ_RUN_MODE', 'PIQ_START_RUNNING'];
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  process.env.PIQ_TEST_APP_ID = 'synthetic-application'; process.env.PIQ_TEST_APP_SECRET = 'synthetic-secret';
+  for (const key of keys.slice(2)) delete process.env[key];
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('External network is disabled in Pi control tests'); });
   const parent = join(process.cwd(), '.test-tmp'); await mkdir(parent, { recursive: true });
-  const root = await mkdtemp(join(parent, 'pi-run-control-'));
-  const cfg = { id: '123455', name: 'Runtime test group', conversations: [{ type: 'group' as const, id: '123455' }] };
-  const cwd = await initializeGroup(root, cfg.id, cfg);
-  await writeFile(join(cwd, 'PIQ.md'), '# Test\n```json\n' + JSON.stringify({ ...cfg,
-    wsUrl: 'ws://127.0.0.1:9/', accessTokenEnv: 'PIQ_TEST_UNUSED_TOKEN', quietMs: 40, maxWaitMs: 100, minIntervalMs: 0 }) + '\n```\n');
-  const terminalEnvironment = ['PIQ_TERMINAL_RETURN_TOKEN', 'PIQ_TERMINAL_WRAPPER_PID', 'PIQ_RUN_MODE'] as const;
-  const savedEnvironment = Object.fromEntries(terminalEnvironment.map(key => [key, process.env[key]]));
-  for (const key of terminalEnvironment) delete process.env[key];
+  const root = await mkdtemp(join(parent, 'official-pi-control-'));
+  const config = { id: 'control', name: 'Control', conversations: [conversation], appIdEnv: 'PIQ_TEST_APP_ID', appSecretEnv: 'PIQ_TEST_APP_SECRET',
+    quietMs: 50, maxWaitMs: 250, minIntervalMs: 0 };
+  const cwd = await initializeGroup(root, config.id, config);
+  await writeFile(join(cwd, 'PIQ.md'), '# Test\n```json\n' + JSON.stringify(config) + '\n```\n');
+  await writeFile(join(cwd, '.pi', 'settings.json'), JSON.stringify({ packages: [] }));
+  await writeFile(join(cwd, 'assets', 'voice.wav'), 'synthetic local media');
   if (options.managedTerminal) {
-    const prepared = await prepareTerminalReturn(cwd);
-    process.env.PIQ_TERMINAL_RETURN_TOKEN = prepared.token;
-    process.env.PIQ_TERMINAL_WRAPPER_PID = String(process.ppid);
+    const lease = await prepareTerminalLaunch(cwd);
+    process.env.PIQ_TERMINAL_RETURN_TOKEN = lease.token;
+    process.env.PIQ_TERMINAL_WRAPPER_PID = String(process.pid);
+    process.env.PIQ_RUN_MODE = 'terminal';
   }
-  if (options.background) process.env.PIQ_RUN_MODE = 'background';
-  t.after(async () => {
-    if (options.managedTerminal) await cancelTerminalReturn(cwd);
-    for (const key of terminalEnvironment) {
-      const value = savedEnvironment[key];
-      if (value === undefined) delete process.env[key]; else process.env[key] = value;
-    }
-  });
   if (options.pending) {
-    LocalSocket.history = [message(1, 'Previously collected message')];
-    const store = await GroupStore.open(cwd, cfg);
-    await store.append(normalizeMessageEvent(LocalSocket.history[0]!)!); await store.close();
+    const store = await GroupStore.open(cwd, config, 'synthetic-application');
+    try { await store.append(message('already-persisted', 'Previously received message')); } finally { await store.close(); }
   }
-  const previousSocket = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket');
-  Object.defineProperty(globalThis, 'WebSocket', { value: LocalSocket, configurable: true, writable: true });
-  t.mock.method(globalThis, 'fetch', async () => { throw new Error('No model network in integration tests.'); });
   const agentDir = join(root, 'agent'); await mkdir(agentDir);
-  await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } }));
+  await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ packages: [], cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } }));
   const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
-  const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager }); await loader.reload();
-  assert.deepEqual(loader.getExtensions().errors, []);
-  const faux = fauxProvider({ provider: 'piq-pause-local', tokensPerSecond: 1_000_000 }); faux.setResponses(responses);
+  const channels: FakeChannel[] = [];
+  let settledTurns = 0;
+  const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, extensionFactories: [api => {
+    piq(api, { claimAccount: async () => async () => {},
+      createTransport: settings => { const channel = new FakeChannel(settings, options.offline === true, options.holdMedia === true); channels.push(channel); return channel; } });
+    api.on('agent_settled', () => { settledTurns++; });
+  }] });
+  await loader.reload(); assert.deepEqual(loader.getExtensions().errors, []);
+  const faux = fauxProvider({ provider: 'piq-local-control', tokensPerSecond: 1_000_000 }); faux.setResponses(responses);
   const modelRuntime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, refreshOnCreate: false });
   modelRuntime.registerNativeProvider(faux.provider);
-  let { session } = await createAgentSession({ cwd, agentDir, modelRuntime, model: faux.getModel(), settingsManager,
-    resourceLoader: loader, sessionManager: SessionManager.create(cwd, join(cwd, '.pi', 'sessions')) });
-  const errors: ExtensionError[] = [];
-  const notices: string[] = [];
-  t.mock.method(session.extensionRunner.createContext().ui, 'notify', (text: string) => notices.push(text));
+  let session: AgentSession;
+  const errors: ExtensionError[] = [], notices: string[] = [];
+  const start = async (resume: boolean) => {
+    ({ session } = await createAgentSession({ cwd, agentDir, modelRuntime, model: faux.getModel(), settingsManager, resourceLoader: loader,
+      sessionManager: resume ? SessionManager.continueRecent(cwd, join(cwd, '.pi', 'sessions')) : SessionManager.create(cwd, join(cwd, '.pi', 'sessions')) }));
+    t.mock.method(session.extensionRunner.createContext().ui, 'notify', (text: string) => { notices.push(text); });
+    await session.bindExtensions({ mode: 'print', shutdownHandler: () => {}, onError: error => errors.push(error) });
+    await eventually(() => channels.length > 0, 'the fake official channel');
+    if (!options.offline) await eventually(async () => (await readRuntimeStatus(cwd))?.connection === 'connected', 'connected state');
+  };
+  const stop = async () => {
+    if (!session) return;
+    await session.abort(); await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose();
+  };
   t.after(async () => {
-    try { await session.abort(); await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); }
+    try { await stop(); if (options.managedTerminal) await clearTerminalLaunch(cwd); }
     finally {
-      if (previousSocket) Object.defineProperty(globalThis, 'WebSocket', previousSocket);
-      else Reflect.deleteProperty(globalThis, 'WebSocket');
+      for (const key of keys) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; }
       await rm(root, { recursive: true, force: true });
     }
   });
-  await session.bindExtensions({ mode: 'print', shutdownHandler: () => {}, onError: error => errors.push(error) });
-  await eventually(() => LocalSocket.instances.length > 0, 'a test socket');
-  const socket = LocalSocket.instances.at(-1)!;
-  if (!options.offline) await eventually(async () => (await readRuntimeStatus(cwd))?.connection === 'connected', 'connected runtime');
-  const restart = async () => {
-    await session.abort();
-    await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
-    session.dispose();
-    await loader.reload();
-    ({ session } = await createAgentSession({ cwd, agentDir, modelRuntime, model: faux.getModel(), settingsManager,
-      resourceLoader: loader, sessionManager: SessionManager.continueRecent(cwd, join(cwd, '.pi', 'sessions')) }));
-    t.mock.method(session.extensionRunner.createContext().ui, 'notify', (text: string) => notices.push(text));
-    await session.bindExtensions({ mode: 'print', shutdownHandler: () => {}, onError: error => errors.push(error) });
-    await eventually(async () => (await readRuntimeStatus(cwd))?.connection === 'connected', 'replacement connection');
-    return session;
-  };
-  return { cwd, session, faux, socket, errors, notices, restart };
+  await start(false);
+  return { cwd, faux, channels, errors, notices, get session() { return session; }, get settledTurns() { return settledTurns; },
+    restart: async () => { await stop(); await loader.reload(); await start(true); }, stop };
 }
 
-test('real Pi pauses automatic wakeups and sending, keeps records, then resumes one aggregated signal', async t => {
+async function action(cwd: string, kind: 'pause' | 'resume') {
+  const request = await requestRunAction(cwd, kind);
+  await eventually(async () => (await readRuntimeStatus(cwd))?.requestId === request.requestId, `${kind} acknowledgement`);
+}
+
+async function journal(cwd: string) {
+  const directory = join(cwd, conversationDirectory(conversation));
+  const names = await readdir(directory);
+  return (await Promise.all(names.filter(name => name.endsWith('.jsonl')).map(name => readFile(join(directory, name), 'utf8'))))
+    .flatMap(text => text.trimEnd().split('\n').filter(Boolean).map(line => JSON.parse(line)));
+}
+
+test('pause keeps collecting, refuses text and file sends, and resume delivers one aggregate', async t => {
   const f = await fixture(t, [
-    fauxAssistantMessage(fauxToolCall('qq_send', { conversation: 'group:123455', text: 'must not be sent during pause' }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage('Paused sending was blocked.'),
-    fauxAssistantMessage('Now considering the accumulated messages.'),
+    fauxAssistantMessage(fauxToolCall('qq_send', { conversation: target, text: 'blocked while paused' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('qq_send_file', { conversation: target, kind: 'voice', path: 'assets/voice.wav' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('Both sends were blocked.'), fauxAssistantMessage('The accumulated messages are now available.'),
   ]);
-  const pause = await requestRunAction(f.cwd, 'pause');
-  await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === pause.requestId, 'pause receipt');
-  assert.equal((await readRuntimeStatus(f.cwd))?.paused, true);
-  for (let index = 1; index <= 4; index++) f.socket.receive(message(index));
-  await eventually(async () => (await readRuntimeStatus(f.cwd))?.pendingCount === 4, 'messages saved while paused');
-  await delay(150);
-  assert.equal(f.faux.state.callCount, 0);
-  // Explicit terminal input may run, but the channel must still refuse external sends.
-  await f.session.prompt('Check paused sending using qq_send.');
-  assert.equal(f.socket.sent.filter(packet => packet.action === 'send_group_msg').length, 0);
-  assert.match(JSON.stringify(f.session.messages), /PiQ 已暂停/);
-  const resume = await requestRunAction(f.cwd, 'resume');
-  await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === resume.requestId, 'resume receipt');
-  await eventually(() => f.faux.state.callCount === 3 && f.session.isIdle, 'one resumed model run');
-  assert.equal(f.session.messages.filter(item => item.role === 'custom' && item.customType === 'piq:messages').length, 1);
-  assert.match(JSON.stringify(f.session.messages), /4 条新消息/);
-  const directory = join(f.cwd, 'messages', 'group', '123455');
-  const files = await readdir(directory);
-  assert.equal((await readFile(join(directory, files[0]!), 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line)).length, 4);
+  await action(f.cwd, 'pause'); assert.equal((await readRuntimeStatus(f.cwd))?.paused, true);
+  for (let i = 0; i < 4; i++) f.channels[0]!.receive(message(`paused-${i}`));
+  await eventually(async () => (await readRuntimeStatus(f.cwd))?.pendingCount === 4, 'paused records');
+  await delay(150); assert.equal(f.faux.state.callCount, 0);
+  await f.session.prompt('Attempt both explicitly requested QQ sends.');
+  assert.equal(f.channels[0]!.sent, 0); assert.equal(f.channels[0]!.mediaStarted, 0);
+  assert.equal(f.session.messages.filter(item => item.role === 'toolResult' && item.isError).length, 2);
+  await action(f.cwd, 'resume');
+  await eventually(() => f.faux.state.callCount === 4 && f.session.isIdle, 'one resumed model turn');
+  const signals = f.session.messages.filter(item => item.role === 'custom' && item.customType === 'piq:messages');
+  assert.equal(signals.length, 1); assert.match(JSON.stringify(signals), /4 条新消息/);
+  assert.equal((await journal(f.cwd)).length, 4);
   assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
 });
 
-test('real Pi does not wake for persisted messages while SnowLuma is disconnected', async t => {
-  const f = await fixture(t, [fauxAssistantMessage('The connection is ready now.')], { offline: true, pending: true });
-  await delay(250);
-  assert.equal(f.faux.state.callCount, 0);
+test('persisted messages wait for an official channel connection before waking Pi', async t => {
+  const f = await fixture(t, [fauxAssistantMessage('The channel is connected now.')], { offline: true, pending: true });
+  await delay(150); assert.equal(f.faux.state.callCount, 0);
   assert.equal(f.session.messages.filter(item => item.role === 'custom').length, 0);
-  f.socket.open();
-  await eventually(() => f.faux.state.callCount === 1 && f.session.isIdle, 'notification after connection');
+  f.channels[0]!.status('connected');
+  await eventually(() => f.faux.state.callCount === 1 && f.session.isIdle, 'pending notification after reconnect');
+  await eventually(async () => (await readRuntimeStatus(f.cwd))?.pendingCount === 0, 'persisted acknowledgement');
   assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
 });
 
-test('pausing an active Pi run aborts it and resume continues even without new group messages', async t => {
+test('pausing an active model turn aborts it and resume continues without a new incoming message', async t => {
   let release = () => {};
   const gate = new Promise<void>(resolve => { release = resolve; });
-  const f = await fixture(t, [
-    async () => { await gate; return fauxAssistantMessage('This response was interrupted.'); },
-    fauxAssistantMessage('The interrupted work can now continue.'),
-  ]);
+  const f = await fixture(t, [async () => { await gate; return fauxAssistantMessage('Interrupted response.'); }, fauxAssistantMessage('Resumed work.')]);
   try {
-    f.socket.receive(message(10, 'Start one run'));
-    await eventually(() => f.faux.state.callCount === 1 && !f.session.isIdle, 'the first run to become busy');
-    const pause = await requestRunAction(f.cwd, 'pause');
-    await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === pause.requestId, 'pause during active run');
-    release();
-    await eventually(() => f.session.isIdle, 'the aborted run to settle');
+    f.channels[0]!.receive(message('start-active'));
+    await eventually(() => f.faux.state.callCount === 1 && !f.session.isIdle, 'active model turn');
+    await action(f.cwd, 'pause'); release();
+    await eventually(() => f.session.isIdle, 'aborted turn');
     assert.ok(f.session.messages.some(item => item.role === 'assistant' && item.stopReason === 'aborted'));
-    assert.equal((await readRuntimeStatus(f.cwd))?.pendingCount, 0);
-    const resume = await requestRunAction(f.cwd, 'resume');
-    await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === resume.requestId, 'resume acknowledgement');
-    await eventually(() => f.faux.state.callCount === 2 && f.session.isIdle, 'continuation without another QQ message');
+    await action(f.cwd, 'resume');
+    await eventually(() => f.faux.state.callCount === 2 && f.session.isIdle, 'resume without another event');
     assert.equal(f.session.messages.filter(item => item.role === 'custom' && item.customType === 'piq:resume').length, 1);
-    assert.equal(f.socket.sent.filter(packet => packet.action === 'send_group_msg').length, 0);
-    assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
+    assert.equal(f.channels[0]!.sent, 0); assert.deepEqual(f.errors, []);
   } finally { release(); }
 });
 
-test('an explicit handoff can continue its existing Pi session when manually reopened', async t => {
-  let release = () => {};
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  let markedBeforeModel = false;
+test('pausing while a file send waits aborts the exact channel signal before dispatch', async t => {
   const f = await fixture(t, [
-    async () => {
-      markedBeforeModel = JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted === true;
-      await gate;
-      return fauxAssistantMessage('Interrupted by closing the terminal.');
-    },
-    fauxAssistantMessage('Continuing the existing work after manual reopening.'),
-  ]);
-  try {
-    const sessionId = f.session.sessionManager.getSessionId();
-    const incoming = message(20, 'Work that takes a while');
-    LocalSocket.history = [incoming];
-    f.socket.receive(incoming);
-    await eventually(() => f.faux.state.callCount === 1 && markedBeforeModel, 'durable busy marker before model work');
-    await eventually(async () => (await readRuntimeStatus(f.cwd))?.pendingCount === 0, 'the notification to be acknowledged');
-    const handoff = await requestRunAction(f.cwd, 'handoff');
-    await eventually(async () => (await readRuntimeStatus(f.cwd))?.requestId === handoff.requestId, 'handoff acknowledgement');
-    const aborting = f.session.abort(); release(); await aborting;
-    assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted, true);
-    const replacement = await f.restart();
-    await eventually(() => f.faux.state.callCount === 2 && replacement.isIdle, 'resumed work after restart');
-    assert.equal(replacement.sessionManager.getSessionId(), sessionId);
-    assert.equal(replacement.messages.filter(item => item.role === 'custom' && item.customType === 'piq:resume').length, 1);
-    await eventually(async () => !JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted, 'completed continuation marker');
-    assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
-  } finally { release(); }
+    fauxAssistantMessage(fauxToolCall('qq_send_file', { conversation: target, kind: 'voice', path: 'assets/voice.wav', replyTo: 'send-trigger' }), { stopReason: 'toolUse' }),
+  ], { holdMedia: true });
+  f.channels[0]!.receive(message('send-trigger'));
+  await eventually(() => f.channels[0]!.mediaStarted === 1, 'a pending media send');
+  await action(f.cwd, 'pause');
+  await eventually(() => f.session.isIdle, 'cancelled send to settle');
+  assert.equal(f.channels[0]!.mediaSignal?.aborted, true);
+  assert.equal(f.channels[0]!.mediaSent, 0);
+  assert.equal((await journal(f.cwd)).filter(item => item.outgoing).length, 0);
+  assert.deepEqual(f.errors, []);
 });
 
-test('reopening an idle Pi session keeps its history without starting a new model turn', async t => {
-  const f = await fixture(t, [fauxAssistantMessage('Finished before the terminal closed.')]);
-  await f.session.prompt('A local task that has already finished.');
-  const sessionId = f.session.sessionManager.getSessionId();
-  await eventually(async () => !JSON.parse(await readFile(join(f.cwd, '.piq', 'run-preferences.json'), 'utf8')).interrupted, 'idle state saved');
-  const replacement = await f.restart();
-  await delay(200);
-  assert.equal(replacement.sessionManager.getSessionId(), sessionId);
-  assert.equal(f.faux.state.callCount, 1);
-  assert.equal(replacement.messages.filter(item => item.role === 'custom' && item.customType === 'piq:resume').length, 0);
-  assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
+test('manual reopen preserves the Pi conversation and receives only through the replacement channel', async t => {
+  const f = await fixture(t, [fauxAssistantMessage('PERSISTED_ASSISTANT_CONTEXT'), context => {
+    assert.match(JSON.stringify(context), /PERSISTED_ASSISTANT_CONTEXT/);
+    return fauxAssistantMessage('New event after reopening.');
+  }]);
+  f.channels[0]!.receive(message('before-close'));
+  await eventually(() => f.faux.state.callCount === 1 && f.session.isIdle && f.settledTurns === 1, 'first settled session turn');
+  const sessionFile = f.session.sessionFile;
+  const old = f.channels[0]!;
+  await f.restart();
+  assert.equal(old.closed, true); assert.equal(f.session.sessionFile, sessionFile);
+  old.receive(message('stale-after-close'));
+  f.channels[1]!.receive(message('after-reopen'));
+  await eventually(() => f.faux.state.callCount === 2 && f.session.isIdle && f.settledTurns === 2, 'reopened session turn');
+  assert.deepEqual((await journal(f.cwd)).map(item => item.messageId), ['before-close', 'after-reopen']);
+  await f.stop();
+  await assert.rejects(readFile(join(f.cwd, '.piq', 'owner.lock')), { code: 'ENOENT' });
+  assert.deepEqual(f.errors, []);
 });
 
-test('the actual Pi session registers its own process beyond a terminal launcher and can reload', async t => {
-  const f = await fixture(t, [], { managedTerminal: true });
-  const leasePath = join(f.cwd, '.piq', 'terminal-return.json');
-  const lease = JSON.parse(await readFile(leasePath, 'utf8'));
-  assert.equal(lease.wrapperPid, process.ppid);
-  assert.equal(lease.piPid, process.pid);
-  assert.notEqual(lease.wrapperPid, lease.piPid);
-  await f.session.reload();
-  const reloaded = JSON.parse(await readFile(leasePath, 'utf8'));
-  assert.equal(reloaded.piPid, process.pid);
-  assert.equal(reloaded.wrapperPid, process.ppid);
-  assert.equal(reloaded.token, lease.token);
-  assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
-});
-
-test('a background Pi session cannot register an inherited terminal return token', async t => {
-  const f = await fixture(t, [], { managedTerminal: true, background: true });
+test('a managed terminal records the real Pi owner and preserves terminal runtime mode', async t => {
+  const f = await fixture(t, [fauxAssistantMessage('No model call needed.')], { managedTerminal: true });
   const lease = JSON.parse(await readFile(join(f.cwd, '.piq', 'terminal-return.json'), 'utf8'));
-  assert.equal(lease.piPid, undefined);
-  assert.equal(lease.wrapperPid, undefined);
-  assert.equal((await readRuntimeStatus(f.cwd))?.mode, 'background');
-  assert.deepEqual(f.errors, []); assert.deepEqual(f.notices, []);
+  assert.equal(lease.wrapperPid, process.pid); assert.equal(lease.piPid, process.pid);
+  assert.equal((await readRuntimeStatus(f.cwd))?.mode, 'terminal');
+  assert.equal(f.faux.state.callCount, 0);
 });

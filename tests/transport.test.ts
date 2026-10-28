@@ -1,721 +1,377 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, open, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { setImmediate as immediate, setTimeout as delay } from 'node:timers/promises';
-import { test } from 'node:test';
-import { OneBotApiError, OneBotClient } from '../src/onebot-client.ts';
-import { SnowLumaTransport, normalizeMessageEvent, normalizePokeEvent, compareCursors, type ConversationEvent, type PokeEvent } from '../src/transport.ts';
+import { mkdir, mkdtemp, open, realpath, rm, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { test, type TestContext } from 'node:test';
+import { ApiError, MediaFileType, QQBot, type QQBotOptions, type SendMessageOptions } from '@tencent-connect/qqbot-nodejs';
+import { MEDIA_LIMITS, QQBotApiError, QQBotTransport, normalizeMessageEvent, normalizePlatformEvent, type ConversationEvent, type QQBotSdk, type ConnectionState } from '../src/transport.ts';
 
-const GROUP = { type: 'group', id: '20001' } as const;
-const PRIVATE = { type: 'private', id: '10002' } as const;
-const TEMPORARY = { type: 'temporary', id: '10002', sourceGroupId: '30001' } as const;
+const GROUP = { type: 'group', id: 'group-openid_A1' } as const;
+const PRIVATE = { type: 'private', id: 'user-openid_B2' } as const;
+type Listener = (...args: any[]) => unknown;
 
-class FakeWebSocket extends EventTarget {
-  static instances: FakeWebSocket[] = [];
-  readyState = 0;
-  sent: Array<{ action: string; params: Record<string, unknown>; echo: string }> = [];
-  respond = true;
-  response = { status: 'ok', retcode: 0, data: { message_id: -42 } };
-  dataForAction?: (action: string, params: Record<string, unknown>) => unknown;
-  readonly url: string;
-
-  constructor(url: string) {
-    super();
-    this.url = url;
-    FakeWebSocket.instances.push(this);
-    queueMicrotask(() => { this.readyState = 1; this.dispatchEvent(new Event('open')); });
-  }
-  send(data: string) {
-    const packet = JSON.parse(data);
-    this.sent.push(packet);
-    if (this.respond) queueMicrotask(() => this.receive({ ...this.response,
-      ...(this.dataForAction ? { data: this.dataForAction(packet.action, packet.params) } : {}), echo: packet.echo }));
-  }
-  receive(data: unknown) { this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(data) })); }
-  close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+function sdkMock(autoReady = true) {
+  const listeners = new Map<string, Set<Listener>>();
+  const sends: SendMessageOptions[] = [];
+  const uploads: Array<Parameters<QQBotSdk['uploadMedia']>[0]> = [];
+  const requests: Array<{ method: string; path: string; body?: unknown }> = [];
+  let starts = 0, stops = 0, finish: (() => void) | undefined, failStart: ((error: Error) => void) | undefined;
+  let send = async (_options: SendMessageOptions): Promise<any> => ({ id: 'official-message_A1', timestamp: '2026-10-28T08:00:00+08:00', ext_info: { ref_idx: 'reference_A1' } });
+  let upload = async (_options: Parameters<QQBotSdk['uploadMedia']>[0]): Promise<any> => ({ file_uuid: 'file-uuid', file_info: 'PRIVATE_FILE_INFO', ttl: 3600 });
+  const apiClient = { async request(_token: string, method: string, path: string, body?: unknown) {
+    requests.push({ method, path, body }); return { ok: true };
+  } };
+  const api = {
+    get: async (path: string, query?: unknown) => apiClient.request('PRIVATE_ACCESS_TOKEN', 'GET', path, query),
+    post: async (path: string, body?: unknown) => apiClient.request('PRIVATE_ACCESS_TOKEN', 'POST', path, body),
+    put: async (path: string, body?: unknown) => apiClient.request('PRIVATE_ACCESS_TOKEN', 'PUT', path, body),
+    patch: async (path: string, body?: unknown) => apiClient.request('PRIVATE_ACCESS_TOKEN', 'PATCH', path, body),
+    delete: async (path: string) => apiClient.request('PRIVATE_ACCESS_TOKEN', 'DELETE', path),
+    getToken: async () => 'PRIVATE_ACCESS_TOKEN',
+  };
+  const sdk = {
+    on(event: string, handler: Listener) { const list = listeners.get(event) ?? new Set(); list.add(handler); listeners.set(event, list); return sdk; },
+    off(event: string, handler: Listener) { listeners.get(event)?.delete(handler); return sdk; },
+    start() {
+      starts++;
+      if (autoReady) queueMicrotask(() => { void emit('ready', {}); });
+      return new Promise<void>((resolve, reject) => { finish = resolve; failStart = reject; });
+    },
+    stop() { stops++; finish?.(); },
+    async send(options: SendMessageOptions) { sends.push(options); return send(options); },
+    async uploadMedia(options: Parameters<QQBotSdk['uploadMedia']>[0]) { uploads.push(options); return upload(options); },
+    api, apiClient,
+  };
+  async function emit(event: string, ...args: unknown[]) { await Promise.all([...(listeners.get(event) ?? [])].map(handler => handler(...args))); }
+  return { sdk: sdk as unknown as QQBotSdk, sends, uploads, requests, api, apiClient, emit,
+    starts: () => starts, stops: () => stops, failStart: (error: Error) => failStart!(error),
+    respondSend(handler: typeof send) { send = handler; }, respondUpload(handler: typeof upload) { upload = handler; } };
 }
 
-function fixture(timeoutMs = 100) {
-  const messages: ConversationEvent[] = [];
-  const pokes: PokeEvent[] = [];
-  const statuses: string[] = [];
-  const client = new OneBotClient({
-    url: 'ws://127.0.0.1:3001/', accessToken: 'test-token',
-    webSocket: FakeWebSocket, reconnect: false, requestTimeoutMs: timeoutMs,
+function fixture(t: TestContext, autoReady = true, groupMemberEvents = false) {
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('Real network is disabled in transport tests'); });
+  const f = sdkMock(autoReady), messages: ConversationEvent[] = [], statuses: ConnectionState[] = [], errors: Error[] = [];
+  let options: QQBotOptions | undefined;
+  const transport = new QQBotTransport({ appId: '123456789', appSecret: 'PRIVATE_APP_SECRET', groupMemberEvents,
+    connectionTimeoutMs: 100, sdkFactory: value => { options = value; return f.sdk; },
+    onMessage: event => { messages.push(event); }, onStatus: status => { statuses.push(status); }, onError: error => { errors.push(error); } });
+  t.after(() => transport.close());
+  return { ...f, transport, messages, statuses, errors, options: () => options! };
+}
+
+function wireFixture(t: TestContext, respond: (path: string, body: Record<string, unknown>) => Response) {
+  const wire: Array<{ url: string; method: string; body: Record<string, unknown>; headers: Headers }> = [];
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    assert.ok(['bots.qq.com', 'api.bot.qq.com'].includes(url.hostname), 'No external network destination is permitted');
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) as Record<string, unknown> : {};
+    wire.push({ url: url.href, method: init?.method ?? 'GET', body, headers: new Headers(init?.headers) });
+    if (url.pathname === '/app/getAppAccessToken') {
+      assert.equal(url.origin, 'https://bots.qq.com');
+      return Response.json({ access_token: 'MOCK_ACCESS_TOKEN', expires_in: '7200' });
+    }
+    assert.equal(url.origin, 'https://api.bot.qq.com');
+    return respond(url.pathname, body);
   });
-  const transport = new SnowLumaTransport({
-    url: 'ws://127.0.0.1:3001/', onMessage: event => messages.push(event),
-    onPoke: event => pokes.push(event),
-    onStatus: status => statuses.push(status),
-  }, client);
-  return { transport, client, messages, pokes, statuses, socket: () => FakeWebSocket.instances.at(-1)! };
+  const gateway = sdkMock();
+  let sdk!: QQBot;
+  const transport = new QQBotTransport({ appId: '123456789', appSecret: 'MOCK_APP_SECRET', onMessage() {}, sdkFactory: settings => {
+    sdk = new QQBot(settings);
+    return { ...gateway.sdk, api: sdk.api, apiClient: sdk.apiClient,
+      send: sdk.send.bind(sdk), uploadMedia: sdk.uploadMedia.bind(sdk) };
+  } });
+  t.after(() => { transport.close(); sdk.stop(); });
+  return { transport, wire };
 }
 
 function event(overrides: Record<string, unknown> = {}) {
-  return { post_type: 'message', message_type: 'group', self_id: 10001, group_id: 20001,
-    user_id: 10002, message_id: -7, message_seq: 9, time: 1_700_000_000,
-    sender: { card: '群名片', nickname: '昵称' },
-    message: [{ type: 'text', data: { text: 'hello' } }], raw_message: 'hello', ...overrides };
+  const raw = { id: 'received-message_X1', content: '原始正文 <faceType=1,faceId=66>', timestamp: '2026-10-28T08:00:00+08:00',
+    group_openid: GROUP.id, author: { member_openid: 'member-openid_C3', username: '成员' }, message_type: 102,
+    attachments: [{ content_type: 'image/png', url: 'https://qq.example/image?rkey=SIGNED_VALUE', filename: 'image.png' }],
+    msg_elements: [{ msg_idx: 'original-index', message_type: 103, content: '引用', msg_elements: [
+      { message_type: 0, content: '最内层原文', attachments: [{ content_type: 'audio/silk', url: 'https://qq.example/audio', asr_refer_text: '已有转写' }] },
+    ] }], future_field: { retained: true } };
+  return { kind: 'group', rawEventType: 'GROUP_MESSAGE_CREATE', senderId: 'member-openid_C3', senderName: '成员',
+    messageId: raw.id, content: 'SDK投影文字', timestamp: raw.timestamp, groupOpenid: GROUP.id, raw, ...overrides };
 }
 
-test('normalizes group and private messages with distinct conversation identities', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  assert.equal(new URL(f.socket().url).searchParams.get('access_token'), 'test-token');
-  f.socket().receive(event());
-  f.socket().receive(event({ post_type: 'message_sent', user_id: 10001 }));
-  f.socket().receive(event({ message_type: 'private' }));
-  f.socket().receive(event({ group_id: '../escape' }));
-  f.socket().receive({ post_type: 'meta_event', meta_event_type: 'heartbeat' });
-  await immediate();
-  assert.equal(f.messages.length, 3);
-  assert.equal(f.messages[0].conversation.id, '20001');
-  assert.equal(f.messages[0].messageId, '-7');
-  assert.equal(f.messages[0].messageSeq, '9');
-  assert.equal(f.messages[0].sender, '群名片');
-  assert.equal(f.messages[0].outgoing, false);
-  assert.equal(f.messages[1].outgoing, true);
-  assert.deepEqual(f.messages[0].conversation, GROUP);
-  assert.deepEqual(f.messages[2].conversation, PRIVATE);
-  assert.deepEqual(f.statuses, ['connected']);
-});
+async function eventually(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (!check()) { if (Date.now() >= deadline) assert.fail('Timed out waiting for mock SDK'); await delay(2); }
+}
 
-test('private self echoes use their peer and temporary messages retain their source group', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  f.socket().receive(event({ message_type: 'private', post_type: 'message_sent', user_id: 10001, target_id: 20001 }));
-  f.socket().receive(event({ message_type: 'private', post_type: 'message_sent', user_id: 10001, session_id: 20002 }));
-  f.socket().receive(event({ message_type: 'private', post_type: 'message_sent', user_id: 10001 }));
-  f.socket().receive(event({ message_type: 'private', sub_type: 'group', group_id: undefined,
-    sender: { nickname: 'Temporary peer', group_id: 30001 } }));
-  f.socket().receive(event({ message_type: 'private', sub_type: 'group', group_id: undefined,
-    sender: { nickname: 'Missing source group' } }));
-  await immediate();
-  assert.equal(f.messages.length, 3, 'an unattributed self echo must not become a private chat with ourselves');
-  assert.deepEqual(f.messages.map(message => message.conversation), [
-    { type: 'private', id: '20001' }, { type: 'private', id: '20002' }, TEMPORARY,
-  ]);
-  assert.equal(f.messages[0].userId, '10001');
-  assert.equal(f.messages[0].outgoing, true);
-  assert.equal('sourceGroupId' in f.messages[2], false);
-  assert.equal(normalizeMessageEvent(event({ message_type: 'guild' })), undefined);
-  assert.equal(normalizeMessageEvent(event({ post_type: 'notice' })), undefined);
-});
-
-test('sends literal text and quoted replies once, with correlated receipt', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  assert.deepEqual(await f.transport.send(GROUP, { text: '[CQ:at,qq=all]', replyTo: -7 }), { messageId: '-42' });
-  assert.equal(f.socket().sent.length, 1);
-  assert.deepEqual(f.socket().sent[0].params, {
-    group_id: 20001, message: [
-      { type: 'reply', data: { id: '-7' } },
-      { type: 'text', data: { text: '[CQ:at,qq=all]' } },
-    ],
+async function mediaFixture(t: TestContext, filename = 'image.png') {
+  const parent = resolve('.test-tmp'); await mkdir(parent, { recursive: true });
+  const root = await mkdtemp(join(parent, 'qqbot-transport-'));
+  t.after(async () => {
+    const resolvedRoot = await realpath(root), within = relative(await realpath(parent), resolvedRoot);
+    assert.ok(within && within !== '..' && !within.startsWith('../') && !within.startsWith('..\\') && !isAbsolute(within));
+    await rm(resolvedRoot, { recursive: true, force: true });
   });
-});
+  const path = join(root, filename); await writeFile(path, 'LOCAL_MEDIA_BYTES');
+  return { root, path };
+}
 
-test('private and temporary-private replies dispatch to the selected peer rather than its group', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  await f.transport.send({ type: 'private', id: GROUP.id }, { text: '[CQ:at,qq=all]' });
-  assert.equal(f.socket().sent[0].action, 'send_private_msg');
-  assert.deepEqual(f.socket().sent[0].params, {
-    user_id: Number(GROUP.id), message: [{ type: 'text', data: { text: '[CQ:at,qq=all]' } }],
-  });
-  await f.transport.send(TEMPORARY, { text: 'temp reply', replyTo: -7 });
-  assert.equal(f.socket().sent[1].action, 'send_private_msg');
-  assert.deepEqual(f.socket().sent[1].params, {
-    user_id: Number(PRIVATE.id), group_id: 30001,
-    message: [{ type: 'reply', data: { id: '-7' } }, { type: 'text', data: { text: 'temp reply' } }],
-  });
-  await assert.rejects(f.transport.send({ ...TEMPORARY, sourceGroupId: '../escape' }, { text: 'bad' }));
-  assert.equal(f.socket().sent.length, 2);
-});
-
-test('the same peer has separate normal-private and source-scoped temporary conversations', () => {
-  const ordinary = normalizeMessageEvent(event({ message_type: 'private', sub_type: 'friend' }))!;
-  const temporary = normalizeMessageEvent(event({ message_type: 'private', sub_type: 'group', group_id: 30001 }))!;
-  const otherGroup = normalizeMessageEvent(event({ message_type: 'private', sub_type: 'group', group_id: 30002 }))!;
-  assert.deepEqual(ordinary.conversation, PRIVATE);
-  assert.deepEqual(temporary.conversation, TEMPORARY);
-  assert.deepEqual(otherGroup.conversation, { ...TEMPORARY, sourceGroupId: '30002' });
-  assert.notDeepEqual(ordinary.conversation, temporary.conversation);
-});
-
-test('temporary history is rejected before any friend-history or login action', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  await assert.rejects(f.transport.fetchHistory(TEMPORARY, null, 20), /临时会话不支持历史补拉/);
-  assert.equal(f.socket().sent.length, 0);
-});
-
-test('history uses inclusive forward anchors and normalizes own records without self_id', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  let loginCalls = 0;
-  const calls: unknown[] = [];
-  f.socket().dataForAction = (action, params) => {
-    if (action === 'get_login_info') { loginCalls++; return { user_id: 10001, nickname: 'Bot' }; }
-    assert.equal(action, 'get_group_msg_history');
-    calls.push(params);
-    return { messages: [
-      { ...event({ message_id: -8, message_seq: 10, user_id: 10001 }), self_id: undefined, post_type: undefined },
-      { ...event(), self_id: undefined, post_type: undefined },
-    ] };
-  };
-  const records = await f.transport.fetchHistory(GROUP, { messageId: '-7', messageSeq: '9', time: 1_700_000_000 }, 100);
-  assert.deepEqual(calls[0], { group_id: 20001, count: 100, message_id: -7, reverse_order: false });
-  assert.deepEqual(records.map(record => record.messageSeq), ['9', '10']);
-  assert.equal(records[1]!.outgoing, true);
-  assert.equal(records[1]!.selfId, '10001');
-  await f.transport.fetchHistory(GROUP, null, 20);
-  assert.equal(loginCalls, 1);
-  assert.deepEqual(calls[1], { group_id: 20001, count: 20 });
-  f.transport.close();
-  await assert.rejects(f.transport.fetchHistory(GROUP, null, 20), /disconnected/);
-});
-
-test('private history uses the peer API and preserves sender-local sequence ordering', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  const calls: unknown[] = [];
-  f.socket().dataForAction = (action, params) => {
-    if (action === 'get_login_info') return { user_id: 10001, nickname: 'Bot' };
-    assert.equal(action, 'get_friend_msg_history');
-    calls.push(params);
-    return { messages: [
-      { ...event({ message_type: 'private', message_id: -11, message_seq: 10000, time: 100 }), self_id: undefined },
-      { ...event({ message_type: 'private', message_id: -12, message_seq: 4, user_id: 10001, time: 101 }), self_id: undefined, post_type: undefined },
-      { ...event({ message_type: 'private', sub_type: 'group', message_id: -99, time: 101, sender: { group_id: 30001 } }), self_id: undefined },
-      { ...event({ message_type: 'private', message_id: -13, message_seq: 10001, time: 101 }), self_id: undefined },
-    ] };
-  };
-  const records = await f.transport.fetchHistory(PRIVATE, { messageId: '-11', messageSeq: '10000', time: 100 }, 100);
-  assert.deepEqual(calls[0], { user_id: 10002, count: 100, message_id: -11, reverse_order: false });
-  assert.deepEqual(records.map(record => record.messageId), ['-11', '-12', '-13']);
-  assert.deepEqual(records.map(record => record.conversation), [PRIVATE, PRIVATE, PRIVATE]);
-  assert.equal(records[1].outgoing, true);
-  assert.equal(compareCursors(records[1], records[2], 'private'), 0);
-  await f.transport.fetchHistory(PRIVATE, null, 20);
-  assert.deepEqual(calls[1], { user_id: 10002, count: 20 });
-  f.socket().dataForAction = () => ({ messages: [event({ message_type: 'private', user_id: 99998 })] });
-  await assert.rejects(f.transport.fetchHistory(PRIVATE, null, 20), /another conversation/);
-});
-
-test('sends local image bytes as standard base64 image segments in one message', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  const directory = await mkdtemp(join(tmpdir(), 'piq-transport-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const path = join(directory, 'sticker.png');
-  await writeFile(path, 'image-bytes');
-  await f.transport.connect();
-  await f.transport.send(GROUP, { text: '贴图', images: [path] });
-  assert.equal(f.socket().sent.length, 1);
-  const encodedImage = `base64://${Buffer.from('image-bytes').toString('base64')}`;
-  assert.equal(f.socket().sent[0].action, 'send_group_msg');
-  assert.deepEqual(f.socket().sent[0].params.message, [
-    { type: 'text', data: { text: '贴图' } },
-    { type: 'image', data: { file: encodedImage } },
-  ]);
-  await f.transport.send(PRIVATE, { text: '私聊图片', images: [path] });
-  assert.equal(f.socket().sent.length, 2);
-  assert.equal(f.socket().sent[1].action, 'send_private_msg');
-  assert.deepEqual(f.socket().sent[1].params, {
-    user_id: Number(PRIVATE.id), message: [
-      { type: 'text', data: { text: '私聊图片' } },
-      { type: 'image', data: { file: encodedImage } },
-    ],
-  });
-});
-
-test('timeout is an unknown result and does not resend', async t => {
-  const f = fixture(15); t.after(() => f.transport.close());
-  await f.transport.connect();
-  f.socket().respond = false;
-  await assert.rejects(f.transport.send(GROUP, { text: 'only once' }), /result is unknown/);
-  assert.equal(f.socket().sent.length, 1);
-});
-
-test('image preparation failures and cancellation prevent the message action', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  await assert.rejects(f.transport.send(GROUP, { text: 'with image', images: [join(tmpdir(), 'piq-missing-directory', 'missing.png')] }), /ENOENT/);
-  await assert.rejects(f.transport.send(GROUP, { text: 'cancelled' }, AbortSignal.abort()), /aborted/i);
-  assert.equal(f.socket().sent.length, 0);
-});
-
-test('closing while opening a local image prevents sending and reconnecting', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  const directory = await mkdtemp(join(tmpdir(), 'piq-transport-close-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const path = join(directory, 'sticker.png');
-  await writeFile(path, 'image-bytes');
-  await f.transport.connect();
-  const socketsBefore = FakeWebSocket.instances.length;
-  const sending = f.transport.send(GROUP, { images: [path] });
-  f.transport.close();
-  await assert.rejects(sending, /aborted|closed/);
-  assert.equal(FakeWebSocket.instances.length, socketsBefore);
-  assert.equal(f.socket().sent.length, 0);
-});
-
-test('an unsuccessful first connection can recover automatically and closes cleanly', async t => {
-  let attempts = 0;
-  class RetrySocket extends EventTarget {
-    readyState = 0;
-    constructor(_url: string) {
-      super();
-      const attempt = ++attempts;
-      queueMicrotask(() => {
-        if (attempt === 1) this.close();
-        else { this.readyState = 1; this.dispatchEvent(new Event('open')); }
-      });
-    }
-    send(_data: string) {}
-    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+test('official dispatch preserves opaque identities and complete raw recursive message payloads', async t => {
+  const f = fixture(t); await f.transport.connect();
+  const original = event();
+  await f.emit('message', {}, original);
+  const received = f.messages[0]!;
+  assert.deepEqual(received.conversation, GROUP);
+  assert.equal(received.selfId, '123456789');
+  assert.equal(received.messageId, 'received-message_X1');
+  assert.equal(received.rawText, original.raw.content);
+  assert.deepEqual(received.raw, original.raw);
+  assert.deepEqual(received.attachments, original.raw.attachments);
+  assert.notEqual(received.raw, original.raw);
+  assert.equal(received.eventType, 'GROUP_MESSAGE_CREATE');
+  const privateRaw = { id: 'private-message', content: '', timestamp: original.timestamp, author: { user_openid: PRIVATE.id, bot: true }, message_type: 101, attachments: [] };
+  const privateEvent = event({ kind: 'c2c', rawEventType: 'C2C_MESSAGE_CREATE', senderId: PRIVATE.id, messageId: privateRaw.id, raw: privateRaw });
+  await f.emit('message', {}, privateEvent);
+  assert.deepEqual(f.messages[1]!.conversation, PRIVATE);
+  assert.equal(f.messages[1]!.botAuthored, true, 'C2C raw author.bot survives the SDK missing senderIsBot projection');
+  assert.equal(f.messages[1]!.outgoing, false, 'a bot author alone is not proof of our own send');
+  await f.emit('message', {}, event({ rawEventType: 'GROUP_AT_MESSAGE_CREATE', senderIsBot: true }));
+  assert.equal(f.messages[2]!.outgoing, false, 'another bot is not this bot sending a message');
+  assert.equal(f.messages[2]!.botAuthored, true);
+  for (const value of [event({ kind: 'guild' }), event({ groupOpenid: undefined }), event({ messageId: 123 }), event({ timestamp: 'invalid' }), event({ raw: null })]) {
+    assert.equal(normalizeMessageEvent(value, '123456789'), undefined);
   }
-  const statuses: string[] = [];
-  const client = new OneBotClient({
-    url: 'ws://127.0.0.1:9/', webSocket: RetrySocket,
-    reconnect: true,
-  });
-  const transport = new SnowLumaTransport({
-    url: 'ws://127.0.0.1:9/', onMessage() {}, onStatus: status => statuses.push(status),
-  }, client);
-  t.after(() => transport.close());
-  await assert.rejects(transport.connect(), /disconnected/);
-  const deadline = Date.now() + 3000;
-  while (!client.isConnected && Date.now() < deadline) await delay(5);
-  assert.equal(client.isConnected, true);
-  assert.deepEqual(statuses, ['disconnected', 'connected']);
-  assert.equal(attempts, 2);
-  transport.close();
-  await delay(10);
-  assert.equal(attempts, 2);
 });
 
-test('an initial send waits for connection and a disconnect after dispatch is not replayed', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.send(GROUP, { text: 'wait for startup' });
-  assert.equal(f.transport.isConnected, true);
-  assert.equal(f.socket().sent.length, 1);
-  f.socket().respond = false;
-  const pending = f.transport.send(GROUP, { text: 'disconnected' });
-  await immediate();
-  f.socket().close();
-  await assert.rejects(pending, /result is unknown/);
-  assert.deepEqual(f.statuses, ['connected', 'disconnected']);
-  assert.equal(f.socket().sent.length, 2);
+test('only a confirmed send in the same target marks a received echo as outgoing', async t => {
+  const f = fixture(t); await f.transport.send(GROUP, { text: 'explicit send' });
+  const original = event();
+  const echo = event({ messageId: 'official-message_A1', raw: { ...original.raw, id: 'official-message_A1' }, senderIsBot: true });
+  await f.emit('message', {}, echo);
+  assert.equal(f.messages[0]!.outgoing, true);
+  assert.equal(f.messages[0]!.botAuthored, true);
+  await f.emit('message', {}, { ...echo, groupOpenid: 'another-group', raw: { ...echo.raw, group_openid: 'another-group' } });
+  assert.equal(f.messages[1]!.outgoing, false, 'message ids from another group cannot borrow our sent proof');
 });
 
-test('a send after a dropped connection reconnects before dispatching once', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  const oldSocket = f.socket();
-  oldSocket.close();
+test('gateway creation uses fixed official hosts and only the requested group/C2C intents', async t => {
+  const f = fixture(t);
+  await Promise.all([f.transport.connect(), f.transport.connect()]);
+  assert.equal(f.starts(), 1); assert.equal(f.transport.isConnected, true);
+  assert.equal(f.options().baseUrl, 'https://api.bot.qq.com');
+  assert.equal(f.options().tokenBaseUrl, 'https://bots.qq.com');
+  assert.equal(f.options().intents, (1 << 25) | (1 << 26));
+  assert.equal(f.options().logger, undefined);
+  const enabled = fixture(t, true, true); await enabled.transport.connect();
+  assert.equal(enabled.options().intents, (1 << 25) | (1 << 26) | (1 << 24));
+});
+
+test('SDK reconnection keeps sends waiting and close cancels pending connection work', async t => {
+  const f = fixture(t); await f.transport.connect();
+  await f.emit('disconnected', { code: 1006, reason: 'test', willReconnect: true });
+  const pending = f.transport.send(GROUP, { text: '待重连发送' });
+  await delay(5); assert.equal(f.sends.length, 0);
+  await f.emit('resumed', {});
+  assert.equal((await pending).messageId, 'official-message_A1');
+  assert.equal(f.starts(), 1);
+  await f.emit('disconnected', { code: 1006, reason: 'test', willReconnect: true });
+  const waiting = f.transport.connect(); f.transport.close();
+  await assert.rejects(waiting, /取消/);
+  f.transport.close(); assert.equal(f.stops(), 1);
   assert.equal(f.transport.isConnected, false);
-  await f.transport.send(GROUP, { text: 'new message after reconnect' });
-  assert.notEqual(f.socket(), oldSocket);
-  assert.equal(oldSocket.sent.length, 0);
-  assert.equal(f.socket().sent.length, 1);
-  assert.equal(f.transport.isConnected, true);
 });
 
-test('unavailable endpoint fails before dispatch with bounded, credential-free diagnostics', async t => {
-  let sends = 0;
-  class UnavailableSocket extends EventTarget {
-    readyState = 0;
-    constructor(_url: string) { super(); queueMicrotask(() => this.close()); }
-    send() { sends++; }
-    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
-  }
-  const client = new OneBotClient({
-    url: 'ws://127.0.0.1:9/', webSocket: UnavailableSocket, reconnect: false,
+test('startup failures and SDK diagnostics never expose credentials or untrusted error text', async t => {
+  const f = fixture(t, false);
+  const starting = f.transport.connect(); await eventually(() => f.starts() === 1);
+  f.failStart(new Error('PRIVATE_APP_SECRET https://bad.example/?token=SECRET'));
+  await assert.rejects(starting, error => { assert.doesNotMatch(String(error), /SECRET|bad\.example/); return true; });
+  assert.ok(f.statuses.includes('error'));
+  assert.doesNotMatch(f.errors.map(error => error.message).join('\n'), /SECRET|bad\.example/);
+  await assert.rejects(f.transport.connect(), /启动或连接失败/);
+});
+
+test('text sends use explicit opaque targets and passive reply ids without automatic fallbacks', async t => {
+  const f = fixture(t);
+  await f.transport.send(GROUP, { text: '文字', replyTo: 'opaque/reply:message' });
+  await f.transport.send(PRIVATE, { text: '主动文字' });
+  assert.deepEqual(f.sends, [
+    { target: { scope: 'group', targetId: GROUP.id, msgId: 'opaque/reply:message' }, msgType: 0, content: '文字' },
+    { target: { scope: 'c2c', targetId: PRIVATE.id }, msgType: 0, content: '主动文字' },
+  ]);
+  f.respondSend(async () => { throw new ApiError('SECRET response', 400, '/private/path', 11253); });
+  await assert.rejects(f.transport.send(GROUP, { text: '权限测试' }), error => {
+    assert.ok(error instanceof QQBotApiError); assert.equal(error.bizCode, 11253); assert.equal(error.resultUnknown, false);
+    assert.match(error.message, /权限/); assert.doesNotMatch(error.message, /SECRET|private\/path/); return true;
   });
-  const transport = new SnowLumaTransport({
-    url: 'ws://person:private-password@127.0.0.1:9/?access_token=private-token',
-    connectionTimeoutMs: 20, onMessage() {}, onStatus() {},
-  }, client);
-  t.after(() => transport.close());
-  await assert.rejects(transport.send(GROUP, { text: 'should not leave' }), error => {
-    assert.match(String(error), /无法连接 SnowLuma.*127\.0\.0\.1:9.*消息未发送/);
-    assert.doesNotMatch(String(error), /private-password|private-token|person/);
-    return true;
-  });
-  assert.equal(sends, 0);
+  assert.equal(f.sends.length, 3);
 });
 
-test('waiting for connection is cancelled by the caller and by session closure', async t => {
-  let sends = 0;
-  class OpeningSocket extends EventTarget {
-    readyState = 0;
-    constructor(_url: string) { super(); }
-    send() { sends++; }
-    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+test('media uploads bytes first and dispatches exactly one captioned message after the receipt', async t => {
+  const f = fixture(t), file = await mediaFixture(t);
+  await f.transport.send(GROUP, { text: '图片说明', images: [file.path], replyTo: 'received-message_X1' });
+  assert.equal(f.uploads.length, 1); assert.equal(f.uploads[0]!.srvSendMsg, false);
+  assert.equal(f.uploads[0]!.fileType, MediaFileType.IMAGE);
+  assert.equal(f.uploads[0]!.buffer!.toString(), 'LOCAL_MEDIA_BYTES');
+  assert.deepEqual(f.sends, [{ target: { scope: 'group', targetId: GROUP.id, msgId: 'received-message_X1' }, msgType: 7,
+    media: { file_info: 'PRIVATE_FILE_INFO' }, content: '图片说明' }]);
+  for (const [kind, extension, fileType] of [['voice', '.wav', 3], ['voice', '.mp3', 3], ['voice', '.silk', 3], ['video', '.mp4', 2], ['file', '.pdf', 4]] as const) {
+    const path = join(file.root, `sample${extension}`); await writeFile(path, 'OTHER_MEDIA');
+    await f.transport.sendMedia(PRIVATE, { kind, path, fileName: `sent${extension}`, text: '说明' });
+    assert.equal(f.uploads.at(-1)!.fileType, fileType);
+    assert.equal(f.uploads.at(-1)!.fileName, `sent${extension}`);
   }
-  const client = new OneBotClient({ url: 'ws://127.0.0.1:9/', webSocket: OpeningSocket, reconnect: false });
-  const transport = new SnowLumaTransport({
-    url: 'ws://127.0.0.1:9/', connectionTimeoutMs: 1000, onMessage() {}, onStatus() {},
-  }, client);
-  t.after(() => transport.close());
-  const caller = new AbortController();
-  const first = transport.send(GROUP, { text: 'cancelled' }, caller.signal);
-  caller.abort(new Error('cancelled by caller'));
-  await assert.rejects(first, /cancelled by caller/);
-  const second = transport.send(GROUP, { text: 'closed' });
-  transport.close();
-  await assert.rejects(second, /closed/);
-  assert.equal(sends, 0);
 });
 
-test('API rejection stays an explicit rejection; closing removes listeners', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  await f.transport.connect();
-  f.socket().response = { status: 'failed', retcode: 403, data: { message_id: 0 } };
-  await assert.rejects(f.transport.send(GROUP, { text: 'rejected' }), /retcode 403/);
-  f.transport.close();
-  f.socket().receive(event());
-  await immediate();
-  assert.equal(f.messages.length, 0);
-  await assert.rejects(f.transport.connect(), /closed/);
-});
-
-function pokeNotice(overrides: Record<string, unknown> = {}) {
-  return { post_type: 'notice', notice_type: 'notify', sub_type: 'poke', self_id: 10001,
-    group_id: 20001, user_id: 10002, target_id: 10001, time: 1_700_000_000, ...overrides };
-}
-
-test('poke notices retain real actor, peer and source without inventing message IDs', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  f.socket().receive(pokeNotice());
-  f.socket().receive(pokeNotice());
-  f.socket().receive(pokeNotice({ group_id: 0, sender_id: 10001, target_id: 10002 }));
-  f.socket().receive(pokeNotice({ group_id: undefined }));
-  f.socket().receive(pokeNotice({ group_id: 0, sender_id: 10002, target_id: 10002 }));
-  assert.equal(f.messages.length, 0);
-  assert.equal(f.pokes.length, 5, 'same-second repeated notices each remain a distinct event');
-  assert.deepEqual(f.pokes.map(poke => poke.conversation), [GROUP, GROUP, PRIVATE, PRIVATE, PRIVATE]);
-  assert.deepEqual(f.pokes.map(poke => poke.userId), ['10002', '10002', '10001', '10002', '10002']);
-  assert.deepEqual(f.pokes.map(poke => poke.outgoing), [false, false, true, false, false]);
-  assert.equal(new Set(f.pokes.map(poke => poke.eventId)).size, 5);
-  for (const poke of f.pokes) {
-    assert.match(poke.eventId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-    assert.equal(poke.source, 'notice');
-    assert.equal('messageId' in poke, false);
-    assert.equal('messageSeq' in poke, false);
+test('invalid media and input bounds fail before upload or send', async t => {
+  const f = fixture(t), file = await mediaFixture(t, 'sample.wav');
+  for (const input of [{}, { text: ' ' }, { text: 'x'.repeat(4501) }, { images: [file.path, file.path] }, { text: 'x', replyTo: '' }]) {
+    await assert.rejects(f.transport.send(GROUP, input));
   }
-  f.transport.close();
-  f.socket().receive(pokeNotice());
-  assert.equal(f.pokes.length, 5);
+  await assert.rejects(f.transport.sendMedia(GROUP, { kind: 'voice', path: join(file.root, 'sample.ogg') }), /WAV/);
+  await assert.rejects(f.transport.sendMedia(GROUP, { kind: 'file', path: file.path, fileName: '../file' }), /文件名/);
+  const handle = await open(file.path, 'r+'); try { await handle.truncate(MEDIA_LIMITS.voice + 1); } finally { await handle.close(); }
+  await assert.rejects(f.transport.sendMedia(GROUP, { kind: 'voice', path: file.path }), /20 MiB/);
+  assert.deepEqual(f.uploads, []); assert.deepEqual(f.sends, []);
 });
 
-test('ambiguous private pokes and malformed identities are rejected', () => {
-  for (const changes of [
-    { group_id: 0, target_id: 10002 }, // No sender_id: outgoing and peer self-poke are ambiguous.
-    { group_id: 0, sender_id: 99999 },
-    { group_id: 0, sender_id: 10001, target_id: 99999 },
-    { group_id: 0, user_id: 10001, sender_id: 10001 },
-    { group_id: -1 }, { group_id: 'bad' }, { user_id: 0 }, { target_id: 0 },
-    { self_id: 0 }, { time: Number.NaN }, { notice_type: 'group_recall' }, { post_type: 'message' },
-  ]) assert.equal(normalizePokeEvent(pokeNotice(changes)), undefined);
+test('cancellation during media upload prevents the message from being dispatched', async t => {
+  const f = fixture(t), file = await mediaFixture(t), controller = new AbortController();
+  let finish!: (value: any) => void;
+  f.respondUpload(() => new Promise(resolve => { finish = resolve; }));
+  const sending = f.transport.sendMedia(GROUP, { kind: 'image', path: file.path }, controller.signal);
+  await eventually(() => f.uploads.length === 1); controller.abort(new Error('SECRET_ABORT'));
+  await assert.rejects(sending, /尚未发送/);
+  finish({ file_info: 'late-file', file_uuid: 'late', ttl: 1 }); await delay(5);
+  assert.deepEqual(f.sends, []);
 });
 
-test('poke actions accept null receipts and cache the login account until reconnect', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  f.socket().dataForAction = action => action === 'get_login_info' ? { user_id: 10001 } : null;
-  assert.deepEqual(await f.transport.poke(GROUP, '10003'), { selfId: '10001', userId: '10003' });
-  assert.deepEqual(await f.transport.poke(PRIVATE), { selfId: '10001', userId: '10002' });
-  assert.deepEqual(f.socket().sent.map(packet => [packet.action, packet.params]), [
-    ['get_login_info', {}], ['group_poke', { group_id: 20001, user_id: 10003 }], ['friend_poke', { user_id: 10002 }],
-  ]);
-  const old = f.socket(); old.close(); await f.transport.connect();
-  f.socket().dataForAction = action => action === 'get_login_info' ? { user_id: 10004 } : null;
-  assert.deepEqual(await f.transport.poke(PRIVATE), { selfId: '10004', userId: '10002' });
-  assert.deepEqual(f.socket().sent.map(packet => packet.action), ['get_login_info', 'friend_poke']);
+test('a cancellation or malformed receipt after send dispatch stays unknown and is never replayed', async t => {
+  const f = fixture(t), controller = new AbortController();
+  let finish!: (value: any) => void;
+  f.respondSend(() => new Promise(resolve => { finish = resolve; }));
+  const sending = f.transport.send(GROUP, { text: '一次' }, controller.signal);
+  await eventually(() => f.sends.length === 1); controller.abort();
+  await assert.rejects(sending, /结果未知/);
+  finish({ id: 'late-receipt', timestamp: 0 }); await delay(5);
+  assert.equal(f.sends.length, 1);
+  f.respondSend(async () => ({ id: 123 }));
+  await assert.rejects(f.transport.send(GROUP, { text: '无效回执' }), /回执无效/);
+  assert.equal(f.sends.length, 2);
 });
 
-test('poke validates target scope and temporary limitations before dispatch', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  await assert.rejects(f.transport.poke(GROUP), /指定有效目标/);
-  await assert.rejects(f.transport.poke(GROUP, '0'), /指定有效目标/);
-  await assert.rejects(f.transport.poke(PRIVATE, '10003'), /当前对话/);
-  await assert.rejects(f.transport.poke(TEMPORARY), /临时会话/);
-  assert.equal(f.socket().sent.length, 0);
-  f.socket().receive(event()); // A verified event already identifies the account.
-  f.socket().dataForAction = () => null;
-  await f.transport.poke(PRIVATE, PRIVATE.id);
-  assert.deepEqual(f.socket().sent.map(packet => packet.action), ['friend_poke']);
-});
-
-test('reactions verify the selected group before adding or removing a reaction', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  f.socket().dataForAction = action => action === 'get_login_info' ? { user_id: 10001 }
-    : action === 'get_msg' ? event({ post_type: undefined, self_id: undefined }) : null;
-  await f.transport.react(GROUP, -7, '76');
-  await f.transport.react(GROUP, -7, '76', false);
-  assert.deepEqual(f.socket().sent.filter(packet => packet.action === 'set_msg_emoji_like').map(packet => packet.params), [
-    { message_id: -7, emoji_id: '76', set: true }, { message_id: -7, emoji_id: '76', set: false },
-  ]);
-  f.socket().dataForAction = () => event({ group_id: 20002 });
-  await assert.rejects(f.transport.react(GROUP, -7, '76'), /指定对话/);
-  await assert.rejects(f.transport.react(PRIVATE, -7, '76'), /仅支持.*群聊/);
-  await assert.rejects(f.transport.react(TEMPORARY, -7, '76'), /仅支持.*群聊/);
-  assert.equal(f.socket().sent.filter(packet => packet.action === 'set_msg_emoji_like').length, 2);
-});
-
-test('recall checks the message ID, sender and explicit conversation instead of trusting a numeric ID', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  let record = event({ user_id: 10001, post_type: undefined, self_id: undefined });
-  f.socket().dataForAction = action => action === 'get_login_info' ? { user_id: 10001 } : action === 'get_msg' ? record : null;
-  await f.transport.recall(GROUP, -7);
-  assert.deepEqual(f.socket().sent.at(-1)?.params, { message_id: -7 });
-  record = event({ user_id: 10002 });
-  await assert.rejects(f.transport.recall(GROUP, -7), /只能撤回/);
-  record = event({ user_id: 10001, group_id: 20002 });
-  await assert.rejects(f.transport.recall(GROUP, -7), /指定对话/);
-  record = event({ user_id: 10001, message_id: -8 });
-  await assert.rejects(f.transport.recall(GROUP, -7), /消息 ID/);
-  record = event({ user_id: 10001, sender: { user_id: 10002 } });
-  await assert.rejects(f.transport.recall(GROUP, -7), /发件者/);
-  assert.equal(f.socket().sent.filter(packet => packet.action === 'delete_msg').length, 1);
-});
-
-test('private recall requires the real peer and temporary recall requires its source group', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  let record: Record<string, unknown> = event({ message_type: 'private', sub_type: 'friend', group_id: undefined,
-    user_id: 10001, target_id: 10002, sender: { user_id: 10001 }, self_id: undefined, post_type: undefined });
-  f.socket().dataForAction = action => action === 'get_login_info' ? { user_id: 10001 } : action === 'get_msg' ? record : null;
-  await f.transport.recall(PRIVATE, -7);
-  record = { ...record, target_id: undefined };
-  await assert.rejects(f.transport.recall(PRIVATE, -7), /指定对话/);
-  record = { ...record, target_id: 10003 };
-  await assert.rejects(f.transport.recall(PRIVATE, -7), /指定对话/);
-  record = { ...record, target_id: 10002, sub_type: 'group', sender: { user_id: 10001, group_id: 30001 } };
-  await assert.rejects(f.transport.recall(PRIVATE, -7), /指定对话/);
-  await f.transport.recall(TEMPORARY, -7);
-  record = { ...record, sender: { user_id: 10001, group_id: 30002 } };
-  await assert.rejects(f.transport.recall(TEMPORARY, -7), /指定对话/);
-  assert.equal(f.socket().sent.filter(packet => packet.action === 'delete_msg').length, 2);
-});
-
-test('favorite sticker catalog keeps account sticker IDs and sends with the dedicated action', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  f.socket().dataForAction = action => action === 'fetch_custom_face_detail'
-    ? [{ emoji_id: 'account-complete-id', resId: 'resource', md5: 'a'.repeat(32), desc: '收藏表情', url: 'https://example.com/sticker.gif' }]
-    : { message_id: -42 };
-  assert.deepEqual(await f.transport.listStickers(), [{
-    emojiId: 'account-complete-id', md5: 'a'.repeat(32), description: '收藏表情', url: 'https://example.com/sticker.gif',
-  }]);
-  await f.transport.listStickers(0);
-  assert.deepEqual(f.socket().sent[0].params, { count: 48 });
-  assert.deepEqual(f.socket().sent[1].params, { count: 0 });
-  assert.deepEqual(await f.transport.sendSticker(GROUP, 'account-complete-id', -7), { messageId: '-42' });
-  assert.deepEqual(await f.transport.sendSticker(PRIVATE, 'a'.repeat(32)), { messageId: '-42' });
-  assert.deepEqual(f.socket().sent.slice(2).map(packet => [packet.action, packet.params]), [
-    ['send_custom_face', { emoji_id: 'account-complete-id', group_id: 20001, reply_to: -7 }],
-    ['send_custom_face', { emoji_id: 'a'.repeat(32), user_id: 10002 }],
-  ]);
-  assert.equal(f.socket().sent.some(packet => packet.action === 'send_group_msg' || packet.action === 'send_private_msg'), false);
-});
-
-test('sticker and message action inputs are rejected before network access', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  await assert.rejects(f.transport.listStickers(-1), /non-negative/);
-  await assert.rejects(f.transport.listStickers(1.5), /non-negative/);
-  await assert.rejects(f.transport.sendSticker(TEMPORARY, 'face'), /临时会话/);
-  await assert.rejects(f.transport.sendSticker(GROUP, ''), /Emoji ID/);
-  await assert.rejects(f.transport.sendSticker(GROUP, 'face', 0), /Message ID/);
-  await assert.rejects(f.transport.recall(GROUP, 2 ** 32), /Message ID/);
-  await assert.rejects(f.transport.react(GROUP, -7, '\n'), /Emoji ID/);
-  assert.equal(f.socket().sent.length, 0);
-  f.socket().dataForAction = () => ({ messages: [] });
-  await assert.rejects(f.transport.listStickers(), /invalid sticker list/);
-  f.socket().dataForAction = () => [{ resId: 'incomplete-identity' }];
-  await assert.rejects(f.transport.listStickers(), /Emoji ID/);
-});
-
-test('new mutating actions preserve explicit API failures and do not retry unknown outcomes', async t => {
-  const f = fixture(15); t.after(() => f.transport.close()); await f.transport.connect();
-  f.socket().receive(event());
-  f.socket().response = { status: 'failed', retcode: 1403, data: { message_id: 0 } };
-  await assert.rejects(f.transport.poke(GROUP, '10002'), error => error instanceof OneBotApiError && error.retcode === 1403);
-  f.socket().respond = false;
-  await assert.rejects(f.transport.poke(PRIVATE), /result is unknown/);
-  await assert.rejects(f.transport.sendSticker(GROUP, 'face'), /result is unknown/);
-  assert.deepEqual(f.socket().sent.map(packet => packet.action), ['group_poke', 'friend_poke', 'send_custom_face']);
-});
-
-test('cancellation and session closure prevent actions after read-only scope checks', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  f.socket().receive(event());
-  f.socket().respond = false;
+test('fixed-host REST guards cancellation even after a delayed SDK token refresh', async t => {
+  const f = fixture(t); await f.transport.connect();
+  for (const path of ['https://outside.example', '//outside.example', '/v2/groups/../token', '/bad\\path']) {
+    await assert.rejects(f.transport.request('GET', path), /路径无效/);
+  }
+  assert.deepEqual(await f.transport.request('GET', '/v2/groups/group-openid_A1/members', { cursor: 'opaque', limit: 10 }), { ok: true });
+  assert.deepEqual(f.requests, [{ method: 'GET', path: '/v2/groups/group-openid_A1/members', body: { cursor: 'opaque', limit: 10 } }]);
+  let release!: () => void, tokenWaitStarted = false;
+  const token = new Promise<void>(resolve => { release = resolve; });
+  f.api.post = async (path, body) => { tokenWaitStarted = true; await token; return f.apiClient.request('secret', 'POST', path, body); };
   const controller = new AbortController();
-  const recalling = f.transport.recall(GROUP, -7, controller.signal);
-  await immediate(); controller.abort(new Error('cancelled fixture'));
-  await assert.rejects(recalling, /cancelled fixture/);
-  assert.deepEqual(f.socket().sent.map(packet => packet.action), ['get_msg']);
-  await assert.rejects(f.transport.poke(PRIVATE, undefined, AbortSignal.abort()), /aborted/i);
-  assert.equal(f.socket().sent.length, 1);
-  const pending = f.transport.poke(PRIVATE);
-  await immediate(); f.transport.close();
-  await assert.rejects(pending, /result is unknown/);
-  assert.deepEqual(f.socket().sent.map(packet => packet.action), ['get_msg', 'friend_poke']);
+  const pending = f.transport.request('POST', '/v2/groups/group-openid_A1/messages', { content: 'not dispatched' }, controller.signal);
+  await eventually(() => tokenWaitStarted); controller.abort();
+  await assert.rejects(pending, /结果未知/);
+  release(); await delay(5);
+  assert.equal(f.requests.length, 1, 'late mutation is blocked before SDK HTTP dispatch');
 });
 
-test('a connection change invalidates message ownership checks before recall dispatch', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  f.socket().receive(event());
-  const original = f.client.raw.bind(f.client);
-  f.client.raw = async function <T>(action: string, params = {}, options = {}): Promise<T> {
-    const result = await original<T>(action, params, options);
-    if (action === 'get_msg') {
-      f.socket().close();
-      await f.transport.connect();
+test('official notices preserve raw payloads and interactions only acknowledge protocol receipt', async t => {
+  const f = fixture(t, true, true); await f.transport.connect();
+  const joinRequest = { group_openid: GROUP.id, member_openid: 'applicant', join_request_id: 'request-abc', username: '申请人',
+    apply_at: '2026-10-28T08:00:00+08:00', verify_info: { method: 'admin_review_qa', review_qa_list: [{ question: '问题', answer: '答案' }] } };
+  await f.emit('rawEvent', { eventType: 'GROUP_JOIN_REQUEST', data: joinRequest });
+  await f.emit('rawEvent', { eventType: 'GROUP_JOIN_REQUEST', data: joinRequest });
+  assert.equal(f.messages[0]!.messageId, f.messages[1]!.messageId);
+  assert.match(f.messages[0]!.messageId, /^event:GROUP_JOIN_REQUEST:/);
+  assert.deepEqual(f.messages[0]!.raw, joinRequest);
+  const added = { group_openid: GROUP.id, member_openid: 'member', timestamp: 1793145600 };
+  const first = normalizePlatformEvent('GROUP_MEMBER_ADD', added, '123456789')!;
+  const second = normalizePlatformEvent('GROUP_MEMBER_ADD', added, '123456789')!;
+  assert.notEqual(first.messageId, second.messageId, 'without a platform id every delivered notice is retained');
+  await f.emit('interaction', {}, { id: 'interaction-1', scene: 'group', group_openid: GROUP.id, user_openid: PRIVATE.id, data: { resolved: { button_data: 'untrusted' } } });
+  assert.equal(f.messages.at(-1)!.eventType, 'INTERACTION_CREATE');
+  assert.equal(normalizePlatformEvent('GROUP_JOIN_REQUEST', { join_request_id: 'request' }, '123456789'), undefined);
+  assert.equal(normalizePlatformEvent('INTERACTION_CREATE', { id: 'i', user_openid: PRIVATE.id }, '123456789'), undefined);
+  await f.emit('interaction', {}, { id: 'interaction-ignored', scene: 'unknown', user_openid: PRIVATE.id, data: { resolved: { button_data: 'do not execute' } } });
+  assert.deepEqual(f.sends, []);
+  assert.deepEqual(f.requests, [
+    { method: 'PUT', path: '/interactions/interaction-1', body: { code: 0 } },
+    { method: 'PUT', path: '/interactions/interaction-ignored', body: { code: 3 } },
+  ]);
+});
+
+test('HTTP 200 business failures remain failures and documented empty 204 responses succeed', async t => {
+  const f = fixture(t); await f.transport.connect();
+  for (const body of [{ code: 11253, message: 'SECRET_AUTH' }, { code: 0, err_code: 11282, message: 'SECRET_AUTH' }]) {
+    f.api.post = async () => body as any;
+    await assert.rejects(f.transport.request('POST', '/v2/groups/group-openid_A1/test', {}), error => {
+      assert.ok(error instanceof QQBotApiError); assert.equal(error.httpStatus, 200); assert.equal(error.resultUnknown, false);
+      assert.ok([11253, 11282].includes(error.bizCode!)); assert.doesNotMatch(error.message, /SECRET_AUTH/); return true;
+    });
+    f.respondSend(async () => body);
+    await assert.rejects(f.transport.send(GROUP, { text: '业务失败' }), QQBotApiError);
+  }
+  f.api.delete = async () => { throw new ApiError('JSON parse failed on empty body', 204, '/v2/groups/group-openid_A1/messages/id'); };
+  assert.equal(await f.transport.request('DELETE', '/v2/groups/group-openid_A1/messages/id'), null);
+});
+
+test('real SDK requests accept only documented empty 200 results without hiding malformed or rejected responses', async t => {
+  let response = () => new Response('', { status: 200 });
+  const f = wireFixture(t, () => response());
+  const bareSdk = new QQBot({ appId: '123456789', appSecret: 'MOCK_APP_SECRET',
+    baseUrl: 'https://api.bot.qq.com', tokenBaseUrl: 'https://bots.qq.com' });
+  t.after(() => bareSdk.stop());
+  await assert.rejects(bareSdk.api.delete('/v2/groups/group/messages/message'), error => error instanceof ApiError && error.httpStatus === 200);
+  for (const [method, path] of [
+    ['DELETE', '/v2/groups/group/messages/message'], ['DELETE', '/v2/users/user/messages/message'],
+    ['DELETE', '/v2/groups/join_approval_strategy/strategy'], ['POST', '/v2/groups/join_approval_strategy/strategy/execute'],
+  ] as const) {
+    const before = f.wire.filter(item => item.url.startsWith('https://api.bot.qq.com')).length;
+    assert.equal(await f.transport.request(method, path, method === 'POST' ? {} : undefined), null);
+    assert.equal(f.wire.filter(item => item.url.startsWith('https://api.bot.qq.com')).length, before + 1, 'one request and no retry');
+    assert.equal(f.wire.at(-1)!.headers.get('authorization'), 'QQBot MOCK_ACCESS_TOKEN');
+  }
+  await assert.rejects(f.transport.request('DELETE', '/v2/groups/group/unlisted'), QQBotApiError);
+  for (const body of ['broken JSON', '<html>upstream failure</html>', ' ']) {
+    response = () => new Response(body, { status: 200 });
+    await assert.rejects(f.transport.request('DELETE', '/v2/users/user/messages/message'), error => error instanceof QQBotApiError && error.resultUnknown);
+  }
+  for (const body of [{ code: 11253, message: 'PRIVATE_ERROR' }, { code: 0, err_code: 11282, message: 'PRIVATE_ERROR' }]) {
+    response = () => Response.json(body);
+    await assert.rejects(f.transport.request('DELETE', '/v2/groups/group/messages/message'), error => {
+      assert.ok(error instanceof QQBotApiError); assert.equal(error.resultUnknown, false);
+      assert.ok([11253, 11282].includes(error.bizCode!)); assert.doesNotMatch(error.message, /PRIVATE_ERROR/); return true;
+    });
+  }
+  response = () => new Response('', { status: 403 });
+  await assert.rejects(f.transport.request('DELETE', '/v2/groups/group/messages/message'), error => error instanceof QQBotApiError && error.httpStatus === 403 && !error.resultUnknown);
+  response = () => new Response(null, { status: 204 });
+  assert.equal(await f.transport.request('DELETE', '/v2/users/user/messages/message'), null);
+});
+
+test('real SDK binary and chunk completion uploads include the required filename on the wire', async t => {
+  let messageNumber = 0;
+  const f = wireFixture(t, (path, body) => {
+    if (path.endsWith('/upload_prepare')) return Response.json({ upload_id: 'mock-upload-id', block_size: 5 * 1024 * 1024, parts: [] });
+    if (path.endsWith('/files')) {
+      assert.equal(typeof body.file_name, 'string');
+      assert.ok(typeof body.file_data === 'string' || body.upload_id === 'mock-upload-id');
+      return Response.json({ file_uuid: 'mock-file', file_info: 'MOCK_FILE_INFO', ttl: 3600 });
     }
-    return result;
-  };
-  const old = f.socket();
-  old.dataForAction = () => event({ user_id: 10001 });
-  await assert.rejects(f.transport.recall(GROUP, -7), /连接已变化/);
-  assert.deepEqual(old.sent.map(packet => packet.action), ['get_msg']);
-  assert.equal(f.socket().sent.length, 0);
-});
-
-test('group AI speech uses native voice actions and unsupported conversations fail locally', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  f.socket().dataForAction = action => action === 'get_ai_characters'
-    ? [{ type: '经典', characters: [{ character_id: 'voice-1', character_name: '示例音色' }] }]
-    : { message_id: -77 };
-  assert.deepEqual(await f.transport.getVoices(GROUP), [{ type: '经典', characters: [{ id: 'voice-1', name: '示例音色' }] }]);
-  assert.deepEqual(await f.transport.speak(GROUP, '晚上好。', 'voice-1'), { messageId: '-77' });
-  await assert.rejects(f.transport.getVoices(PRIVATE), /仅支持群聊/);
-  await assert.rejects(f.transport.speak(TEMPORARY, 'hello', 'voice-1'), /仅支持群聊/);
-  await assert.rejects(f.transport.speak(GROUP, ' ', 'voice-1'), /非空文字/);
-  assert.deepEqual(f.socket().sent.map(packet => [packet.action, packet.params]), [
-    ['get_ai_characters', { group_id: 20001 }],
-    ['send_group_ai_record', { group_id: 20001, character: 'voice-1', text: '晚上好。' }],
-  ]);
-});
-
-test('QQ transcription first proves the conversation and verifies a real voice segment', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  let record: Record<string, unknown> = event({ message: [{ type: 'record', data: { file: 'voice.amr' } }] });
-  f.socket().dataForAction = action => action === 'get_login_info' ? { user_id: 10001 }
-    : action === 'get_msg' ? record : { text: '语音识别内容' };
-  assert.deepEqual(await f.transport.transcribe(GROUP, -7), { text: '语音识别内容' });
-  assert.deepEqual(f.socket().sent.map(packet => packet.action), ['get_login_info', 'get_msg', 'fetch_ptt_text']);
-  record = event({ group_id: 20002, message: [{ type: 'record', data: { file: 'voice.amr' } }] });
-  await assert.rejects(f.transport.transcribe(GROUP, -7), /指定对话/);
-  record = event();
-  await assert.rejects(f.transport.transcribe(GROUP, -7), /不包含 QQ 语音/);
-  record = event({ message_type: 'private', sub_type: 'friend', group_id: undefined,
-    message: [{ type: 'record', data: { file: 'private.amr' } }] });
-  assert.deepEqual(await f.transport.transcribe(PRIVATE, -7), { text: '语音识别内容' });
-  record = { ...record, sub_type: 'group', sender: { group_id: 30001 } };
-  await assert.rejects(f.transport.transcribe(PRIVATE, -7), /指定对话/);
-  assert.deepEqual(await f.transport.transcribe(TEMPORARY, -7), { text: '语音识别内容' });
-  assert.equal(f.socket().sent.filter(packet => packet.action === 'fetch_ptt_text').length, 3);
-});
-
-test('AI voice cancellation, API failures and missing receipts do not trigger another send', async t => {
-  const f = fixture(15); t.after(() => f.transport.close()); await f.transport.connect();
-  await assert.rejects(f.transport.speak(GROUP, 'hello', 'voice-1', AbortSignal.abort()), /aborted/i);
-  f.socket().response = { status: 'failed', retcode: 1403, data: { message_id: 0 } };
-  await assert.rejects(f.transport.speak(GROUP, 'hello', 'voice-1'), error => error instanceof OneBotApiError);
-  f.socket().respond = false;
-  await assert.rejects(f.transport.speak(GROUP, 'hello', 'voice-1'), /result is unknown/);
-  assert.deepEqual(f.socket().sent.map(packet => packet.action), ['send_group_ai_record', 'send_group_ai_record']);
-});
-
-test('local voice files use one record segment with explicit group, private and temporary routing', async t => {
-  const f = fixture(); t.after(() => f.transport.close());
-  const directory = await mkdtemp(join(tmpdir(), 'piq-record-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const path = join(directory, 'speech.wav');
-  const bytes = Buffer.from([82, 73, 70, 70, 0, 1, 2, 255]);
-  await writeFile(path, bytes);
-  const message = [{ type: 'record', data: { file: `base64://${bytes.toString('base64')}` } }];
-  assert.deepEqual(await f.transport.sendRecord(GROUP, path), { messageId: '-42' });
-  assert.deepEqual(await f.transport.sendRecord(PRIVATE, path), { messageId: '-42' });
-  assert.deepEqual(await f.transport.sendRecord(TEMPORARY, path), { messageId: '-42' });
-  assert.deepEqual(f.socket().sent.map(packet => [packet.action, packet.params]), [
-    ['send_group_msg', { group_id: 20001, message }],
-    ['send_private_msg', { user_id: 10002, message }],
-    ['send_private_msg', { user_id: 10002, group_id: 30001, message }],
-  ]);
-  assert.equal(f.socket().sent.some(packet => JSON.stringify(packet.params).includes(path)), false);
-});
-
-test('invalid, empty and oversized audio sources fail before any network action', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  const directory = await mkdtemp(join(tmpdir(), 'piq-record-inputs-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  for (const file of ['https://example.test/voice.wav', 'file:///voice.wav', 'base64://abcd', 'data:audio/wav;base64,abcd', '']) {
-    await assert.rejects(f.transport.sendRecord(GROUP, file), /本地音频文件/);
+    assert.ok(path.endsWith('/messages'));
+    return Response.json({ id: `mock-message-${++messageNumber}`, timestamp: '2026-10-28T08:00:00+08:00' });
+  });
+  const file = await mediaFixture(t);
+  for (const [kind, extension, target] of [['image', '.png', GROUP], ['voice', '.wav', PRIVATE], ['video', '.mp4', GROUP], ['file', '.pdf', PRIVATE]] as const) {
+    const path = join(file.root, `local${extension}`); await writeFile(path, `synthetic-${kind}`);
+    await f.transport.sendMedia(target, { kind, path, fileName: `sent${extension}`, text: '说明' });
+    const upload = f.wire.filter(item => item.url.endsWith('/files')).at(-1)!;
+    assert.equal(upload.body.file_name, `sent${extension}`);
+    assert.equal(upload.body.srv_send_msg, false);
   }
-  await assert.rejects(f.transport.sendRecord(GROUP, join(directory, 'missing.wav')), /ENOENT/);
-  await assert.rejects(f.transport.sendRecord(GROUP, directory));
-  const empty = join(directory, 'empty.wav'); await writeFile(empty, '');
-  await assert.rejects(f.transport.sendRecord(GROUP, empty), /不能为空/);
-  const large = join(directory, 'large.wav');
-  const handle = await open(large, 'w');
-  try { await handle.truncate(32 * 1024 * 1024 + 1); } finally { await handle.close(); }
-  await assert.rejects(f.transport.sendRecord(GROUP, large), /32 MiB/);
-  assert.equal(f.socket().sent.length, 0);
-});
-
-test('audio cancellation and session closure while opening a file never dispatch or reconnect', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  const directory = await mkdtemp(join(tmpdir(), 'piq-record-cancel-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const path = join(directory, 'speech.wav'); await writeFile(path, 'audio-bytes');
-  await assert.rejects(f.transport.sendRecord(GROUP, path, AbortSignal.abort()), /aborted/i);
-  const caller = new AbortController();
-  const cancelled = f.transport.sendRecord(GROUP, path, caller.signal);
-  caller.abort(new Error('record cancelled by caller'));
-  await assert.rejects(cancelled, /record cancelled by caller/);
-  const sockets = FakeWebSocket.instances.length;
-  const closing = f.transport.sendRecord(GROUP, path);
-  f.transport.close();
-  await assert.rejects(closing, /closed/);
-  assert.equal(FakeWebSocket.instances.length, sockets);
-  assert.equal(f.socket().sent.length, 0);
-});
-
-test('audio send timeouts and invalid receipts remain unknown without replaying', async t => {
-  const f = fixture(15); t.after(() => f.transport.close()); await f.transport.connect();
-  const directory = await mkdtemp(join(tmpdir(), 'piq-record-receipt-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const path = join(directory, 'speech.wav'); await writeFile(path, 'audio-bytes');
-  f.socket().respond = false;
-  await assert.rejects(f.transport.sendRecord(GROUP, path), /result is unknown/);
-  assert.equal(f.socket().sent.length, 1);
-  f.socket().respond = true;
-  for (const receipt of [null, {}, { message_id: 0 }, { message_id: 2_147_483_648 }]) {
-    f.socket().dataForAction = () => receipt;
-    await assert.rejects(f.transport.sendRecord(PRIVATE, path), /result is unknown/);
-  }
-  assert.equal(f.socket().sent.length, 5);
-  f.socket().response = { status: 'failed', retcode: 403, data: { message_id: 0 } };
-  await assert.rejects(f.transport.sendRecord(GROUP, path), error => error instanceof OneBotApiError && error.retcode === 403);
-  assert.equal(f.socket().sent.length, 6);
-});
-
-test('a dropped audio receipt is never resent after reconnect', async t => {
-  const f = fixture(); t.after(() => f.transport.close()); await f.transport.connect();
-  const directory = await mkdtemp(join(tmpdir(), 'piq-record-disconnect-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const path = join(directory, 'speech.wav'); await writeFile(path, 'audio-bytes');
-  const old = f.socket(); old.respond = false;
-  const sending = f.transport.sendRecord(GROUP, path);
-  const deadline = Date.now() + 1000;
-  while (!old.sent.length && Date.now() < deadline) await delay(5);
-  assert.equal(old.sent.length, 1);
-  old.close();
-  await assert.rejects(sending, /result is unknown/);
-  await f.transport.connect();
-  assert.notEqual(f.socket(), old);
-  assert.equal(f.socket().sent.length, 0);
+  const largePath = join(file.root, 'large.mp4');
+  const handle = await open(largePath, 'w'); try { await handle.truncate(6 * 1024 * 1024); } finally { await handle.close(); }
+  await f.transport.sendMedia(GROUP, { kind: 'video', path: largePath, fileName: 'large-sent.mp4' });
+  const complete = f.wire.filter(item => item.url.endsWith('/files')).at(-1)!;
+  assert.deepEqual(complete.body, { upload_id: 'mock-upload-id', file_name: 'large-sent.mp4' });
+  assert.equal(f.wire.filter(item => item.url.endsWith('/messages')).length, 5);
 });

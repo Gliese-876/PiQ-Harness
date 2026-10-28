@@ -8,7 +8,7 @@ export type RunAction = 'pause' | 'resume' | 'shutdown' | 'handoff';
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'error';
 export interface RuntimeStatus {
   pid: number;
-  mode: 'background' | 'terminal';
+  mode: 'terminal';
   paused: boolean;
   connection: ConnectionState;
   pendingCount: number;
@@ -75,7 +75,7 @@ export async function readRuntimeStatus(cwd: string): Promise<RuntimeStatus | nu
     if (!item || typeof item !== 'object' || !('key' in item) || !('count' in item) || !Number.isSafeInteger(item.count) || Number(item.count)<0) return false;
     try { parseConversationKey(item.key); return true; } catch { return false; }
   }).map((item:{key:string;count:number})=>({key:item.key,count:item.count})) : [];
-  return { pid: lock.pid, mode: status.mode === 'background' ? 'background' : 'terminal', paused: status.paused,
+  return { pid: lock.pid, mode: 'terminal', paused: status.paused,
     connection: status.connection, pendingCount: Number(status.pendingCount) || 0, pendingConversations, updatedAt: Number(status.updatedAt),
     requestId: typeof status.requestId === 'string' ? status.requestId : undefined,
     lastError: typeof status.lastError === 'string' ? status.lastError : undefined };
@@ -211,7 +211,7 @@ export class RunController {
 
   private async publish(): Promise<void> {
     const values = { version: 1, ownerToken: this.lock.token, pid: this.lock.pid,
-      mode: process.env.PIQ_RUN_MODE === 'background' ? 'background' : 'terminal',
+      mode: 'terminal',
       paused: this.paused, ...this.callbacks.snapshot(), requestId: this.lastRequest };
     const serialized = JSON.stringify(values);
     if (serialized === this.lastSerialized) return;

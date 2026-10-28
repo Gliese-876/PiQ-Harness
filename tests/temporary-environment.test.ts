@@ -12,7 +12,7 @@ const parentTemporaryValues = () => Object.fromEntries(temporaryKeys(process.env
 async function fixture(t: TestContext) {
   const parent = resolve('.test-tmp'); await mkdir(parent, { recursive: true });
   const root = await mkdtemp(join(parent, 'temporary-environment-'));
-  const cwd = await initializeGroup(root, 'friends', { name: 'Friends', conversations: [{ type: 'group', id: '123456' }] });
+  const cwd = await initializeGroup(root, 'friends', { name: 'Friends', conversations: [{ type: 'group', id: 'opaque-group_123456' }] });
   const fakeEntry = join(root, 'fake-pi.mjs');
   await writeFile(fakeEntry, [
     "import { writeFile } from 'node:fs/promises';",
@@ -31,7 +31,7 @@ async function fixture(t: TestContext) {
     if (!resolve(root).startsWith(parent + sep)) throw new Error('Temporary cleanup must stay in the test directory.');
     await rm(root, { recursive: true, force: true });
   });
-  const env = { PIQ_PI_ENTRY: fakeEntry, SNOWLUMA_ACCESS_TOKEN: 'synthetic-test-token', Temp: 'old-temp', tMp: 'old-tmp', tmpDIR: 'old-tmpdir' };
+  const env = { PIQ_PI_ENTRY: fakeEntry, QQBOT_APP_ID: 'synthetic-app-id', QQBOT_APP_SECRET: 'synthetic-test-secret', Temp: 'old-temp', tMp: 'old-tmp', tmpDIR: 'old-tmpdir' };
   return { root, cwd, fakeEntry, env, links, temporary: join(cwd, '.tmp') };
 }
 
