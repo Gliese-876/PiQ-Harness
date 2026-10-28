@@ -300,8 +300,11 @@ export class QQBotTransport {
         try { await options.onMessage(event); code = 0; }
         catch { this.report(new TransportError('QQ 互动事件已收到，但本地记录失败。')); }
       }
-      // This only confirms protocol delivery, never evaluates or executes button_data.
-      if (!this.closed && id(data.id)) {
+      // QQ requires replies only for buttons and menus. Other types include
+      // authorization queries and clear-session notices; acknowledging those
+      // can falsely confirm an action we have not performed.
+      // Never evaluate or execute button_data.
+      if (!this.closed && (data.type === 11 || data.type === 12) && id(data.id)) {
         try { await this.request('PUT', `/interactions/${encodeURIComponent(data.id)}`, { code }); }
         catch { if (!this.closed) this.report(new TransportError('QQ 互动事件的平台接收确认失败；未自动重试。')); }
       }

@@ -301,16 +301,32 @@ test('official notices preserve raw payloads and interactions only acknowledge p
   const first = normalizePlatformEvent('GROUP_MEMBER_ADD', added, '123456789')!;
   const second = normalizePlatformEvent('GROUP_MEMBER_ADD', added, '123456789')!;
   assert.notEqual(first.messageId, second.messageId, 'without a platform id every delivered notice is retained');
-  await f.emit('interaction', {}, { id: 'interaction-1', scene: 'group', group_openid: GROUP.id, user_openid: PRIVATE.id, data: { resolved: { button_data: 'untrusted' } } });
+  await f.emit('interaction', {}, { id: 'interaction-1', type: 11, scene: 'group', group_openid: GROUP.id, user_openid: PRIVATE.id, data: { resolved: { button_data: 'untrusted' } } });
   assert.equal(f.messages.at(-1)!.eventType, 'INTERACTION_CREATE');
+  await f.emit('interaction', {}, { id: 'menu-1', type: 12, scene: 'c2c', user_openid: PRIVATE.id, data: { resolved: { feature_id: 'untrusted-menu' } } });
   assert.equal(normalizePlatformEvent('GROUP_JOIN_REQUEST', { join_request_id: 'request' }, '123456789'), undefined);
   assert.equal(normalizePlatformEvent('INTERACTION_CREATE', { id: 'i', user_openid: PRIVATE.id }, '123456789'), undefined);
-  await f.emit('interaction', {}, { id: 'interaction-ignored', scene: 'unknown', user_openid: PRIVATE.id, data: { resolved: { button_data: 'do not execute' } } });
+  await f.emit('interaction', {}, { id: 'interaction-ignored', type: 11, scene: 'unknown', user_openid: PRIVATE.id, data: { resolved: { button_data: 'do not execute' } } });
   assert.deepEqual(f.sends, []);
   assert.deepEqual(f.requests, [
     { method: 'PUT', path: '/interactions/interaction-1', body: { code: 0 } },
+    { method: 'PUT', path: '/interactions/menu-1', body: { code: 0 } },
     { method: 'PUT', path: '/interactions/interaction-ignored', body: { code: 3 } },
   ]);
+});
+
+test('authorization and clear-session notices are retained without confirming an unperformed action', async t => {
+  const f = fixture(t); await f.transport.connect();
+  const types = [13, 14, 15, 16, 18, 19, 20, 999, undefined];
+  for (const [index, type] of types.entries()) {
+    const notice = { id: `notice-${index}`, ...(type === undefined ? {} : { type }), scene: 'group', group_openid: GROUP.id,
+      data: { type: type === 20 ? 2001 : type, resolved: {} } };
+    await f.emit('interaction', {}, notice);
+    assert.deepEqual(f.messages.at(-1)!.raw, notice);
+  }
+  assert.equal(f.messages.length, types.length);
+  assert.deepEqual(f.requests, [], 'no acknowledgement that could report a clear-session or authorization operation as completed');
+  assert.deepEqual(f.sends, []);
 });
 
 test('HTTP 200 business failures remain failures and documented empty 204 responses succeed', async t => {
