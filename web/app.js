@@ -755,6 +755,11 @@ function updateCredentialControls() {
   $('save-credentials').disabled = disabled || state.busy || !credentialsDirty(); $('refresh-credentials').disabled = disabled;
   $('qq-app-id').disabled = disabled; $('qq-app-secret').disabled = disabled;
   $('save-credentials').textContent = state.credentialPending ? '正在处理…' : '保存机器人配置';
+  const previousAccountId = state.detail?.credential?.boundAppId || state.credentialAppId;
+  const replacing = !!previousAccountId && $('qq-app-id').value.trim() !== previousAccountId;
+  $('qq-app-secret').placeholder = replacing ? '填写新机器人的 AppSecret' : state.detail?.credential?.hasSecret ? '已保存；留空保留现有 AppSecret' : '填写 AppSecret';
+  $('credential-source').textContent = replacing ? '更换 AppID 时请填写新机器人的 AppSecret，保存时确认归档旧账号记录。'
+    : state.detail?.credential?.hasSecret ? 'AppSecret 已保存，留空即可保留。修改后请重开本组 Pi 终端。' : '填写 AppID 和 AppSecret 后保存到本机，密码框会清空。';
   if (!state.credentialPending && credentialsDirty() && $('credential-feedback').dataset.status !== 'error') credentialFeedback('修改尚未保存。');
 }
 
