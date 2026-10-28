@@ -1,12 +1,12 @@
 # PiQ Harness
 
-让 Pi 通过腾讯官方 QQBot 接口参与对话，在本地工作台管理会话、人设、记忆和资料。
+让 Pi 通过腾讯官方 QQBot 接口参与对话，在工作台管理会话、人设、记忆和资料。
 
 **一个对话组对应一个 Pi 会话。** 同组可以包含多个机器人群聊和机器人私聊，共用上下文与记忆，各自保存聊天日志。PiQ 先保存平台消息，再通知 Pi 哪些对话有更新；Pi 自主决定读取、回应或整理记忆。只有显式调用发送工具，内容才会发到 QQ。
 
 **同一个 AppID 同时只允许一个活动 PiQ 对话组。** 将这个机器人的多个群聊和私聊放进同一个组；需要多个组同时在线时，分别使用不同的机器人 AppID。PiQ 使用操作系统级占用检查，避免多个 SDK 实例争用同一机器人的连接。
 
-QQ 接入使用腾讯官方 **[`@tencent-connect/qqbot-nodejs@1.0.5`](https://github.com/tencent-connect/qqbot-nodejs)**。Windows 工作台可直接填写 AppID 和 AppSecret，凭据保存到当前用户的环境变量，AppSecret 保存后不回显。当前版本使用 QQ 开放平台机器人身份，接收文字、图片、语音、视频、文件、卡片、引用和聊天记录等平台消息结构；发送及管理操作按具体接口和机器人权限执行。
+QQ 接入使用腾讯官方 **[`@tencent-connect/qqbot-nodejs@1.0.5`](https://github.com/tencent-connect/qqbot-nodejs)**。Windows 工作台可直接填写 AppID 和 AppSecret，凭据保存到 Windows 用户环境变量，AppSecret 保存后不回显。当前版本使用 QQ 开放平台机器人身份，接收文字、图片、语音、视频、文件、卡片、引用和聊天记录等平台消息结构；发送及管理操作按具体接口和机器人权限执行。
 
 - **终端运行**：工作台打开 Pi 终端，关闭终端即停止；需要批准的工具调用在终端确认。
 - **对话组管理**：创建、重命名、移入回收站和恢复；可重开空上下文，保留资料与历史文件。
@@ -22,7 +22,7 @@ QQ 接入使用腾讯官方 **[`@tencent-connect/qqbot-nodejs@1.0.5`](https://gi
 | 组件 | 要求 |
 | --- | --- |
 | Node.js | 24 系列至少 `24.22.1`，或 `26.12.1` 及以上；以 [package.json](package.json) 为准 |
-| Pi Coding Agent | 使用和验证的版本为 `1.4.0`；先完成模型认证与选择 |
+| Pi Coding Agent | `1.4.0`；先完成模型认证与选择 |
 | QQ 开放平台机器人 | 已取得 AppID、AppSecret，并完成目标会话所需的平台配置与授权 |
 | Windows | 当前机器人凭据的保存与读取使用 Windows 用户环境变量 |
 | Windows Terminal | 工作台打开 Pi 终端需要 `wt.exe` |
@@ -41,10 +41,10 @@ pi
 在 [QQ 开放平台](https://bot.qq.com/)创建机器人，取得 AppID 和 AppSecret。按[官方接入指引](https://bot.qq.com/wiki/)检查以下设置：
 
 1. 创建过程如出现“设置 AI 服务”，可以选择“稍后连接”，由 PiQ 提供模型与回复逻辑。
-2. 在“开发基础设置”的“事件订阅与回调地址”中选择 **WebSocket**。这种连接方式适合本机运行，无需配置公网回调服务器。
+2. 在“开发基础设置”的“事件订阅与回调地址”中选择 **WebSocket**，无需配置公网回调服务器。
 3. 按实际使用范围设置机器人服务范围。测试时，将自己的 QQ 加入“内部体验号码”，再按平台页面指引把机器人加入测试群或打开机器人私聊。
 
-服务范围、事件订阅和消息权限以当前平台页面为准。AppSecret 在下面的本机工作台密码输入框中填写。
+服务范围、事件订阅和消息权限以当前平台页面为准。AppSecret 在工作台的密码输入框中填写。
 
 ### 3. 启动工作台并配置机器人
 
@@ -55,11 +55,11 @@ npm ci
 npm run web
 ```
 
-打开 [http://127.0.0.1:3210](http://127.0.0.1:3210)。工作台只监听本机回环地址，官方 SDK 随项目依赖安装。
+打开 [http://127.0.0.1:3210](http://127.0.0.1:3210)。工作台只监听回环地址，官方 SDK 随项目依赖安装。
 
 1. 点击“新建对话组”，填写名称，先创建空组。
 2. 打开本组“连接设置”，填写 AppID，在 AppSecret 密码框中输入密钥，然后保存。
-3. 检查工作台显示的凭据状态。凭据按本组目录保存在当前 Windows 用户的环境变量中；AppSecret 永不回显，也不写入项目凭据文件、`PIQ.md`、日志或接口响应。
+3. 检查工作台显示的凭据状态。凭据按对话组保存到 Windows 用户环境变量；AppSecret 永不回显，也不写入项目凭据文件、`PIQ.md`、日志或接口响应。
 
 首次保存须填写 AppID 和 AppSecret。再次配置同一 AppID 时，AppSecret 留空可保留此前在工作台为本组保存的值。已有记录的组绑定了机器人 AppID，更换机器人应新建组。机器人凭据统一通过 Windows 工作台配置，当前不提供其他操作系统的凭据配置入口。
 
@@ -67,7 +67,7 @@ npm run web
 
 1. 点击“发现对话”，临时连接机器人并等待平台事件。
 2. 在获准的测试群中 @ 机器人，或给机器人发一条私聊消息。工作台显示收到的对话，点选后加入本组；发现过程不自动回复。
-3. 填写本组 `PERSONA.md`、`AGENTS.md`，选择模型，然后“打开 Pi 终端”。首次运行由本机操作者确认信任本组资源。
+3. 填写本组 `PERSONA.md`、`AGENTS.md`，选择模型，然后“打开 Pi 终端”。首次运行时确认本组资源的信任提示。
 
 工作台打开 Pi 前会自动结束发现，也可以手动“结束发现”。同一 AppID 的发现和 Pi 运行共用连接占用；已有 Pi 运行时，先停止它再发现新对话。
 
@@ -103,7 +103,7 @@ OpenID 属于机器人所在的平台应用上下文，应与本组配置的 App
 | 生图、参考图编辑 | `@buyong/pi-codex-image-gen` | 完成订阅登录；结果复制到本组 `assets/images/` 后显式发送 |
 | 语音回复 | `mimo-v2-5-tts` 技能 | 凭据使用环境变量；音频保存到本组，再用 `qq_send_file` 发送 |
 
-在需要这些能力的本组目录中安装已核对的示例版本：
+在对话组目录中按需安装以下扩展，版本号为固定示例：
 
 ```powershell
 pi install -l npm:@gotgenes/pi-permission-system@40.3.0
@@ -116,15 +116,15 @@ pi install -l npm:@buyong/pi-codex-image-gen@0.3.1
 
 安装后还需放置权限配置、合并本组 Pi 设置，并重新打开终端。完整步骤见 **[可选扩展配置指南](docs/optional-integrations.md)**；基础组合从 [Pi 设置示例](examples/integrations/pi-settings.example.json)开始。
 
-常规读取优先使用 Pi 原生工具：`read` 查看文件、`ls` 列目录、`find` 找文件、`grep` 搜索内容。这些读取已在示例中允许，不必为读日志反复请求 PowerShell 批准。任意命令仍按整条命令批准；Windows 沙箱的实际范围与已知限制见配置指南。
+常规读取优先使用 Pi 原生工具：`read` 查看文件、`ls` 列目录、`find` 找文件、`grep` 搜索内容。权限示例允许上述读取工具；命令执行仍按整条命令批准。Windows 沙箱的范围与限制见配置指南。
 
 `pi-web-access` 的保守示例启用 `web_search`、`fetch_content`、`get_search_content`。它直接管理自身缓存，内部文件操作不会自动经过 yuru7 接管的命令工具。配置作用域和 [web-search.json 示例](examples/integrations/web-search.example.json)见[联网配置](docs/optional-integrations.md#pi-web-access)。
 
-[`@buyong/pi-codex-image-gen`](https://github.com/buYoung/pi-packages/tree/main/apps/pi-codex-image-gen) 提供 `image_gen` 工具与 `imagegen` 技能。按上游说明，在 Pi 中使用 `/login openai-codex` 完成可用的 ChatGPT Plus/Pro 订阅登录，聊天模型可以保持原配置；API key 不能代替该项登录。已有全局包或本地适配器提供 `image_gen` 时复用现有入口，避免重复启用。
+[`@buyong/pi-codex-image-gen`](https://github.com/buYoung/pi-packages/tree/main/apps/pi-codex-image-gen) 提供 `image_gen` 工具与 `imagegen` 技能。按上游说明，在 Pi 中使用 `/login openai-codex` 完成可用的 ChatGPT Plus/Pro 订阅登录，聊天模型可以保持原配置；API key 不能代替该项登录。已有扩展提供 `image_gen` 时复用现有入口，避免重复启用。
 
 `0.3.1` 尝试把 PNG 保存到 `<agentDir>/generated_images/<sessionId>/<toolCallId>.png`，成功路径位于 `details.savedPath`。将确认已保存的文件复制到本组 `assets/images/` 后，使用 `qq_send` 的 `images` 或 `qq_send_file` 的 `kind: "image"` 显式发送。插件自己的保存不自动经过命令沙箱，保持生图工具审批。
 
-MiMo 沿用主人安装的技能，`MIMO_API_KEY` 从启动环境取得。将音频输出到本组 `assets/voices/`，然后使用：
+安装 `mimo-v2-5-tts` 技能，并通过环境变量提供 `MIMO_API_KEY`。将音频输出到本组 `assets/voices/`，然后使用：
 
 ```json
 {"conversation":"group:GROUP_OPENID","kind":"voice","path":"assets/voices/reply.wav","replyTo":"PLATFORM_MESSAGE_ID"}
@@ -247,7 +247,7 @@ SDK 负责平台连接与重连；PiQ 的本地持久记录用于查询已收到
 
 当前正式会话范围是官方机器人群聊与机器人私聊，不接管个人 QQ 账号，也不沿用旧群临时私聊或 OneBot 协议。官方 `message_type=102` 聊天记录从当前收到的事件中读取，与云端离线历史补拉分别处理。频道接口不作为群聊接口使用；本版也不会把仅支持频道的表情反应暴露为群聊工具。
 
-群管理工具始终指定本组内的目标群。部分查询需要平台能力白名单，成员移除、禁言、黑名单和审批还需要对应管理授权；先查询再明确操作，结果未确认时不要自动重试。可选权限配置默认对这些新增操作询问本机操作者。
+群管理工具始终指定本组内的目标群。部分查询需要平台能力白名单，成员移除、禁言、黑名单和审批还需要对应管理授权；先查询再明确操作，结果未确认时不要自动重试。可选权限配置默认要求操作者批准这些新增操作。
 
 入群自动审批策略只管理明确单独关联当前群的条目。创建时固定目标群，后续修改前重新核验；不允许借当前群操作跨群策略。该策略白名单按平台接口使用 QQ 号码字符串，其他会话和成员参数仍使用 OpenID。
 
