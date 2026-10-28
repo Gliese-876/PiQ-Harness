@@ -9,7 +9,7 @@ PiQ 通过公开 OneBot 及后端 API 独立接入 SnowLuma，**不使用、不�
 - **终端运行**：工作台打开 Pi 终端，关闭终端即停止；需要批准的工具调用在终端确认。
 - **对话组管理**：创建、重命名、移入回收站和恢复；可重开空上下文，保留资料与历史文件。
 - **聊天工具**：文字、图片、语音、戳一戳、表情回应、群文件，以及聊天记录读取和合并转发。
-- **按需扩展**：可搭配权限扩展、写入沙箱、`pi-web-access` 和 MiMo TTS，分别配置在需要它们的对话组。
+- **按需扩展**：可搭配权限扩展、写入沙箱、`pi-web-access`、生图插件和 MiMo TTS，分别配置在需要它们的对话组。
 
 ## 快速开始
 
@@ -80,20 +80,27 @@ npm run web
 | 日常聊天、长期记忆 | PiQ + 一个可用的 Pi 模型 | 明确人设和回应频率，让 Pi 按需读取日志与整理记忆 |
 | 允许读取、约束写入 | `@gotgenes/pi-permission-system` + `@yuru7/pi-sandbox` + 配套本地策略示例 | 普通写入限本组；保护文件编辑和 PowerShell 执行前由人批准 |
 | 查资料、读网页与 PDF | 在前述组合上增加 `pi-web-access` | 配置搜索提供方、抓取缓存；网络工具初期保持询问 |
+| 生图、参考图编辑 | 增加 `@buyong/pi-codex-image-gen`（本机安装版本 `0.3.1`） | 单独完成 Codex 订阅登录；生成结果复制到本组 `assets/images/`，再由 `qq_send` 发送 |
 | 语音回复 | 增加 `mimo-v2-5-tts` 技能 | 用环境变量提供凭据；音频保存到本组，再由 `qq_voice` 发送 |
 
-可在工作台显示的**本组目录**中安装已核对的版本：
+可在工作台显示的**本组目录**中安装已核对的版本。已有全局包或本地适配器提供 `image_gen` 时复用现有配置，避免再次启用同一扩展而重复注册：
 
 ```powershell
 pi install -l npm:@gotgenes/pi-permission-system@40.3.0
 pi install -l npm:@yuru7/pi-sandbox@0.4.1
 # 需要联网能力时再添加
 pi install -l npm:pi-web-access@0.45.0
+# 需要生图或修图时再添加
+pi install -l npm:@buyong/pi-codex-image-gen@0.3.1
 ```
 
 安装后还需要放置权限配置、合并本组 Pi 设置，并重新打开终端。完整步骤、可复制的 JSON 和 Windows 临时目录适配见 **[可选扩展配置指南](docs/optional-integrations.md)**；基础组合从 [Pi 设置示例](examples/integrations/pi-settings.example.json)开始。
 
 `pi-web-access` 提供 `web_search`、`fetch_content`、`get_search_content`、`source_check` 等工具；本文的保守示例只启用前三项。它会自行管理缓存，也提供 GitHub 克隆等功能；这些内部读写不自动经过 yuru7 接管的命令工具。推荐先使用指南中的保守配置，明确缓存位置，按需开启克隆、远程抓取和视频处理。[联网配置](docs/optional-integrations.md#pi-web-access)提供 [Pi 设置示例](examples/integrations/pi-settings.web.example.json)和 [web-search.json 示例](examples/integrations/web-search.example.json)；请先确认它们各自的配置作用域。
+
+[`@buyong/pi-codex-image-gen`](https://github.com/buYoung/pi-packages/tree/main/apps/pi-codex-image-gen) 提供 `image_gen` 工具及配套 `imagegen` 技能，支持生图和参考图编辑。按上游说明，在 Pi 中用 `/login openai-codex` 完成可用的 ChatGPT Plus/Pro 订阅登录，用 `/codex-imagen` 选择生图模型；聊天模型可以继续使用原来的配置。该插件使用订阅凭据，单独的 OpenAI API key 不能替代这项登录；实际生图能力取决于账号和后端权限。
+
+`0.3.1` 默认尝试把 PNG 保存到 `<agentDir>/generated_images/<sessionId>/<toolCallId>.png`，`agentDir` 通常是 `~/.pi/agent`；工具结果的 `details.savedPath` 表示成功保存的位置。生成后将文件复制到本组 `assets/images/`，再显式调用 `qq_send`，例如 `{"conversation":"group:123456789","images":["assets/images/reply.png"]}`。参考图使用可读的绝对路径。保持 `image_gen` 的工具审批；插件自己的文件保存不自动经过 PowerShell 写入沙箱，生成和编辑只使用允许外发的提示词与参考图。
 
 权限组合提供工具审批和受限命令执行。读取仍按当前用户权限开放；任意脚本以整条命令接受批准，获批后仍可修改组内文件。Windows 沙箱的已知限制，以及保护文件的实际范围，在配置指南中单独说明。
 
