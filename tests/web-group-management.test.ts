@@ -505,3 +505,39 @@ test('the workbench offers password fields and no environment-name or terminal s
   assert.match(html, /id="save-credentials"/);
   assert.match(html, /id="start-discovery"/);
 });
+
+test('saving aggregation settings immediately restores editable robot credentials without a polling refresh', async () => {
+  const ui = page();
+  const credential = { appId: 'configured-app', hasSecret: true, available: true, managed: true };
+  ui.run(`renderCredential(${JSON.stringify(credential)}); $('quiet-ms').value='1500'; $('max-wait-ms').value='10000';
+    $('min-interval-ms').value='15000'; state.configText=JSON.stringify(connectionFields()); $('quiet-ms').value='2000';`);
+  ui.respond(async (_path, options) => ({ config: JSON.parse(String(options.body)).config, revision: 'updated', credential }));
+  await ui.run('saveConfig({preventDefault(){}})');
+  assert.equal(ui.get('qq-app-id').disabled, false);
+  assert.equal(ui.get('qq-app-secret').disabled, false);
+  ui.get('qq-app-secret').value = 'new-synthetic-secret';
+  ui.run('updateCredentialControls()');
+  assert.equal(ui.get('save-credentials').disabled, false);
+});
+
+test('document saves keep credential drafts editable and reenable saving on completion or failure', async () => {
+  for (const fail of [false, true]) {
+    const ui = page();
+    ui.run(`renderCredential({appId:'configured-app',hasSecret:true,available:true}); state.documentLoaded=true;
+      state.documentText='before'; $('document-content').value='after'; $('qq-app-secret').value='draft-synthetic-secret';`);
+    let finish!: (value: unknown) => void;
+    let reject!: (error: Error) => void;
+    ui.respond(() => new Promise((resolve, failRequest) => { finish = resolve; reject = failRequest; }));
+    const pending = ui.run('saveDocument()');
+    ui.run('renderRunStatus()');
+    assert.equal(ui.get('qq-app-id').disabled, false);
+    assert.equal(ui.get('qq-app-secret').disabled, false);
+    assert.equal(ui.get('save-credentials').disabled, true);
+    if (fail) reject(new Error('simulated document failure'));
+    else finish({ revision: 'saved' });
+    await pending;
+    assert.equal(ui.get('save-credentials').disabled, false);
+    assert.equal(ui.get('qq-app-secret').value, 'draft-synthetic-secret');
+    assert.doesNotMatch(JSON.stringify(ui.run('state')), /draft-synthetic-secret/);
+  }
+});

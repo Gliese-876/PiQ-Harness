@@ -722,8 +722,8 @@ function renderCredential(value, resetInputs = false) {
 }
 
 function updateCredentialControls() {
-  const disabled = !state.detail || state.credentialPending || state.busy || state.groupPending.has(state.selected);
-  $('save-credentials').disabled = disabled || !credentialsDirty(); $('refresh-credentials').disabled = disabled;
+  const disabled = !state.detail || state.credentialPending || state.groupPending.has(state.selected);
+  $('save-credentials').disabled = disabled || state.busy || !credentialsDirty(); $('refresh-credentials').disabled = disabled;
   $('qq-app-id').disabled = disabled; $('qq-app-secret').disabled = disabled;
   $('save-credentials').textContent = state.credentialPending ? '正在处理…' : '保存机器人配置';
 }
@@ -832,7 +832,7 @@ async function saveDocument() {
       state.documentText = content; state.documentRevision = result.revision; notice(`${documentLabel(filename)} 已保存。`);
     }
   } catch (error) { notice(error.message, true); }
-  finally { state.busy = false; updateDocumentState(true); updateConfigState(); updateMembershipState(); }
+  finally { state.busy = false; updateDocumentState(true); updateConfigState(); updateMembershipState(); updateCredentialControls(); }
 }
 
 async function saveConfig(event) {
@@ -858,7 +858,7 @@ async function saveConfig(event) {
       notice(error.message, true);
     }
   }
-  finally { state.busy = false; updateConfigState(); updateDocumentState(); updateMembershipState(); }
+  finally { state.busy = false; updateConfigState(); updateDocumentState(); updateMembershipState(); updateCredentialControls(); }
 }
 
 async function saveMembership(event) {
@@ -894,7 +894,7 @@ async function saveMembership(event) {
       notice(error.message, true);
     }
   }
-  finally { state.busy = false; updateMembershipState(); updateConfigState(); updateDocumentState(); }
+  finally { state.busy = false; updateMembershipState(); updateConfigState(); updateDocumentState(); updateCredentialControls(); }
 }
 
 function setTab(tab) {
@@ -1056,7 +1056,7 @@ async function saveModel(event) {
       if (result.requestId) void refreshModelRuntime();
     }
   } catch (error) { notice(error.message, true); }
-  finally { state.busy = false; updateModelState(); updateConfigState(); updateDocumentState(); updateMembershipState(); }
+  finally { state.busy = false; updateModelState(); updateConfigState(); updateDocumentState(); updateMembershipState(); updateCredentialControls(); }
 }
 
 function setLogOptions(logs) {
