@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { test, type TestContext } from 'node:test';
 import { conversationDirectory } from '../src/conversations.ts';
 import { initializeGroup, loadConfig, type GroupConfig } from '../src/config.ts';
-import { startWebServer } from '../src/web-server.ts';
+import { startWebServer, type WebOptions } from '../src/web-server.ts';
+import { createWebDiscovery, type WebDiscovery } from '../src/web-discovery.ts';
 import type { ModelCatalog } from '../src/web-models.ts';
 import { getProcessStatus } from '../src/process-manager.ts';
 import { prepareTerminalLaunch, registerTerminal } from '../src/terminal-monitor.ts';
@@ -16,8 +17,6 @@ import { prepareTerminalLaunch, registerTerminal } from '../src/terminal-monitor
 interface State {
   root: string;
   csrfToken: string;
-  defaultAppIdEnv: string;
-  defaultAppSecretEnv: string;
   groups: Array<{ id: string; name: string; conversations: GroupConfig['conversations']; path: string; running: boolean; pid: number | null }>;
 }
 interface Group {
@@ -40,7 +39,7 @@ function logRecord(seq: number, text = '测试消息', changes: Record<string, u
 
 const logLine = (record: ReturnType<typeof logRecord>) => JSON.stringify(record) + '\n';
 
-async function fixture(t: TestContext, catalog: ModelCatalog = { models: [] }) {
+async function fixture(t: TestContext, catalog: ModelCatalog = { models: [] }, overrides: Partial<WebOptions> = {}) {
   const parent = fileURLToPath(new URL('../.test-tmp/', import.meta.url));
   await mkdir(parent, { recursive: true });
   const root = await mkdtemp(join(parent, 'web-server-'));
@@ -63,6 +62,7 @@ async function fixture(t: TestContext, catalog: ModelCatalog = { models: [] }) {
       }
       return { requestId: `mock-${action}` };
     },
+    ...overrides,
   });
   t.after(async () => {
     await app.close();
@@ -96,8 +96,8 @@ test('WebUI exposes only local group metadata and serves its frontend with restr
   assert.ok(address && typeof address !== 'string');
   assert.equal(address.address, '127.0.0.1');
   assert.equal(f.state.root, await realpath(f.root));
-  assert.equal(f.state.defaultAppIdEnv, 'QQBOT_APP_ID');
-  assert.equal(f.state.defaultAppSecretEnv, 'QQBOT_APP_SECRET');
+  assert.equal('defaultAppIdEnv' in f.state, false);
+  assert.equal('defaultAppSecretEnv' in f.state, false);
   assert.match(f.state.csrfToken, /^[0-9a-f]{64}$/);
   assert.deepEqual(f.state.groups.map(group => group.id), ['123456']);
   assert.equal(f.state.groups[0]?.name, 'Test conversation group');
@@ -153,7 +153,7 @@ test('connection edits preserve Markdown around the JSON block and reject group 
   const f = await fixture(t);
   await writeFile(join(f.cwd, 'PIQ.md'), '# 自定义连接说明\n\n请保留这段。\n\n```json\n' + JSON.stringify(await loadConfig(f.cwd), null, 2) + '\n```\n\n尾部说明也需要保留。\n');
   const group = await f.get<Group>('/api/groups/123456');
-  const config = { ...group.config, quietMs: 2500, maxWaitMs: 12000, appIdEnv: 'TEST_APP_ID', appSecretEnv: 'TEST_APP_SECRET' };
+  const config = { ...group.config, quietMs: 2500, maxWaitMs: 12000, groupMemberEvents: true };
   const response = await f.call('/api/groups/123456/config', 'PUT', { config, revision: group.configRevision });
   assert.equal(response.status, 200, await response.clone().text());
   assert.deepEqual(await loadConfig(f.cwd), config);
@@ -247,8 +247,8 @@ test('group creation is isolated and duplicate requests cannot replace existing 
   const f = await fixture(t);
   const existing = await readFile(join(f.cwd, 'PERSONA.md'), 'utf8');
   const results = await Promise.all([
-    f.call('/api/groups', 'POST', { id: '654321', name: 'Second group', conversations: [{ type: 'group', id: '654321' }], appIdEnv: 'SECOND_APP_ID' }),
-    f.call('/api/groups', 'POST', { id: '654321', name: 'Second group', conversations: [{ type: 'group', id: '654321' }], appIdEnv: 'OTHER_APP_ID' }),
+    f.call('/api/groups', 'POST', { id: '654321', name: 'Second group', conversations: [{ type: 'group', id: '654321' }] }),
+    f.call('/api/groups', 'POST', { id: '654321', name: 'Second group', conversations: [{ type: 'group', id: '654321' }] }),
   ]);
   assert.deepEqual(results.map(response => response.status).sort(), [201, 409]);
   assert.equal((await loadConfig(join(f.root, '654321')))?.id, '654321');
@@ -698,4 +698,114 @@ test('model API preserves Pi settings and safely addresses live changes to the c
   assert.deepEqual(finalSettings.packages, originalPackages);
   assert.equal(finalSettings.theme, 'existing-theme');
   assert.equal(finalSettings.privateTestToken, 'KEEP_ON_DISK_ONLY');
+});
+
+
+test('credential save is local and returns only safe metadata without changing group configuration', async t => {
+  const privateSecret = 'SYNTHETIC_PRIVATE_SECRET';
+  let stored: { appId: string; appSecret?: string } | undefined;
+  const f = await fixture(t, { models: [] }, {
+    saveCredentials: async (_cwd, input) => {
+      if (input.appSecret === undefined) input = { ...input, appSecret: stored?.appSecret };
+      stored = input;
+      return { appId: input.appId, hasSecret: true, available: true, appSecret: privateSecret };
+    },
+    credentials: async () => ({ appId: stored?.appId ?? '', hasSecret: !!stored, available: !!stored, managed: true, source: '本机' }),
+  });
+  const original = await readFile(join(f.cwd, 'PIQ.md'), 'utf8');
+  const response = await f.call('/api/groups/123456/credentials', 'PUT', { appId: 'synthetic-app', appSecret: privateSecret });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.doesNotMatch(body, /SYNTHETIC_PRIVATE_SECRET|appSecret/);
+  assert.equal(JSON.parse(body).credential.appId, 'synthetic-app');
+  assert.equal((await f.call('/api/groups/123456/credentials', 'PUT', { appId: 'synthetic-app' })).status, 200);
+  assert.equal(stored?.appSecret, privateSecret);
+  assert.equal(await readFile(join(f.cwd, 'PIQ.md'), 'utf8'), original);
+  assert.doesNotMatch(JSON.stringify(await f.get<Group>('/api/groups/123456')), /SYNTHETIC_PRIVATE_SECRET|appSecretEnv/);
+  assert.equal((await f.call('/api/groups/123456/credentials/configure', 'POST', {})).status, 404);
+});
+
+test('credential API enforces local authorization and never echoes storage failures or extra fields', async t => {
+  let writes = 0;
+  const f = await fixture(t, { models: [] }, { saveCredentials: async () => { writes++; throw new Error('SYNTHETIC_SECRET_IN_FAILURE'); } });
+  const denied = await fetch(f.app.url + '/api/groups/123456/credentials', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ appId: 'synthetic-app', appSecret: 'SYNTHETIC_SECRET_IN_FAILURE' }) });
+  assert.equal(denied.status, 403); assert.equal(writes, 0);
+  assert.equal((await f.call('/api/groups/123456/credentials', 'PUT', { appId: 'synthetic-app', appSecret: 'secret', extra: true })).status, 400);
+  assert.equal(writes, 0);
+  const response = await f.call('/api/groups/123456/credentials', 'PUT', { appId: 'synthetic-app', appSecret: 'SYNTHETIC_SECRET_IN_FAILURE' });
+  assert.equal(response.status, 400); assert.equal(writes, 1);
+  assert.doesNotMatch(await response.text(), /SYNTHETIC_SECRET_IN_FAILURE/);
+});
+
+test('workbench discovers conversations on demand and releases discovery before opening Pi', async t => {
+  const lifecycle: string[] = [];
+  const discovery = createWebDiscovery({ discover: async (_cwd, options) => {
+    lifecycle.push('discover');
+    options?.output?.('QQ 官方机器人已连接，等待会话事件。');
+    options?.output?.(JSON.stringify({ conversationKey: 'private:Discovered_User', userId: 'Discovered_User' }));
+    await new Promise<void>(resolve => options!.signal!.addEventListener('abort', () => resolve(), { once: true }));
+    lifecycle.push('released'); return 0;
+  } });
+  const f = await fixture(t, { models: [] }, { discovery, openTerminal: async () => { lifecycle.push('open'); return { message: '模拟终端' }; } });
+  assert.deepEqual(lifecycle, []);
+  assert.equal((await f.call('/api/groups/123456/discovery', 'POST', {})).status, 200);
+  assert.equal((await f.call('/api/groups/123456/discovery', 'POST', {})).status, 200);
+  const found = await f.get<{ state: string; conversations: GroupConfig['conversations'] }>('/api/groups/123456/discovery');
+  assert.equal(found.state, 'connected');
+  assert.deepEqual(found.conversations, [{ type: 'private', id: 'Discovered_User' }]);
+  const group = await f.get<Group>('/api/groups/123456');
+  const selected = await f.call('/api/groups/123456/config', 'PUT', {
+    config: { ...group.config, conversations: [...group.config.conversations, ...found.conversations] }, revision: group.configRevision,
+  });
+  assert.equal(selected.status, 200);
+  const stopped = await f.call('/api/groups/123456/discovery', 'DELETE');
+  assert.equal(stopped.status, 200, 'the browser stops discovery without a JSON body');
+  assert.equal((await stopped.json() as { state: string }).state, 'idle');
+  assert.deepEqual(lifecycle, ['discover', 'released']);
+  assert.equal((await f.call('/api/groups/123456/discovery', 'POST', {})).status, 200);
+  assert.equal((await f.call('/api/groups/123456/open', 'POST', {})).status, 200);
+  assert.deepEqual(lifecycle, ['discover', 'released', 'discover', 'released', 'open']);
+  assert.equal((await f.call('/api/groups/123456/discovery', 'POST', {})).status, 409, 'a pending Pi launch prevents a competing discovery');
+});
+
+test('discovery requires configured credentials and a stopped Pi', async t => {
+  let starts = 0;
+  const discovery: WebDiscovery = { start: async () => { starts++; return { state: 'connecting', conversations: [] }; },
+    snapshot: () => ({ state: 'idle', conversations: [] }), stop: async () => ({ state: 'idle', conversations: [] }), close: async () => {} };
+  let available = false;
+  const f = await fixture(t, { models: [] }, { discovery, credentials: async () => ({ available, source: '模拟' }) });
+  assert.equal((await f.call('/api/groups/123456/discovery', 'POST', {})).status, 400);
+  available = true;
+  await mkdir(join(f.cwd, '.piq'), { recursive: true });
+  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'test-owner' }));
+  assert.equal((await f.call('/api/groups/123456/discovery', 'POST', {})).status, 409);
+  assert.equal(starts, 0);
+});
+
+test('uncertain discovery cleanup prevents credential changes, terminal launch and recycling', async t => {
+  const blocked = { state: 'error' as const, conversations: [], error: '发现连接尚未关闭。' };
+  const discovery: WebDiscovery = { start: async () => blocked, snapshot: () => blocked, stop: async () => blocked, close: async () => {} };
+  const f = await fixture(t, { models: [] }, { discovery, saveCredentials: async () => { assert.fail('must not change credentials'); } });
+  assert.equal((await f.call('/api/groups/123456/open', 'POST', {})).status, 409);
+  assert.equal((await f.call('/api/groups/123456/credentials', 'PUT', { appId: 'synthetic', appSecret: 'secret' })).status, 409);
+  assert.equal((await f.call('/api/groups/123456', 'DELETE')).status, 409);
+  assert.deepEqual(f.launched, []);
+  assert.ok(await loadConfig(f.cwd));
+});
+
+
+test('an active Pi permits secret rotation but blocks an application change before storage is touched', async t => {
+  let writes = 0;
+  const f = await fixture(t, { models: [] }, {
+    credentials: async () => ({ appId: 'current-app', available: true, hasSecret: true, managed: true, source: '本机' }),
+    saveCredentials: async (_cwd, input) => { writes++; return { appId: input.appId, available: true, hasSecret: true }; },
+  });
+  await mkdir(join(f.cwd, '.piq'), { recursive: true });
+  await writeFile(join(f.cwd, '.piq', 'owner.lock'), JSON.stringify({ version: 1, pid: process.pid, token: 'active-owner' }));
+  assert.equal((await f.call('/api/groups/123456/credentials', 'PUT', { appId: 'different-app', appSecret: 'secret' })).status, 409);
+  assert.equal(writes, 0);
+  const rotated = await f.call('/api/groups/123456/credentials', 'PUT', { appId: 'current-app', appSecret: 'new-secret' });
+  assert.equal(rotated.status, 200); assert.equal(writes, 1);
+  assert.equal((await rotated.json() as { restartRequired: boolean }).restartRequired, true);
 });

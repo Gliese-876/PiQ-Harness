@@ -58,16 +58,15 @@ async function eventually(check: () => boolean | Promise<boolean>, label: string
 async function fixture(t: TestContext, responses: FauxResponseStep[], options: {
   offline?: boolean; pending?: boolean; holdMedia?: boolean; managedTerminal?: boolean;
 } = {}) {
-  const keys = ['PIQ_TEST_APP_ID', 'PIQ_TEST_APP_SECRET', 'PIQ_TERMINAL_RETURN_TOKEN', 'PIQ_TERMINAL_WRAPPER_PID', 'PIQ_RUN_MODE', 'PIQ_START_RUNNING'];
+  const keys = ['PIQ_TERMINAL_RETURN_TOKEN', 'PIQ_TERMINAL_WRAPPER_PID', 'PIQ_RUN_MODE', 'PIQ_START_RUNNING'];
   const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
-  process.env.PIQ_TEST_APP_ID = 'synthetic-application'; process.env.PIQ_TEST_APP_SECRET = 'synthetic-secret';
-  for (const key of keys.slice(2)) delete process.env[key];
+  for (const key of keys) delete process.env[key];
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('External network is disabled in Pi control tests'); });
   const parent = join(process.cwd(), '.test-tmp'); await mkdir(parent, { recursive: true });
   const root = await mkdtemp(join(parent, 'official-pi-control-'));
-  const config = { id: 'control', name: 'Control', conversations: [conversation], appIdEnv: 'PIQ_TEST_APP_ID', appSecretEnv: 'PIQ_TEST_APP_SECRET',
+  const config = { id: 'control', name: 'Control', conversations: [conversation],
     quietMs: 50, maxWaitMs: 250, minIntervalMs: 0 };
-  const cwd = await initializeGroup(root, config.id, config);
+  const cwd = await initializeGroup(root, config.id, { name: config.name, conversations: config.conversations });
   await writeFile(join(cwd, 'PIQ.md'), '# Test\n```json\n' + JSON.stringify(config) + '\n```\n');
   await writeFile(join(cwd, '.pi', 'settings.json'), JSON.stringify({ packages: [] }));
   await writeFile(join(cwd, 'assets', 'voice.wav'), 'synthetic local media');
@@ -88,6 +87,10 @@ async function fixture(t: TestContext, responses: FauxResponseStep[], options: {
   let settledTurns = 0;
   const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, extensionFactories: [api => {
     piq(api, { claimAccount: async () => async () => {},
+      readManagedCredentials: async directory => {
+        assert.equal(directory, cwd);
+        return { appId: 'synthetic-application', appSecret: 'synthetic-secret', hasSecret: true, available: true };
+      },
       createTransport: settings => { const channel = new FakeChannel(settings, options.offline === true, options.holdMedia === true); channels.push(channel); return channel; } });
     api.on('agent_settled', () => { settledTurns++; });
   }] });

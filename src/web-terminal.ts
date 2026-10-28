@@ -5,111 +5,50 @@ import { fileURLToPath } from 'node:url';
 import { createFreshSession, groupTemporaryEnvironment, resolvePiCommand } from './cli.ts';
 import { loadConfig, type GroupConfig } from './config.ts';
 import { clearTerminalLaunch, prepareTerminalLaunch, withTerminalStartupLock } from './terminal-monitor.ts';
+import { readManagedCredentials, type ManagedCredentials } from './bot-credentials.ts';
 
 export interface CredentialStatus {
   available: boolean;
   source: string;
+  appId?: string;
+  hasSecret?: boolean;
+  managed?: boolean;
 }
 
 export interface CredentialOptions {
-  /** An explicit environment makes credential resolution independent of the machine unless a reader is supplied. */
+  /** Environment inherited by the local child process; never a QQ credential source. */
   env?: NodeJS.ProcessEnv;
-  readUserEnvironment?: (names: readonly string[]) => Promise<NodeJS.ProcessEnv>;
+  readManagedCredentials?: (cwd: string) => Promise<ManagedCredentials>;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  if (Object.hasOwn(env, name) && env[name] !== undefined) return env[name];
-  if (process.platform !== 'win32') return;
-  return Object.entries(env).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
-}
-
-/** Query only the two configured QQ application variable names, never the user's whole environment. */
-async function readWindowsUserEnvironment(names: readonly string[]): Promise<NodeJS.ProcessEnv> {
-  if (process.platform !== 'win32' || names.length === 0) return {};
-  const shell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const script = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
-    + "$names = ConvertFrom-Json $env:PIQ_CREDENTIAL_VARIABLE_NAMES; $values = @{}; "
-    + "foreach ($name in $names) { $value = [Environment]::GetEnvironmentVariable([string]$name, 'User'); "
-    + "if ($null -ne $value) { $values[[string]$name] = $value } }; ConvertTo-Json -InputObject $values -Compress";
-  return new Promise((resolveValues, reject) => {
-    const child = spawn(shell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-      windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PIQ_CREDENTIAL_VARIABLE_NAMES: JSON.stringify(names) },
-    });
-    let contents = '', settled = false;
-    const finish = (values?: NodeJS.ProcessEnv) => {
-      if (settled) return;
-      settled = true; clearTimeout(timer);
-      child.stdout.destroy(); child.stderr.destroy();
-      if (values) resolveValues(values);
-      else reject(new Error('无法读取指定的 QQ 机器人用户环境变量。'));
-    };
-    const timer = setTimeout(() => { child.kill(); finish(); }, 5_000);
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', chunk => {
-      if (contents.length + String(chunk).length > 16_384) { child.kill(); finish(); return; }
-      contents += String(chunk);
-    });
-    child.stderr.on('data', () => {});
-    child.once('error', () => finish());
-    child.once('close', code => {
-      if (code !== 0) { finish(); return; }
-      try {
-        const values: unknown = JSON.parse(contents.trim());
-        if (!object(values)) { finish(); return; }
-        finish(Object.fromEntries(names.flatMap(name => typeof values[name] === 'string' ? [[name, values[name]]] : [])));
-      } catch { finish(); }
-    });
-  });
-}
-
-/** The returned environment is for a local child process, never for an HTTP response. */
+/** Credentials come only from this group's saved local settings. */
 export async function resolveGroupEnvironment(
-  _cwd: string,
-  config: GroupConfig,
+  cwd: string,
+  _config: GroupConfig,
   options: CredentialOptions = {},
-): Promise<{ env: NodeJS.ProcessEnv; credential: CredentialStatus }> {
-  const names = [config.appIdEnv, config.appSecretEnv];
-  if (names.some(name => typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) {
-    throw new Error('QQ 机器人凭据须配置有效的环境变量名。');
-  }
+): Promise<{ env: NodeJS.ProcessEnv; credential: CredentialStatus; credentials?: { appId: string; appSecret: string } }> {
   const env = { ...(options.env ?? process.env) };
-  if (process.platform === 'win32') for (const name of names) {
-    const value = environmentValue(env, name);
-    if (value === undefined) continue;
-    for (const key of Object.keys(env)) if (key.toLowerCase() === name.toLowerCase()) delete env[key];
-    Object.defineProperty(env, name, { value, enumerable: true, configurable: true, writable: true });
+  try {
+    const saved = await (options.readManagedCredentials ?? readManagedCredentials)(cwd);
+    if (!saved.available || !saved.appId || !saved.appSecret) return { env, credential: {
+      available: false, appId: saved.appId, hasSecret: saved.hasSecret, managed: true,
+      source: '请在连接设置填写并保存机器人 AppID 和 AppSecret。',
+    } };
+    return { env, credentials: { appId: saved.appId, appSecret: saved.appSecret },
+      credential: { available: true, appId: saved.appId, hasSecret: true, managed: true, source: '机器人凭据已保存在本机。' } };
+  } catch {
+    return { env, credential: { available: false, appId: '', hasSecret: false, managed: true,
+      source: '无法读取本机机器人凭据，请在连接设置重试保存。' } };
   }
-  const missing = names.filter(name => !environmentValue(env, name)?.trim());
-  const readUser = options.readUserEnvironment ?? (options.env === undefined ? readWindowsUserEnvironment : undefined);
-  let userReadFailed = false;
-  if (missing.length && readUser) {
-    try {
-      const user = await readUser(missing);
-      for (const name of missing) {
-        const value = environmentValue(user, name);
-        if (!value?.trim()) continue;
-        // Windows names are case-insensitive. Keep one spelling so child process sorting cannot select an older empty value.
-        if (process.platform === 'win32') for (const key of Object.keys(env)) {
-          if (key.toLowerCase() === name.toLowerCase()) delete env[key];
-        }
-        Object.defineProperty(env, name, { value, enumerable: true, configurable: true, writable: true });
-      }
-    } catch { userReadFailed = true; }
-  }
-  const unresolved = names.filter(name => !environmentValue(env, name)?.trim());
-  return { env, credential: unresolved.length
-    ? { available: false, source: `${userReadFailed ? '用户环境读取失败；' : ''}请设置环境变量 ${unresolved.join('、')}` }
-    : { available: true, source: `环境变量 ${names.join('、')}` } };
 }
 
-/** Safe metadata: neither the application id nor the secret is included. */
-export async function credentialStatus(config: GroupConfig, options: CredentialOptions = {}): Promise<CredentialStatus> {
-  return (await resolveGroupEnvironment('', config, options)).credential;
+/** Browser metadata contains only the application id and whether a secret exists. */
+export async function credentialStatus(config: GroupConfig, options: CredentialOptions = {}, cwd = ''): Promise<CredentialStatus> {
+  return (await resolveGroupEnvironment(cwd, config, options)).credential;
 }
 
 export async function getRunningOwner(cwd: string): Promise<{ running: boolean; pid: number | null }> {

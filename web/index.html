@@ -75,14 +75,26 @@
 
         <section id="panel-conversations" class="tab-panel" role="tabpanel" aria-labelledby="tab-conversations" hidden>
           <div class="section-intro"><div><h2>对话与归属</h2><p>组内对话共用一套文档、记忆、模型和 Pi 会话。每个对话只能属于一个对话组。</p></div><button id="reload-config" class="button subtle" type="button" disabled>重新读取配置</button></div>
+          <div class="settings-card">
+            <div class="settings-section">
+              <div class="setting-heading"><h3>从机器人消息中发现对话</h3><button id="start-discovery" class="button subtle" type="button">发现对话</button></div>
+              <p class="field-help">先保存机器人凭据，再点击发现；给机器人发私聊，或在群里 @ 一下，即可直接加入本组。</p>
+              <div id="discovery-panel" hidden>
+                <p id="discovery-status" class="field-help" role="status" aria-live="polite"></p>
+                <p id="discovery-error" class="inline-error" role="alert" hidden></p>
+                <div id="discovery-list" class="conversation-rows"></div>
+                <button id="stop-discovery" class="button subtle" type="button">结束发现</button>
+              </div>
+            </div>
+          </div>
           <p id="membership-outdated" class="membership-lock" role="status" hidden>对话组有新的归属或名称变更。当前草稿已保留，请重新读取配置后再编辑。</p>
           <form id="membership-form" class="settings-card">
             <div class="settings-section">
               <div class="field"><label for="group-name">对话组名称</label><input id="group-name" name="name" type="text" maxlength="80" required autocomplete="off" disabled></div>
               <p id="membership-lock" class="membership-lock" role="status" hidden>请先停止本对话组的 Pi，再调整对话归属；运行时可通过“管理对话组”重命名。</p>
               <div id="conversation-rows" class="conversation-rows" aria-label="本组对话"></div>
-              <button id="add-conversation" class="button subtle" type="button" disabled>添加对话</button>
-              <p class="field-help membership-help">群聊填写 group_openid，私聊填写 user_openid。这些标识来自腾讯官方事件或开发平台，不是群号或 QQ 号码。移除对话后停止接收其新消息，已有记录与记忆保留。</p>
+              <details><summary>手工添加对话（可选）</summary><button id="add-conversation" class="button subtle" type="button" disabled>填写 OpenID</button><p class="field-help membership-help">群聊填写 group_openid，私聊填写 user_openid。这些标识来自腾讯官方事件或开发平台，不是群号或 QQ 号码。</p></details>
+              <p class="field-help membership-help">移除对话后停止接收其新消息，已有记录与记忆保留。</p>
             </div>
             <div class="editor-footer"><span id="membership-state" class="save-state">正在读取…</span><button id="save-membership" class="button save-button" type="submit" disabled>保存对话组</button></div>
           </form>
@@ -119,12 +131,18 @@
         </section>
 
         <section id="panel-connection" class="tab-panel" role="tabpanel" aria-labelledby="tab-connection" hidden>
-          <div class="section-intro"><div><h2>连接与消息聚合</h2><p>设置保存在本对话组 PIQ.md 中，重启或 /reload 后生效。</p></div></div>
-          <form id="connection-form" class="settings-card">
+          <div class="section-intro"><div><h2>机器人连接</h2><p>配置机器人后，再发现并加入群聊或私聊。</p></div></div>
+          <form id="credentials-form" class="settings-card" autocomplete="off">
             <div class="settings-section">
               <div class="setting-heading"><h3>腾讯官方 QQBot</h3><span id="credential-status" class="credential-status"></span></div>
-              <div class="field"><label for="app-id-env">AppID 环境变量名</label><input id="app-id-env" name="appIdEnv" type="text" required pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off" placeholder="QQBOT_APP_ID"><span class="field-help">在本机环境中配置官方机器人 AppID，此处只填写变量名。</span></div>
-              <div class="field"><label for="app-secret-env">AppSecret 环境变量名</label><input id="app-secret-env" name="appSecretEnv" type="text" required pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off" placeholder="QQBOT_APP_SECRET"><span id="credential-source" class="field-help">在本机环境中配置 AppSecret，此处不输入密钥。连接由本组 Pi 终端持有。</span></div>
+              <div class="field"><label for="qq-app-id">AppID</label><input id="qq-app-id" name="appId" type="text" required autocomplete="off" spellcheck="false" placeholder="从 QQ 开放平台复制 AppID"></div>
+              <div class="field"><label for="qq-app-secret">AppSecret</label><input id="qq-app-secret" name="appSecret" type="password" autocomplete="new-password" spellcheck="false" placeholder="填写 AppSecret"><span id="credential-source" class="field-help">保存到本机后，密码框会清空。</span></div>
+            </div>
+            <div class="editor-footer"><button id="save-credentials" class="button primary" type="submit" disabled>保存机器人配置</button><button id="refresh-credentials" class="button subtle" type="button" disabled>刷新状态</button></div>
+          </form>
+          <div class="section-intro"><div><h2>事件与消息聚合</h2><p>这些设置保存在本组 PIQ.md 中，重启或 /reload 后生效。</p></div></div>
+          <form id="connection-form" class="settings-card">
+            <div class="settings-section">
               <div class="field"><label for="group-member-events">群成员事件</label><select id="group-member-events" name="groupMemberEvents"><option value="false">不订阅</option><option value="true">订阅群成员与入群申请事件</option></select><span class="field-help">仅在官方平台已授予群成员事件权限时启用；群管理查询和操作仍由工具显式执行。</span></div>
             </div>
             <div class="settings-section">
@@ -159,12 +177,12 @@
   <dialog id="add-dialog" class="add-dialog" aria-labelledby="add-title">
     <form id="add-form">
       <div class="dialog-heading"><h2 id="add-title">新建对话组</h2><button id="close-add" class="icon-button" type="button" aria-label="关闭">×</button></div>
-      <p class="dialog-description">为相关对话创建共用的配置、文档和 Pi 会话。</p>
+      <p class="dialog-description">填写机器人配置后，可用“发现对话”加入群聊和私聊；也可以创建后再配置。</p>
       <div class="field"><label for="new-group-name">对话组名称</label><input id="new-group-name" name="name" type="text" maxlength="80" required autocomplete="off" placeholder="例如 朋友们"></div>
       <div class="field"><label for="new-group-id">目录标识（可留空）</label><input id="new-group-id" name="id" type="text" maxlength="64" pattern="[a-z0-9][a-z0-9_\-]{0,63}" autocomplete="off" placeholder="留空自动生成"><span class="field-help">可填写小写字母、数字、下划线或短横线；创建后保持固定。</span></div>
-      <div class="dialog-conversations"><h3>初始对话</h3><div id="new-conversation-rows" class="conversation-rows" aria-label="新对话组中的对话"></div><button id="add-new-conversation" class="button subtle" type="button">添加对话</button><p class="field-help membership-help">可以添加多个群聊和私聊，也可以创建后再添加。</p></div>
-      <div class="field"><label for="new-app-id-env">AppID 环境变量名</label><input id="new-app-id-env" name="appIdEnv" type="text" pattern="[A-Za-z_][A-Za-z0-9_]*" required autocomplete="off"></div>
-      <div class="field"><label for="new-app-secret-env">AppSecret 环境变量名</label><input id="new-app-secret-env" name="appSecretEnv" type="text" pattern="[A-Za-z_][A-Za-z0-9_]*" required autocomplete="off"><span class="field-help">仅填写变量名；AppID 和 AppSecret 由主人配置在本机环境中。</span></div>
+      <div class="field"><label for="new-app-id">AppID（可稍后填写）</label><input id="new-app-id" name="appId" type="text" autocomplete="off" spellcheck="false" placeholder="从 QQ 开放平台复制 AppID"></div>
+      <div class="field"><label for="new-app-secret">AppSecret（可稍后填写）</label><input id="new-app-secret" name="appSecret" type="password" autocomplete="new-password" spellcheck="false" placeholder="填写 AppSecret"><span class="field-help">仅保存到本机；创建后密码框会清空。</span></div>
+      <details class="dialog-conversations"><summary>手工填写初始 OpenID（可选）</summary><div id="new-conversation-rows" class="conversation-rows" aria-label="新对话组中的对话"></div><button id="add-new-conversation" class="button subtle" type="button">填写 OpenID</button></details>
       <p id="add-error" class="inline-error" role="alert" hidden></p>
       <div class="dialog-actions"><button id="cancel-add" class="button subtle" type="button">取消</button><button id="confirm-add" class="button primary" type="submit">创建对话组</button></div>
     </form>

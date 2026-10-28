@@ -10,7 +10,7 @@ QQ 协议接入使用腾讯发布的 `@tencent-connect/qqbot-nodejs`，本项目
 - [官方 LICENSE](https://github.com/tencent-connect/qqbot-nodejs/blob/main/LICENSE)
 - [npm 包](https://www.npmjs.com/package/@tencent-connect/qqbot-nodejs)
 
-本项目仅使用该 SDK 的公开接口，通过手工配置的 AppID/AppSecret 连接官方机器人。项目不依赖或分发 `@tencent-connect/qqbot-connector`，不包含扫码绑定实现，也不接入 SnowLuma、OneBot 或 DSH。
+本项目仅使用该 SDK 的公开接口，通过机器人 AppID/AppSecret 连接官方平台。机器人凭据统一在 Windows 工作台直接填写 AppID 和 AppSecret 密码框，保存到当前用户的环境变量，密钥保存后不回显；CLI 连接读取同一份已保存的凭据。项目不依赖或分发 `@tencent-connect/qqbot-connector`，不包含扫码绑定实现，也不接入 SnowLuma、OneBot 或 DSH。
 
 分发包含此 SDK 的产物时，保留 SDK 随附的完整 LICENSE 和以下声明：
 

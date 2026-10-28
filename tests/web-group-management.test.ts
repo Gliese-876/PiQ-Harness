@@ -42,15 +42,20 @@ function page() {
   const prompts: Array<string | null> = [];
   const confirmations: string[] = [];
   let confirmed = true;
+  const storage = new Map<string,string>();
+  const timers = new Map<number, () => unknown>();
+  let timerId = 0;
   let responder = async (_path: string, _options: RequestInit): Promise<unknown> => ({});
   const context = createContext({
     URL, console, TextEncoder, TextDecoder,
+    setTimeout: (callback: () => unknown) => { const id = ++timerId; timers.set(id, callback); return id; },
+    clearTimeout: (id: number) => timers.delete(id),
     document: { getElementById: get, createElement: (tag: string) => new Element(tag), querySelectorAll: () => [] },
     window: {
       prompt: () => prompts.shift() ?? null,
       confirm: (message: string) => { confirmations.push(message); return confirmed; },
     },
-    localStorage: { setItem() {}, removeItem() {} },
+    localStorage: { setItem(key: string, value: string) { storage.set(key,value); }, removeItem(key: string) { storage.delete(key); } },
     fetch: async (path: string, options: RequestInit) => {
       requests.push({ path, options });
       const result = await responder(path, options);
@@ -63,7 +68,7 @@ function page() {
     state.configRevision='revision-1'; state.groups=[{id:'one',name:'原组',running:false,conversations:[{type:'group',id:'GROUP_OpenID-1'}]}];
     state.configText=JSON.stringify(connectionFields()); state.csrfToken='test-token';`);
   return {
-    get, run, requests, prompts, confirmations,
+    get, run, requests, prompts, confirmations, storage, timers,
     confirm(value: boolean) { confirmed = value; },
     respond(callback: typeof responder) { responder = callback; },
   };
@@ -108,7 +113,7 @@ test('a running group can be renamed with its revision but cannot be deleted', a
 
 test('group mutations respect unsaved settings and deletion cancellation', async () => {
   const ui = page();
-  ui.run("$('app-id-env').value='CHANGED_APP_ID';");
+  ui.run("$('quiet-ms').value='2000';");
   ui.prompts.push('未保存时不能改名');
   await ui.run("manageGroup('rename')");
   assert.equal(ui.requests.length, 0);
@@ -250,19 +255,21 @@ test('conversation forms preserve opaque OpenIDs and reject unsupported kinds or
   assert.equal(ui.run("validateConversations([{type:'group',id:'Aa'},{type:'group',id:'aa'}]).length"), 2);
 });
 
-test('connection settings submit credential variable names and display configuration separately from connection', async () => {
+test('event settings stay separate from credentials and clear their own dirty state', async () => {
   const ui = page();
-  ui.run("state.detail.config={...state.detail.config,appIdEnv:'QQBOT_APP_ID',appSecretEnv:'QQBOT_APP_SECRET',groupMemberEvents:false,quietMs:1500,maxWaitMs:10000,minIntervalMs:15000}; state.detail.config.conversations=[]; setConfig(state.detail); $('app-secret-env').value='OTHER_APP_SECRET'; $('group-member-events').value='true';");
-  ui.respond(async (_path, options) => ({ config: JSON.parse(String(options.body)).config, revision: 'official-revision', credential: { available: true, source: '环境变量 QQBOT_APP_ID、OTHER_APP_SECRET' } }));
+  ui.run("state.detail.config={...state.detail.config,groupMemberEvents:false,quietMs:1500,maxWaitMs:10000,minIntervalMs:15000}; state.detail.config.conversations=[]; setConfig(state.detail); $('group-member-events').value='true'; $('qq-app-secret').value='UNSAVED_SECRET';");
+  ui.respond(async (_path, options) => ({ config: JSON.parse(String(options.body)).config, revision: 'official-revision', credential: { available: true, appId: '123456', hasSecret: true } }));
   await ui.run('saveConfig({preventDefault(){}})');
   const payload = JSON.parse(String(ui.requests[0]!.options.body));
-  assert.equal(payload.config.appIdEnv, 'QQBOT_APP_ID');
+  assert.equal('appIdEnv' in payload.config, false);
   assert.equal(payload.config.groupMemberEvents, true);
   assert.equal(ui.run('configDirty()'), false, 'saving the event subscription must clear the dirty state');
-  assert.equal(payload.config.appSecretEnv, 'OTHER_APP_SECRET');
+  assert.equal('appSecretEnv' in payload.config, false);
+  assert.doesNotMatch(String(ui.requests[0]!.options.body), /UNSAVED_SECRET/);
+  assert.equal(ui.get('qq-app-secret').value, 'UNSAVED_SECRET', 'saving event settings preserves the separate credential draft');
   assert.equal('wsUrl' in payload.config, false);
   assert.equal('accessTokenEnv' in payload.config, false);
-  assert.equal(ui.get('credential-status').textContent, '凭据已配置');
+  assert.equal(ui.get('credential-status').textContent, '机器人已配置');
   ui.run('renderRunStatus()');
   assert.equal(ui.get('connection-status').textContent, 'QQBot 未连接');
 });
@@ -323,4 +330,178 @@ test('large platform previews are bounded and marked without truncating the unde
   assert.ok(Buffer.byteLength(details.children[1]!.textContent) < 64 * 1024 + 256);
   assert.equal(ui.get('log-content').textContent, original);
   assert.equal(ui.requests.length, 0);
+});
+
+test('credentials save through the dedicated body, clear the password, and never enter config or storage', async () => {
+  const ui = page();
+  ui.run("renderCredential({available:false}); $('qq-app-id').value='123456'; $('qq-app-secret').value='TYPED_SECRET';");
+  ui.respond(async () => ({ restartRequired: true, credential: { available: true, appId: '123456', hasSecret: true, managed: true, appSecret: 'MUST_NOT_ENTER_BROWSER_STATE' } }));
+  await ui.run('saveCredentials({preventDefault(){}})');
+  assert.equal(ui.requests[0]!.path, '/api/groups/one/credentials');
+  assert.equal(ui.requests[0]!.options.method, 'PUT');
+  assert.deepEqual(JSON.parse(String(ui.requests[0]!.options.body)), { appId: '123456', appSecret: 'TYPED_SECRET' });
+  assert.match(ui.get('notice').textContent, /重开本组 Pi 终端/);
+  await ui.run('refreshCredentials()');
+  assert.equal(ui.get('qq-app-id').value, '123456');
+  assert.equal(ui.get('qq-app-secret').value, '');
+  assert.match((ui.get('qq-app-secret') as Element & {placeholder:string}).placeholder, /留空保留/);
+  assert.equal(ui.get('credential-status').textContent, '机器人已配置');
+  assert.doesNotMatch(ui.run('JSON.stringify(state)'), /TYPED_SECRET|MUST_NOT_ENTER_BROWSER_STATE/);
+  assert.doesNotMatch(JSON.stringify([...ui.storage]), /TYPED_SECRET|MUST_NOT_ENTER_BROWSER_STATE/);
+  assert.ok(ui.requests.every(request => !/123456|TYPED_SECRET/.test(request.path)));
+  assert.equal(ui.run('credentialsDirty()'), false);
+});
+
+test('a blank password retains saved credentials and status refresh preserves all unsaved drafts', async () => {
+  const ui = page();
+  ui.run("renderCredential({available:true,appId:'123456',hasSecret:true}); $('qq-app-id').value='654321'; $('quiet-ms').value='2000';");
+  ui.respond(async () => ({ credential: { available: true, appId: '654321', hasSecret: true, managed: true } }));
+  await ui.run('saveCredentials({preventDefault(){}})');
+  assert.deepEqual(JSON.parse(String(ui.requests[0]!.options.body)), { appId: '654321' });
+  ui.run("$('qq-app-secret').value='DRAFT_SECRET';");
+  await ui.run('refreshCredentials()');
+  assert.equal(ui.get('qq-app-secret').value, 'DRAFT_SECRET');
+  assert.equal(ui.get('quiet-ms').value, '2000');
+  assert.equal(ui.run('configDirty()'), true);
+  assert.doesNotMatch(ui.run('JSON.stringify(state)'), /DRAFT_SECRET/);
+});
+
+test('a late credential save does not clear another group password draft', async () => {
+  const ui = page();
+  ui.run("renderCredential({available:false}); $('qq-app-id').value='123456'; $('qq-app-secret').value='FIRST_SECRET';");
+  let finish!: (value: unknown) => void;
+  ui.respond(async () => new Promise(resolve => { finish = resolve; }));
+  const saving = ui.run('saveCredentials({preventDefault(){}})');
+  ui.run("state.selected='two'; state.detailSequence++; renderCredential({available:false},true); $('qq-app-secret').value='SECOND_SECRET';");
+  finish({ credential: { available: true, appId: '123456', hasSecret: true } });
+  await saving;
+  assert.equal(ui.get('qq-app-secret').value, 'SECOND_SECRET');
+  assert.equal(ui.get('qq-app-id').value, '');
+});
+
+test('creating a group may defer credentials and opens connection setup', async () => {
+  const ui = page();
+  ui.get('new-group-name').value = 'New group';
+  ui.run('readConversationRows=()=>[]; refreshState=async()=>{}; mayDiscard=()=>true; selectGroup=async(id)=>{state.selected=id;}; setTab=tab=>{state.tab=tab;};');
+  ui.respond(async () => ({ id: 'created' }));
+  await ui.run('addGroup({preventDefault(){}})');
+  assert.equal(ui.requests.length, 1);
+  assert.deepEqual(JSON.parse(String(ui.requests[0]!.options.body)), { name: 'New group', conversations: [] });
+  assert.equal(ui.run('state.selected'), 'created');
+  assert.equal(ui.run('state.tab'), 'connection');
+});
+
+test('new-group credentials use a separate request and partial failure preserves the created group', async () => {
+  for (const failure of [false, true]) {
+    const ui = page();
+    ui.get('new-group-name').value = 'New group'; ui.get('new-app-id').value = '123456'; ui.get('new-app-secret').value = 'NEW_SECRET';
+    ui.run('readConversationRows=()=>[]; refreshState=async()=>{}; mayDiscard=()=>true; selectGroup=async(id)=>{state.selected=id;}; setTab=tab=>{state.tab=tab;};');
+    ui.respond(async path => {
+      if (path === '/api/groups') return { id: 'created' };
+      if (failure) throw new Error('Could not save NEW_SECRET');
+      return { credential: { available: true, appId: '123456', hasSecret: true } };
+    });
+    await ui.run('addGroup({preventDefault(){}})');
+    assert.deepEqual(JSON.parse(String(ui.requests[0]!.options.body)), { name: 'New group', conversations: [] });
+    assert.equal(ui.requests[1]!.path, '/api/groups/created/credentials');
+    assert.deepEqual(JSON.parse(String(ui.requests[1]!.options.body)), { appId: '123456', appSecret: 'NEW_SECRET' });
+    assert.equal(ui.get('new-app-secret').value, '');
+    assert.equal(ui.run('state.selected'), 'created');
+    assert.doesNotMatch(ui.get('notice').textContent + ui.run('JSON.stringify(state)'), /NEW_SECRET/);
+    if (failure) assert.match(ui.get('notice').textContent, /已创建.*保存失败.*连接设置重试/);
+  }
+});
+
+test('discovery starts only after a click, polls while open, and stops before opening Pi', async () => {
+  const ui = page();
+  ui.run('state.detail.credential={available:true}; renderRunStatus(); refreshState=async()=>{};');
+  assert.equal(ui.requests.length, 0);
+  ui.respond(async path => path.endsWith('/discovery') ? { state: 'connected', conversations: [{ type: 'private', id: 'Discovered_OpenID_1' }] } : {});
+  await ui.run('startDiscovery()');
+  assert.equal(ui.requests[0]!.options.method, 'POST');
+  assert.equal(ui.get('discovery-panel').hidden, false);
+  assert.match(ui.get('discovery-status').textContent, /发私聊/);
+  assert.equal(ui.timers.size, 1);
+  const poll = [...ui.timers.values()][0]!;
+  await poll();
+  assert.equal(ui.requests[1]!.path, '/api/groups/one/discovery');
+  assert.equal(ui.requests[1]!.options.method, undefined);
+  await ui.run('openTerminal()');
+  assert.deepEqual(ui.requests.slice(-2).map(request => [request.path, request.options.method]), [
+    ['/api/groups/one/discovery', 'DELETE'], ['/api/groups/one/open', 'POST'],
+  ]);
+  assert.equal(ui.get('discovery-panel').hidden, true);
+});
+
+test('discovered conversations join through the current config revision without copying an OpenID', async () => {
+  const ui = page();
+  const discovered = { type: 'group', id: 'Discovered_OpenID_2' };
+  ui.run(`state.detail.credential={available:true}; state.discoveryGroup='one'; state.discoveryOpen=true; state.discovered=[${JSON.stringify(discovered)}];`);
+  ui.respond(async (_path, options) => ({ config: JSON.parse(String(options.body)).config, revision: 'discovered-revision' }));
+  await ui.run(`addDiscoveredConversation(${JSON.stringify(discovered)})`);
+  const saved = JSON.parse(String(ui.requests[0]!.options.body));
+  assert.equal(saved.revision, 'revision-1');
+  assert.deepEqual(saved.config.conversations, [{ type: 'group', id: 'GROUP_OpenID-1' }, discovered]);
+  assert.equal(ui.run('state.configRevision'), 'discovered-revision');
+  assert.match(ui.get('discovery-list').textContent, /已加入本组/);
+});
+
+test('discovery refuses live Pi and unsaved settings and releases a delayed start when closed', async () => {
+  const ui = page();
+  ui.run('state.detail.credential={available:true}; state.groups[0].running=true;');
+  await ui.run('startDiscovery()');
+  assert.equal(ui.requests.length, 0);
+  ui.run("state.groups[0].running=false; $('quiet-ms').value='20';");
+  await ui.run('startDiscovery()');
+  assert.equal(ui.requests.length, 0);
+  ui.run('state.configText=JSON.stringify(connectionFields());');
+  let finish!: (value: unknown) => void;
+  ui.respond(async (_path, options) => options.method === 'POST' ? new Promise(resolve => { finish = resolve; }) : { state: 'idle', conversations: [] });
+  const starting = ui.run('startDiscovery()');
+  const closing = ui.run('stopDiscovery()');
+  assert.equal(ui.requests.length, 1);
+  finish({ state: 'connected', conversations: [] });
+  await Promise.all([starting, closing]);
+  assert.deepEqual(ui.requests.map(request => request.options.method), ['POST', 'DELETE']);
+  assert.equal(ui.get('discovery-panel').hidden, true);
+  assert.equal(ui.timers.size, 0);
+});
+
+test('discovery expiration stops its connection and preserves found choices', async () => {
+  const ui = page();
+  ui.run('state.detail.credential={available:true};');
+  ui.respond(async (_path, options) => ({ state: options.method === 'DELETE' ? 'idle' : 'connected', conversations: [{ type: 'private', id: 'Found_OpenID' }] }));
+  await ui.run('startDiscovery()');
+  ui.run('state.discoveryDeadline=0;');
+  await [...ui.timers.values()][0]!();
+  assert.equal(ui.requests.at(-1)!.options.method, 'DELETE');
+  assert.equal(ui.run('state.discoveryState'), 'idle');
+  assert.equal(ui.run('state.discovered[0].id'), 'Found_OpenID');
+});
+
+test('leaving the conversations panel releases discovery and late polls cannot cancel a new session timer', async () => {
+  const ui = page();
+  ui.run('state.detail.credential={available:true};');
+  ui.respond(async (_path, options) => ({ state: options.method === 'DELETE' ? 'idle' : 'connected', conversations: [] }));
+  await ui.run('startDiscovery()');
+  const previousVersion = ui.run('state.discoveryVersion');
+  ui.run("setTab('connection')");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ui.requests.at(-1)!.options.method, 'DELETE');
+  assert.equal(ui.run('state.discoveryOpen'), false);
+  await ui.run('startDiscovery()');
+  const currentTimer = ui.run('state.discoveryTimer');
+  ui.run(`scheduleDiscoveryPoll(${previousVersion})`);
+  assert.equal(ui.run('state.discoveryTimer'), currentTimer);
+  assert.equal(ui.timers.has(currentTimer), true);
+});
+
+test('the workbench offers password fields and no environment-name or terminal setup controls', async () => {
+  const html = await readFile(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.doesNotMatch(html, /app-id-env|app-secret-env|configure-credentials|配置终端/);
+  assert.doesNotMatch(script, /credentials\/configure|configureCredentials/);
+  assert.match(html, /id="qq-app-secret"[^>]*type="password"/);
+  assert.match(html, /id="new-app-secret"[^>]*type="password"/);
+  assert.match(html, /id="save-credentials"/);
+  assert.match(html, /id="start-discovery"/);
 });

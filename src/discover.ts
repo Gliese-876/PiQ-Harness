@@ -54,15 +54,16 @@ export async function discoverGroup(cwd: string, options: DiscoverOptions = {}):
       let resolved;
       try { resolved = await resolveGroupEnvironment(cwd, config, options); }
       catch {
-        output('无法读取 QQ 机器人凭据，请检查应用环境变量。');
+        output('无法读取 QQ 机器人凭据，请检查工作台的连接设置。');
         return 1;
       }
       if (stopped) return 0;
-      if (!resolved.credential.available) {
+      if (!resolved.credential.available || !resolved.credentials) {
         output(`无法连接 QQ 官方机器人：${resolved.credential.source}。`);
         return 1;
       }
-      try { releaseAccount = await (options.claimAccount ?? claimBotAccount)(resolved.env[config.appIdEnv]!); }
+      const credentials = resolved.credentials;
+      try { releaseAccount = await (options.claimAccount ?? claimBotAccount)(credentials.appId); }
       catch {
         if (stopped) return 0;
         output('无法取得 QQ 机器人运行占用；同一 AppID 可能已有 PiQ 对话组运行，请先结束相关组并检查本机 socket 占用。');
@@ -80,8 +81,8 @@ export async function discoverGroup(cwd: string, options: DiscoverOptions = {}):
       output('正在监听 QQ 官方机器人事件；按 Ctrl+C 退出。');
       try {
         transport = (options.createTransport ?? (specification => new QQBotTransport(specification)))({
-          appId: resolved.env[config.appIdEnv]!,
-          appSecret: resolved.env[config.appSecretEnv]!,
+          appId: credentials.appId,
+          appSecret: credentials.appSecret,
           onMessage(event) {
             if (stopped) return;
             let key: string, userId: string;

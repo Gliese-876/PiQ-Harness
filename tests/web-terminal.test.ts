@@ -21,103 +21,40 @@ async function fixture() {
   return { root, cwd, config };
 }
 
-test('credential metadata exposes availability without secrets and process settings take priority', async t => {
+test('saved group credentials are the sole source and are not copied into child environments or metadata', async t => {
   const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  const input = Object.freeze({ QQBOT_APP_ID: 'synthetic-process-id', QQBOT_APP_SECRET: 'synthetic-process-secret', PIQ_TEST_MARKER: 'preserved' });
-  const processBefore = [process.env.QQBOT_APP_ID, process.env.QQBOT_APP_SECRET];
-  const options = { env: input, readUserEnvironment: async () => { assert.fail('Present process credentials must not read user settings'); return {}; } };
-  const status = await credentialStatus(f.config, options);
-  assert.equal(status.available, true);
-  assert.deepEqual(Object.keys(status).sort(), ['available', 'source']);
-  assert.doesNotMatch(JSON.stringify(status), /synthetic-process-id|synthetic-process-secret/);
+  const input = Object.freeze({ QQBOT_APP_ID: 'obsolete-app', QQBOT_APP_SECRET: 'obsolete-secret', UNRELATED: 'keep' });
+  const options = { env: input, readManagedCredentials: async (cwd: string) => {
+    assert.equal(cwd, f.cwd);
+    return { appId: 'saved-app', appSecret: 'saved-secret-never-returned', hasSecret: true, available: true };
+  } };
   const resolved = await resolveGroupEnvironment(f.cwd, f.config, options);
-  assert.notEqual(resolved.env, input);
-  assert.deepEqual(resolved.env, input);
-  assert.equal(resolved.credential.available, true);
-  assert.equal(input.QQBOT_APP_SECRET, 'synthetic-process-secret');
-  assert.ok(process.env.QQBOT_APP_ID === processBefore[0] && process.env.QQBOT_APP_SECRET === processBefore[1], 'Parent credentials must not change');
+  assert.deepEqual(resolved.credentials, { appId: 'saved-app', appSecret: 'saved-secret-never-returned' });
+  assert.deepEqual(resolved.env, input); assert.notEqual(resolved.env, input);
+  const metadata = await credentialStatus(f.config, options, f.cwd);
+  assert.deepEqual(metadata, { available: true, source: '机器人凭据已保存在本机。', managed: true, appId: 'saved-app', hasSecret: true });
+  assert.doesNotMatch(JSON.stringify(metadata), /saved-secret|obsolete-secret/);
 });
 
-test('user fallback requests only missing configured names and imports only those values', async t => {
+test('obsolete global variables do not connect a bot when this group has no saved credentials', async t => {
   const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  const config = validateConfig({ ...f.config, appIdEnv: 'PIQ_SELECTED_APP_ID', appSecretEnv: 'PIQ_SELECTED_APP_SECRET' });
-  const input = Object.freeze({ PIQ_SELECTED_APP_ID: 'synthetic-process-id', PIQ_TEST_MARKER: 'keep' });
-  const requests: string[][] = [];
-  const result = await resolveGroupEnvironment(f.cwd, config, { env: input, readUserEnvironment: async names => {
-    requests.push([...names]);
-    return { PIQ_SELECTED_APP_ID: 'must-not-replace-process-id', PIQ_SELECTED_APP_SECRET: 'synthetic-user-secret',
-      QQBOT_APP_ID: 'unselected-default-id', QQBOT_APP_SECRET: 'unselected-default-secret', UNRELATED_VALUE: 'never-import' };
-  } });
-  assert.deepEqual(requests, [['PIQ_SELECTED_APP_SECRET']]);
-  assert.equal(result.env.PIQ_SELECTED_APP_ID, 'synthetic-process-id');
-  assert.equal(result.env.PIQ_SELECTED_APP_SECRET, 'synthetic-user-secret');
-  assert.equal(result.env.PIQ_TEST_MARKER, 'keep');
-  assert.equal(result.env.QQBOT_APP_ID, undefined); assert.equal(result.env.QQBOT_APP_SECRET, undefined);
-  assert.equal(result.env.UNRELATED_VALUE, undefined);
-  assert.deepEqual(input, { PIQ_SELECTED_APP_ID: 'synthetic-process-id', PIQ_TEST_MARKER: 'keep' });
-  assert.equal(result.credential.available, true);
-  assert.doesNotMatch(JSON.stringify(result.credential), /synthetic-process-id|synthetic-user-secret/);
+  const result = await resolveGroupEnvironment(f.cwd, f.config, { env: { QQBOT_APP_ID: 'obsolete-bot', QQBOT_APP_SECRET: 'obsolete-secret' },
+    readManagedCredentials: async () => ({ appId: '', hasSecret: false, available: false }) });
+  assert.equal(result.credential.available, false); assert.equal(result.credentials, undefined);
+  assert.match(result.credential.source, /连接设置/);
+  assert.doesNotMatch(JSON.stringify(result.credential), /obsolete-bot|obsolete-secret/);
 });
 
-test('fallback requires both selected credentials and does not substitute default variable names', async t => {
+test('unreadable or partial saved credentials fail closed with safe diagnostics', async t => {
   const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  const config = validateConfig({ ...f.config, appIdEnv: 'PIQ_SELECTED_APP_ID', appSecretEnv: 'PIQ_SELECTED_APP_SECRET' });
-  const requested: string[][] = [];
-  const result = await resolveGroupEnvironment(f.cwd, config, { env: {}, readUserEnvironment: async names => {
-    requested.push([...names]);
-    return { QQBOT_APP_ID: 'wrong-app-id', QQBOT_APP_SECRET: 'wrong-app-secret', PIQ_SELECTED_APP_SECRET: 'synthetic-user-secret' };
-  } });
-  assert.deepEqual(requested, [['PIQ_SELECTED_APP_ID', 'PIQ_SELECTED_APP_SECRET']]);
-  assert.equal(result.credential.available, false);
-  assert.match(result.credential.source, /PIQ_SELECTED_APP_ID/);
-  assert.equal(result.env.PIQ_SELECTED_APP_ID, undefined);
-  assert.equal(result.env.PIQ_SELECTED_APP_SECRET, 'synthetic-user-secret');
-  assert.equal(result.env.QQBOT_APP_ID, undefined); assert.equal(result.env.QQBOT_APP_SECRET, undefined);
-  assert.doesNotMatch(JSON.stringify(result.credential), /wrong-app|synthetic-user-secret/);
-});
-
-test('an explicitly supplied environment stays isolated when no user reader is provided', async t => {
-  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  for (const env of [{}, { QQBOT_APP_ID: 'synthetic-only-id' }, { QQBOT_APP_SECRET: 'synthetic-only-secret' }]) {
-    const result = await resolveGroupEnvironment(f.cwd, f.config, { env });
-    assert.equal(result.credential.available, false);
-    assert.deepEqual(result.env, env);
-    assert.doesNotMatch(JSON.stringify(result.credential), /synthetic-only-id|synthetic-only-secret/);
+  for (const readManagedCredentials of [
+    async () => ({ appId: 'saved-bot', hasSecret: false, available: false }),
+    async () => { throw new Error('private-reader-error-secret'); },
+  ]) {
+    const result = await resolveGroupEnvironment(f.cwd, f.config, { env: {}, readManagedCredentials });
+    assert.equal(result.credential.available, false); assert.equal(result.credentials, undefined);
+    assert.doesNotMatch(JSON.stringify(result.credential), /private-reader-error-secret/);
   }
-  const result = await resolveGroupEnvironment(f.cwd, f.config, { env: { QQBOT_APP_ID: '', QQBOT_APP_SECRET: '' } });
-  assert.equal(result.credential.available, false);
-});
-
-test('Windows credential names are normalized for exact-key consumers without replacing process values', { skip: process.platform !== 'win32' }, async t => {
-  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  const input = Object.freeze({ qqbot_app_id: 'synthetic-parent-id', QqBot_App_Secret: '', UNRELATED_VALUE: 'keep' });
-  const result = await resolveGroupEnvironment(f.cwd, f.config, { env: input, readUserEnvironment: async names => {
-    assert.deepEqual(names, ['QQBOT_APP_SECRET']);
-    return { qqbot_app_id: 'must-not-replace-id', qqbot_app_secret: 'synthetic-user-secret' };
-  } });
-  assert.equal(result.env[f.config.appIdEnv], 'synthetic-parent-id');
-  assert.equal(result.env[f.config.appSecretEnv], 'synthetic-user-secret');
-  assert.equal(result.env.qqbot_app_id, undefined); assert.equal(result.env.QqBot_App_Secret, undefined);
-  assert.equal(result.env.qqbot_app_secret, undefined);
-  assert.equal(result.env.UNRELATED_VALUE, 'keep');
-  assert.equal(result.credential.available, true);
-  assert.deepEqual(input, { qqbot_app_id: 'synthetic-parent-id', QqBot_App_Secret: '', UNRELATED_VALUE: 'keep' });
-});
-
-test('user environment read failures return safe metadata and preserve process values', async t => {
-  const f = await fixture(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  const result = await resolveGroupEnvironment(f.cwd, f.config, {
-    env: { QQBOT_APP_ID: 'synthetic-process-id' },
-    readUserEnvironment: async names => {
-      assert.deepEqual(names, ['QQBOT_APP_SECRET']);
-      throw new Error('private-reader-secret https://private.invalid/?secret=hidden');
-    },
-  });
-  assert.equal(result.credential.available, false);
-  assert.match(result.credential.source, /QQBOT_APP_SECRET/);
-  assert.equal(result.env.QQBOT_APP_ID, 'synthetic-process-id');
-  assert.equal(result.env.QQBOT_APP_SECRET, undefined);
-  assert.doesNotMatch(JSON.stringify(result.credential), /private-reader-secret|private.invalid|hidden|synthetic-process-id/);
 });
 
 test('missing QQBot credentials still open the terminal with a configuration reminder', async t => {
@@ -129,7 +66,7 @@ test('missing QQBot credentials still open the terminal with a configuration rem
     launch: async specification => { requests.push(specification); },
   });
   assert.equal(requests.length, 1);
-  assert.match(result.message, /QQBOT_APP_ID/); assert.match(result.message, /QQBOT_APP_SECRET/);
+  assert.match(result.message, /连接设置/);
   assert.equal(requests[0]!.env.QQBOT_APP_ID, undefined);
   assert.equal(requests[0]!.env.QQBOT_APP_SECRET, undefined);
 });
@@ -141,7 +78,7 @@ test('terminal request uses trusted scripts and separate arguments with a scoped
   let request: TerminalLaunch | undefined;
   const result = await openGroupTerminal(f.cwd, {
     env: { SystemRoot: 'C:\\Windows', PIQ_PI_ENTRY: fakeEntry, QQBOT_APP_ID: 'synthetic-app-id' },
-    readUserEnvironment: async names => { assert.deepEqual(names, ['QQBOT_APP_SECRET']); return { QQBOT_APP_SECRET: 'private-test-token', IGNORED_FROM_USER: 'do-not-import' }; },
+    readManagedCredentials: async () => ({ appId: 'saved-app', appSecret: 'private-test-token', hasSecret: true, available: true }),
     prepareLaunch: async () => ({ token: 'terminal-return-test-token' }),
     clearLaunch: async () => {},
     launch: async specification => { request = specification; },
@@ -150,7 +87,7 @@ test('terminal request uses trusted scripts and separate arguments with a scoped
   assert.equal(request!.cwd, f.cwd);
   assert.equal(request!.command, 'wt.exe');
   assert.equal(request!.env.QQBOT_APP_ID, 'synthetic-app-id');
-  assert.equal(request!.env.QQBOT_APP_SECRET, 'private-test-token');
+  assert.equal(request!.env.QQBOT_APP_SECRET, undefined);
   assert.equal(request!.env.IGNORED_FROM_USER, undefined);
   assert.equal(request!.env.PIQ_GROUP_DIRECTORY, f.cwd);
   assert.equal(request!.env.PIQ_NODE_EXECUTABLE, process.execPath);

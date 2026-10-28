@@ -68,10 +68,9 @@ async function eventually(check: () => boolean | Promise<boolean>, label: string
 }
 
 async function fixture(t: TestContext) {
-  const variables = ['PIQ_TEST_APP_ID', 'PIQ_TEST_APP_SECRET', 'PIQ_TERMINAL_RETURN_TOKEN', 'PIQ_TERMINAL_WRAPPER_PID', 'PIQ_RUN_MODE', 'PIQ_START_RUNNING'];
+  const variables = ['PIQ_TERMINAL_RETURN_TOKEN', 'PIQ_TERMINAL_WRAPPER_PID', 'PIQ_RUN_MODE', 'PIQ_START_RUNNING'];
   const saved = Object.fromEntries(variables.map(name => [name, process.env[name]]));
-  process.env.PIQ_TEST_APP_ID = 'synthetic-application'; process.env.PIQ_TEST_APP_SECRET = 'synthetic-secret-never-sent';
-  for (const name of variables.slice(2)) delete process.env[name];
+  for (const name of variables) delete process.env[name];
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('External network is disabled in Pi integration tests'); });
   const parent = join(process.cwd(), '.test-tmp'); await mkdir(parent, { recursive: true });
   const root = await mkdtemp(join(parent, 'official-pi-host-'));
@@ -92,10 +91,7 @@ async function fixture(t: TestContext) {
   } = {}) {
     const conversations = options.conversations ?? [{ type: 'group' as const, id: `opaque-${id}` }];
     const cwd = await initializeGroup(root, id, { name: id, conversations });
-    const missingPrefix = `PIQ_ABSENT_${id.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`;
     await writeFile(join(cwd, 'PIQ.md'), '# Test group\n```json\n' + JSON.stringify({ id, name: id, conversations,
-      appIdEnv: options.credentials === false ? `${missingPrefix}_APP_ID` : 'PIQ_TEST_APP_ID',
-      appSecretEnv: options.credentials === false ? `${missingPrefix}_APP_SECRET` : 'PIQ_TEST_APP_SECRET',
       quietMs: 80, maxWaitMs: 500, minIntervalMs: 0 }) + '\n```\n');
     await writeFile(join(cwd, '.pi', 'settings.json'), JSON.stringify({ packages: [] }));
     await writeFile(join(cwd, 'AGENTS.md'), `# Group instructions\n\nRULES_ONLY_FOR_${id}\n`);
@@ -107,6 +103,11 @@ async function fixture(t: TestContext) {
     let settledTurns = 0;
     const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, extensionFactories: [api => {
       piq(api, {
+        readManagedCredentials: async directory => {
+          assert.equal(directory, cwd);
+          return options.credentials === false ? { appId: '', hasSecret: false, available: false }
+            : { appId: 'synthetic-application', appSecret: 'synthetic-secret-never-sent', hasSecret: true, available: true };
+        },
         claimAccount: options.claimAccount ?? (async () => { if (options.accountConflict) throw new Error('同一 AppID 已有 PiQ 对话组运行，请先结束该组后再启动。'); return async () => {}; }),
         createTransport: settings => { const channel = new FakeChannel(settings, !options.offline); channels.push(channel); return channel; },
       });
@@ -289,7 +290,7 @@ test('missing application credentials stay visible in runtime status and never c
   assert.equal(host.channels.length, 0);
   const status = await readRuntimeStatus(host.cwd);
   assert.equal(status?.connection, 'error');
-  assert.match(status?.lastError ?? '', /APP_ID|APP_SECRET/);
+  assert.match(status?.lastError ?? '', /AppID|AppSecret|凭据|连接设置/);
   assert.doesNotMatch(JSON.stringify(status), /synthetic-secret-never-sent/);
   await host.session.prompt('Work locally without QQ credentials.');
   assert.equal(host.faux.state.callCount, 1); assert.equal(host.channels.length, 0);

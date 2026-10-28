@@ -8,7 +8,7 @@ import { Notifier } from './notifier.ts';
 import { GroupStore } from './store.ts';
 import { QQBotTransport, type ConversationEvent } from './transport.ts';
 import { registerModelControl } from './model-control.ts';
-import { resolveGroupEnvironment } from './web-terminal.ts';
+import { resolveGroupEnvironment, type CredentialOptions } from './web-terminal.ts';
 import { RunController, type ConnectionState } from './run-control.ts';
 import { workspaceFile } from './workspace-files.ts';
 import { registerTerminal } from './terminal-monitor.ts';
@@ -21,6 +21,7 @@ type Channel = Pick<QQBotTransport, 'connect' | 'close' | 'isConnected' | 'send'
 export interface PiQOptions {
   createTransport?: (options: ConstructorParameters<typeof QQBotTransport>[0]) => Channel;
   claimAccount?: typeof claimBotAccount;
+  readManagedCredentials?: CredentialOptions['readManagedCredentials'];
 }
 interface Binding {
   id: string; cwd: string; config: GroupConfig; ctx: ExtensionContext; store: GroupStore;
@@ -99,10 +100,11 @@ export default function piq(pi: ExtensionAPI, options: PiQOptions = {}): void {
     try {
       const config = await loadConfig(ctx.cwd);
       if (!config || starting !== generation) return;
-      if (!config.conversations.length) throw new Error('请先添加官方群聊或私聊 OpenID；可用 piq discover 查看收到的对话标识。');
-      const credentials = await resolveGroupEnvironment(ctx.cwd, config);
+      if (!config.conversations.length) throw new Error('请先在工作台发现并加入群聊或私聊。');
+      const resolved = await resolveGroupEnvironment(ctx.cwd, config, { readManagedCredentials: options.readManagedCredentials });
+      const credentials = resolved.credentials;
       if (starting !== generation) return;
-      store = await GroupStore.open(ctx.cwd, config, credentials.env[config.appIdEnv]);
+      store = await GroupStore.open(ctx.cwd, config, credentials?.appId);
       if (starting !== generation) { await store.close(); return; }
       release = await claimConversations(ctx.cwd, config);
       if (starting !== generation) { await release(); await store.close(); return; }
@@ -112,7 +114,7 @@ export default function piq(pi: ExtensionAPI, options: PiQOptions = {}): void {
       }
       if (starting !== generation) { await release(); await store.close(); return; }
       current = { id: randomUUID(), cwd: ctx.cwd, ctx, config, store, releaseConversations: release,
-        members: new Set(config.conversations.map(conversationKey)), closed: false, selfId: credentials.env[config.appIdEnv] ?? config.id,
+        members: new Set(config.conversations.map(conversationKey)), closed: false, selfId: credentials?.appId ?? config.id,
         status: 'connecting', sendAbort: new AbortController(), resumeTurn: false, receiving: Promise.resolve(), confirmedSends: new Set<string>() } as Binding;
       const owner = current;
       owner.notifier = new Notifier(config, {
@@ -147,8 +149,8 @@ export default function piq(pi: ExtensionAPI, options: PiQOptions = {}): void {
       if (owner.control.paused) owner.notifier.suspend();
       binding = owner;
       if (starting !== generation) { binding = undefined; await close(owner); return; }
-      if (!credentials.credential.available) {
-        owner.status = 'error'; owner.lastError = credentials.credential.source; owner.control.refresh(); report(owner, owner.lastError); return;
+      if (!resolved.credential.available || !credentials) {
+        owner.status = 'error'; owner.lastError = resolved.credential.source; owner.control.refresh(); report(owner, owner.lastError); return;
       }
       let releaseAccount: () => Promise<void>;
       try { releaseAccount = await (options.claimAccount ?? claimBotAccount)(owner.selfId); }
@@ -160,7 +162,7 @@ export default function piq(pi: ExtensionAPI, options: PiQOptions = {}): void {
       if (owner.closed || starting !== generation || binding !== owner) { await releaseAccount(); return; }
       owner.releaseAccount = releaseAccount;
       owner.transport = (options.createTransport ?? (settings => new QQBotTransport(settings)))({
-        appId: credentials.env[config.appIdEnv]!, appSecret: credentials.env[config.appSecretEnv]!, groupMemberEvents: config.groupMemberEvents,
+        appId: credentials.appId, appSecret: credentials.appSecret, groupMemberEvents: config.groupMemberEvents,
         onMessage: event => {
           if (owner.closed) return;
           const delivery = owner.receiving.then(() => receive(owner, event));

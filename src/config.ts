@@ -9,8 +9,6 @@ export interface GroupConfig {
   id: string;
   name: string;
   conversations: Conversation[];
-  appIdEnv: string;
-  appSecretEnv: string;
   groupMemberEvents: boolean;
   quietMs: number;
   maxWaitMs: number;
@@ -18,7 +16,6 @@ export interface GroupConfig {
 }
 
 export const DEFAULTS: Omit<GroupConfig, 'id' | 'name' | 'conversations'> = {
-  appIdEnv: 'QQBOT_APP_ID', appSecretEnv: 'QQBOT_APP_SECRET',
   groupMemberEvents: false,
   quietMs: 1_500, maxWaitMs: 10_000, minIntervalMs: 15_000,
 };
@@ -50,17 +47,12 @@ export function validateConfig(value: unknown): GroupConfig {
   const conversations = value.conversations.map(validateConversation);
   if (new Set(conversations.map(conversationKey)).size !== conversations.length) throw new Error('同一对话在对话组中只能出现一次。');
   const merged = { ...DEFAULTS, ...value };
-  for (const field of ['appIdEnv', 'appSecretEnv'] as const) {
-    if (typeof merged[field] !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(merged[field])) {
-      throw new Error(`${field} 必须是有效的环境变量名；实际凭据不能写入 PIQ.md。`);
-    }
-  }
   if (typeof merged.groupMemberEvents !== 'boolean') throw new Error('groupMemberEvents 必须是布尔值。');
   for (const key of ['quietMs', 'maxWaitMs', 'minIntervalMs'] as const) {
     if (typeof merged[key] !== 'number' || !Number.isInteger(merged[key]) || merged[key] < 0 || merged[key] > 3_600_000) throw new Error(`${key} 必须是 0 到 3600000 的整数毫秒。`);
   }
   if (merged.maxWaitMs === 0 || merged.quietMs > merged.maxWaitMs) throw new Error('maxWaitMs 必须大于 0，且不小于 quietMs。');
-  return { id, name: value.name.trim(), conversations, appIdEnv: merged.appIdEnv, appSecretEnv: merged.appSecretEnv,
+  return { id, name: value.name.trim(), conversations,
     groupMemberEvents: merged.groupMemberEvents,
     quietMs: merged.quietMs, maxWaitMs: merged.maxWaitMs, minIntervalMs: merged.minIntervalMs };
 }
@@ -247,8 +239,6 @@ export async function assertAssignments(cwd: string, config: GroupConfig): Promi
 export interface InitializeOptions {
   name: string;
   conversations: Conversation[];
-  appIdEnv?: string;
-  appSecretEnv?: string;
   extensionPath?: string;
 }
 
@@ -259,10 +249,10 @@ async function createIfMissing(path: string, content: string): Promise<void> {
 
 export async function initializeGroup(rootInput: string, idInput: string, options: InitializeOptions): Promise<string> {
   const id = validateGroupId(idInput);
-  const requested = validateConfig({ id, name: options?.name, conversations: options?.conversations, ...DEFAULTS,
-    ...(options?.appIdEnv === undefined ? {} : { appIdEnv: options.appIdEnv }),
-    ...(options?.appSecretEnv === undefined ? {} : { appSecretEnv: options.appSecretEnv }),
-  });
+  if (!object(options) || Object.keys(options).some(key => !['name', 'conversations', 'extensionPath'].includes(key))) {
+    throw new Error('初始化选项含未知配置项。');
+  }
+  const requested = validateConfig({ id, name: options.name, conversations: options.conversations, ...DEFAULTS });
   return withRootLock(resolve(rootInput), async root => {
     const cwd = join(root, id);
     try { if ((await lstat(cwd)).isSymbolicLink()) throw new ConfigError(400, '对话组目录不能是符号链接。'); }
@@ -296,7 +286,7 @@ export async function initializeGroup(rootInput: string, idInput: string, option
       '本目录内的对话共用会话、人设、记忆和资料，成员对话见 PIQ.md。',
       'PERSONA.md 可记录人设；需要时自行读取、维护 MEMORY.md 或其他 Markdown。',
       '官方机器人群聊和私聊使用 OpenID 标识，日志保存在 messages/v3/group/<OpenID哈希>/ 与 messages/v3/private/<OpenID哈希>/，各自按日期使用 JSONL。',
-      '消息保留官方事件原文，发送必须明确指定 PIQ.md 中配置的本组对话；实际 AppID 与 AppSecret 只从指定环境变量读取。',
+      '消息保留官方事件原文，发送必须明确指定 PIQ.md 中配置的本组对话；AppID 与 AppSecret 在工作台填写，由本组单独管理，不能写入 Markdown。',
       'PiQ 通知只表示有新消息。自行阅读记录，判断是否回应，也可以保持沉默。',
       '发消息时调用 qq_send，并明确指定本组中的目标对话。普通 Pi 回答只显示在当前会话。',
       '回复以目标对话的上下文为准；其他对话尤其私聊的内容，不因属于同组而自动转述。',

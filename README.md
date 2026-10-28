@@ -6,7 +6,7 @@
 
 **同一个 AppID 同时只允许一个活动 PiQ 对话组。** 将这个机器人的多个群聊和私聊放进同一个组；需要多个组同时在线时，分别使用不同的机器人 AppID。PiQ 使用操作系统级占用检查，避免多个 SDK 实例争用同一机器人的连接。
 
-QQ 接入使用腾讯官方 **[`@tencent-connect/qqbot-nodejs@1.0.5`](https://github.com/tencent-connect/qqbot-nodejs)**，凭据由环境变量提供。当前版本使用 QQ 开放平台机器人身份，接收文字、图片、语音、视频、文件、卡片、引用和聊天记录等平台消息结构；发送及管理操作按具体接口和机器人权限执行。
+QQ 接入使用腾讯官方 **[`@tencent-connect/qqbot-nodejs@1.0.5`](https://github.com/tencent-connect/qqbot-nodejs)**。Windows 工作台可直接填写 AppID 和 AppSecret，凭据保存到当前用户的环境变量，AppSecret 保存后不回显。当前版本使用 QQ 开放平台机器人身份，接收文字、图片、语音、视频、文件、卡片、引用和聊天记录等平台消息结构；发送及管理操作按具体接口和机器人权限执行。
 
 - **终端运行**：工作台打开 Pi 终端，关闭终端即停止；需要批准的工具调用在终端确认。
 - **对话组管理**：创建、重命名、移入回收站和恢复；可重开空上下文，保留资料与历史文件。
@@ -24,7 +24,8 @@ QQ 接入使用腾讯官方 **[`@tencent-connect/qqbot-nodejs@1.0.5`](https://gi
 | Node.js | 24 系列至少 `24.22.1`，或 `26.12.1` 及以上；以 [package.json](package.json) 为准 |
 | Pi Coding Agent | 使用和验证的版本为 `1.4.0`；先完成模型认证与选择 |
 | QQ 开放平台机器人 | 已取得 AppID、AppSecret，并完成目标会话所需的平台配置与授权 |
-| Windows Terminal | 工作台打开终端需要 `wt.exe`；其他环境可在现有终端使用 CLI |
+| Windows | 当前机器人凭据的保存与读取使用 Windows 用户环境变量 |
+| Windows Terminal | 工作台打开 Pi 终端需要 `wt.exe` |
 
 Pi 可按[官方 Windows 说明](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/windows.md)安装，也可安装指定版本：
 
@@ -35,46 +36,42 @@ pi
 
 在 Pi 中使用 `/login` 配置模型访问，再用 `/model` 选择可用模型。
 
-### 2. 配置机器人凭据并启动工作台
+### 2. 准备官方机器人
+
+在 [QQ 开放平台](https://bot.qq.com/)创建机器人，取得 AppID 和 AppSecret。按[官方接入指引](https://bot.qq.com/wiki/)检查以下设置：
+
+1. 创建过程如出现“设置 AI 服务”，可以选择“稍后连接”，由 PiQ 提供模型与回复逻辑。
+2. 在“开发基础设置”的“事件订阅与回调地址”中选择 **WebSocket**。这种连接方式适合本机运行，无需配置公网回调服务器。
+3. 按实际使用范围设置机器人服务范围。测试时，将自己的 QQ 加入“内部体验号码”，再按平台页面指引把机器人加入测试群或打开机器人私聊。
+
+服务范围、事件订阅和消息权限以当前平台页面为准。AppSecret 在下面的本机工作台密码输入框中填写。
+
+### 3. 启动工作台并配置机器人
 
 ```powershell
 git clone https://github.com/Gliese-876/PiQ-Harness.git
 cd PiQ-Harness
 npm ci
-```
-
-在启动工作台的本机进程环境中提供以下变量：
-
-| 环境变量 | 内容 |
-| --- | --- |
-| `QQBOT_APP_ID` | QQ 开放平台机器人的 AppID |
-| `QQBOT_APP_SECRET` | 对应机器人的 AppSecret |
-
-凭据不写入 `PIQ.md`、角色文档、聊天记录或仓库。设置环境变量后重新启动工作台及 Pi 终端，使新进程取得配置。
-
-```powershell
 npm run web
 ```
 
-打开 [http://127.0.0.1:3210](http://127.0.0.1:3210)。工作台只监听本机回环地址。官方 SDK 随项目依赖安装；接入由 AppID/AppSecret 完成，没有个人号登录或扫码绑定流程。
+打开 [http://127.0.0.1:3210](http://127.0.0.1:3210)。工作台只监听本机回环地址，官方 SDK 随项目依赖安装。
 
-### 3. 创建对话组并取得 OpenID
+1. 点击“新建对话组”，填写名称，先创建空组。
+2. 打开本组“连接设置”，填写 AppID，在 AppSecret 密码框中输入密钥，然后保存。
+3. 检查工作台显示的凭据状态。凭据按本组目录保存在当前 Windows 用户的环境变量中；AppSecret 永不回显，也不写入项目凭据文件、`PIQ.md`、日志或接口响应。
 
-1. 点击“新建对话组”，填写名称；可以先创建空组并准备资料。
-2. 在“连接设置”填写凭据环境变量名，默认分别为 `QQBOT_APP_ID` 和 `QQBOT_APP_SECRET`。
-3. 准备目标会话的平台 OpenID。群聊使用 `group_openid`，机器人私聊使用对应用户 OpenID；数字 QQ 群号和个人 QQ 号不能代替它们。
-4. 在“对话”页添加成员，每个对话只归属一个组。标识形式为 `group:GROUP_OPENID` 或 `private:USER_OPENID`，保留原始大小写。
-5. 填写本组 `PERSONA.md`、`AGENTS.md`，选择模型，然后“打开 Pi 终端”。首次运行由本机操作者确认信任本组资源。
+首次保存须填写 AppID 和 AppSecret。再次配置同一 AppID 时，AppSecret 留空可保留此前在工作台为本组保存的值。已有记录的组绑定了机器人 AppID，更换机器人应新建组。机器人凭据统一通过 Windows 工作台配置，当前不提供其他操作系统的凭据配置入口。
 
-需要从实际事件取得 OpenID 时，先在另一个终端设置同一机器人的凭据，然后运行：
+### 4. 发现对话并打开 Pi
 
-```powershell
-npm run piq -- discover friends
-```
+1. 点击“发现对话”，临时连接机器人并等待平台事件。
+2. 在获准的测试群中 @ 机器人，或给机器人发一条私聊消息。工作台显示收到的对话，点选后加入本组；发现过程不自动回复。
+3. 填写本组 `PERSONA.md`、`AGENTS.md`，选择模型，然后“打开 Pi 终端”。首次运行由本机操作者确认信任本组资源。
 
-将 `friends` 换成已创建的空组标识。按平台要求在获准会话中 @ 机器人或给机器人发一条私聊消息；发现模式只显示收到的会话标识，不自动回复。记录输出的 `group:...` 或 `private:...`，按 Ctrl+C 退出，再到工作台添加成员。
+工作台打开 Pi 前会自动结束发现，也可以手动“结束发现”。同一 AppID 的发现和 Pi 运行共用连接占用；已有 Pi 运行时，先停止它再发现新对话。
 
-`discover` 同样占用 AppID。先退出发现模式，再打开该机器人的 Pi 终端；也不要在另一组同时启动相同 AppID。
+发现功能会取得平台 OpenID，无需手工查找。已知 OpenID 时仍可手动添加：群聊为 `group:GROUP_OPENID`，机器人私聊为 `private:USER_OPENID`，保留原始大小写。数字 QQ 群号和个人 QQ 号不能代替 OpenID，每个对话只归属一个组。
 
 OpenID 属于机器人所在的平台应用上下文，应与本组配置的 AppID 配套使用。接收哪些事件、可向哪些会话发送、回复时效和主动消息授权，以 QQ 开放平台实际权限与接口结果为准。
 
@@ -148,7 +145,7 @@ MiMo 沿用主人安装的技能，`MIMO_API_KEY` 从启动环境取得。将音
 | 平台消息记录 | PiQ 维护的 `messages/`，用原生读取工具查询 |
 | 密钥 | 环境变量或 Pi 自身认证机制 |
 
-长会话积累较多临时内容时，可以先整理确有保留价值的信息，再“重开会话”。备份前停止本组，整体保留组目录、聊天日志和通知水位。
+长会话积累较多临时内容时，可以先整理确有保留价值的信息，再“重开会话”。备份前停止本组，整体保留组目录、聊天日志和通知水位。机器人凭据保存在工作目录以外的环境变量中；换电脑或移动组目录后，需要重新配置凭据。
 
 消息聚合默认等待静默 1.5 秒，连续发言最多聚合 10 秒，两次通知至少间隔 15 秒。活跃群可尝试 `quietMs: 2500`、`maxWaitMs: 15000`、`minIntervalMs: 30000`，再按实际节奏调整。这些设置决定 PiQ 如何通知模型，不能延长平台的回复窗口。
 
@@ -167,7 +164,7 @@ PiQ-Messages/
   AGENTS.md                     公共约定
   .trash/                       可恢复的已删除组
   friends/
-    PIQ.md                      会话、凭据变量名与聚合参数
+    PIQ.md                      会话、成员事件与聚合参数
     AGENTS.md                   本组约定
     PERSONA.md                  本组人设
     MEMORY.md                   按需创建的长期记忆
@@ -190,8 +187,6 @@ PiQ-Messages/
     { "type": "group", "id": "GROUP_OPENID", "name": "项目群" },
     { "type": "private", "id": "USER_OPENID", "name": "协作私聊" }
   ],
-  "appIdEnv": "QQBOT_APP_ID",
-  "appSecretEnv": "QQBOT_APP_SECRET",
   "groupMemberEvents": false,
   "quietMs": 1500,
   "maxWaitMs": 10000,
@@ -199,7 +194,7 @@ PiQ-Messages/
 }
 ```
 
-OpenID 示例必须换成平台返回的真实值。`appIdEnv`、`appSecretEnv` 填环境变量名称，不填凭据内容；不同机器人可以使用不同变量名。组内的 v3 数据带有机器人应用绑定，后续 AppID 不一致时会拒绝混用；更换机器人 AppID 应新建对话组，不能只改环境变量并沿用原组。外部扩展设置放在各自指定位置，不往 `PIQ.md` 添加未知字段。
+OpenID 示例必须换成平台返回的真实值。机器人凭据只通过工作台保存，不写入此文件。组内的 v3 数据带有机器人应用绑定，后续 AppID 不一致时会拒绝混用；更换机器人 AppID 应新建对话组。旧格式配置会被拒绝，请通过当前工作台新建配置。外部扩展设置放在各自指定位置，不往 `PIQ.md` 添加未知字段。
 
 `groupMemberEvents` 默认是 `false`。需要记录群成员事件时，可在工作台的连接设置中开启；机器人还须取得平台相应事件权限。保存后重新打开 Pi 终端，使新的事件订阅生效。
 
@@ -218,9 +213,14 @@ OpenID 示例必须换成平台返回的真实值。`appIdEnv`、`appSecretEnv` 
 
 参数与 JSON 示例见 **[QQ 工具与消息记录](docs/qq-tools.md)**。`replyTo` 使用本对话收到的平台消息字符串 ID；`seq` 是本地日志序号，不能用于平台回复。
 
+### CLI
+
+CLI 的 `open` 和 `discover` 读取工作台已为本组保存的凭据。先在 Windows 工作台“连接设置”填写并保存 AppID/AppSecret，再运行下列连接命令。
+
 ```powershell
 # 创建空组，稍后取得 OpenID 并添加成员
 npm run piq -- init friends --name "朋友"
+# 在工作台为 friends 保存机器人凭据后，再执行以下命令
 # 监听实际平台事件，显示可配置的会话 OpenID
 npm run piq -- discover friends
 # 在当前终端继续最近会话
@@ -232,6 +232,8 @@ npm run piq -- path friends
 ```
 
 CLI 同样支持 `--root`；`init` 可重复使用 `--conversation group:GROUP_OPENID` 或 `--conversation private:USER_OPENID`。`open` 可在 `--` 后传入 Pi 参数。Pi 中的 `/piq` 查看状态，`/piq retry` 重试未确认的本地消息通知。
+
+CLI `discover` 只显示实际收到的 `group:...` 或 `private:...`。在目标会话发送消息取得标识后，按 Ctrl+C 结束发现，再添加成员并打开 Pi；它与工作台发现功能一样占用当前 AppID。
 
 ## 连接、消息记录与限制
 
@@ -257,7 +259,7 @@ SDK 负责平台连接与重连；PiQ 的本地持久记录用于查询已收到
 
 1. 停止旧 Pi 会话和工作台，将整个旧工作区保留为归档。
 2. 使用新的空根目录启动本版本，例如 `npm run web -- --root D:\PiQ-QQBot`。
-3. 手工配置机器人的 AppID/AppSecret 环境变量，重新取得 OpenID，建立新对话组。
+3. 建立新对话组，在 Windows 工作台“连接设置”填写并保存 AppID/AppSecret，再用“发现对话”加入目标群聊和私聊。
 4. 检查后按需复制人设、约定、记忆或媒体资料。保留旧消息和旧 Pi 会话作为归档，不将它们覆盖到新组的日志、运行状态或会话目录。
 
 程序不自动扫描并转换旧工作区，不复用旧端点、令牌、补拉游标或旧消息格式。需要查看旧记录时，在归档目录中单独阅读。

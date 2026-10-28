@@ -5,10 +5,12 @@ import { dirname, join, relative, isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { defaultMessagesRoot } from './cli.ts';
-import { DEFAULTS, initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, validateConfig, validateGroupId, type GroupConfig } from './config.ts';
+import { initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, validateConfig, validateGroupId, type GroupConfig } from './config.ts';
 import { deleteGroup, listDeletedGroups, restoreGroup } from './group-management.ts';
 import { conversationKey, conversationDirectory, parseConversationKey, type Conversation } from './conversations.ts';
 import { credentialStatus, getRunningOwner, openGroupTerminal } from './web-terminal.ts';
+import { saveManagedCredentials, ManagedCredentialError } from './bot-credentials.ts';
+import { createWebDiscovery } from './web-discovery.ts';
 import { getModelPreference, listModels, saveModelPreference, type ModelCatalog } from './web-models.ts';
 import { readModelStatus, requestModelChange } from './model-control.ts';
 import { clearInterruptedWork, readRuntimeStatus, requestRunAction } from './run-control.ts';
@@ -52,14 +54,17 @@ async function textFile(path: string, allowMissing = false): Promise<string> {
   } catch (error) { if (allowMissing && missing(error)) return ''; throw error; }
 }
 
-async function readBody(request: IncomingMessage): Promise<Record<string, unknown>> {
-  if (!request.headers['content-type']?.startsWith('application/json')) throw new HttpError(415, '需要 JSON 请求。');
+async function readBody(request: IncomingMessage, allowEmpty = false): Promise<Record<string, unknown>> {
+  const isJson = request.headers['content-type']?.startsWith('application/json');
+  if (!isJson && !allowEmpty) throw new HttpError(415, '需要 JSON 请求。');
   const chunks: Buffer[] = []; let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
     if (size > MAX_BODY) throw new HttpError(413, '内容超过 512 KB。');
     chunks.push(Buffer.from(chunk));
   }
+  if (size === 0 && allowEmpty) return {};
+  if (!isJson) throw new HttpError(415, '需要 JSON 请求。');
   try {
     const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
@@ -77,6 +82,8 @@ export interface WebOptions {
   port?: number;
   openTerminal?: typeof openGroupTerminal;
   credentials?: typeof credentialStatus;
+  saveCredentials?: typeof saveManagedCredentials;
+  discovery?: ReturnType<typeof createWebDiscovery>;
   models?: () => Promise<ModelCatalog>;
   action?: typeof requestRunAction;
 }
@@ -87,11 +94,19 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
   const csrfToken = randomBytes(32).toString('hex');
   const launch = options.openTerminal ?? openGroupTerminal;
   const credentials = options.credentials ?? credentialStatus;
+  const saveCredentials = options.saveCredentials ?? saveManagedCredentials;
+  const discovery = options.discovery ?? createWebDiscovery();
   const models = options.models ?? (() => listModels());
   const action = options.action ?? requestRunAction;
   const launching = new Map<string, number>();
   const operations = new Map<string, Promise<unknown>>();
   let port = 0;
+  let closing = false;
+
+  async function stopDiscovery(cwd: string): Promise<void> {
+    const state = await discovery.stop(cwd);
+    if (state.state === 'error') throw new HttpError(409, state.error ?? '发现连接尚未正常关闭，请检查机器人占用。');
+  }
 
   async function runtime(cwd: string) {
     const process = await getProcessStatus(cwd);
@@ -143,6 +158,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
   async function openSession(id: string, freshSession: boolean) {
     const cwd = await groupPath(id);
     if (!(await loadConfig(cwd))!.conversations.length) throw new HttpError(400, '请先添加至少一个对话。');
+    await stopDiscovery(cwd);
     if ((launching.get(id) ?? 0) > Date.now()) {
       if (freshSession) throw new HttpError(409, '终端正在打开，请等启动完成后重开会话。');
       return { alreadyRunning: true, message: '终端正在打开，请稍候。' };
@@ -232,6 +248,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
     response.setHeader('Referrer-Policy', 'no-referrer');
     response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
     void (async () => {
+      if (closing) throw new HttpError(503, '工作台正在关闭。');
       const host = request.headers.host;
       if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) throw new HttpError(403, '仅允许从本机地址访问。');
       if (!request.url?.startsWith('/')) throw new HttpError(400, '无效路径。');
@@ -253,7 +270,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       }
       if (method === 'GET' && url.pathname === '/api/state') {
         const list = await groups();
-        json(response, { root, csrfToken, groups: list, defaultAppIdEnv: DEFAULTS.appIdEnv, defaultAppSecretEnv: DEFAULTS.appSecretEnv }); return;
+        json(response, { root, csrfToken, groups: list }); return;
       }
       if (method === 'GET' && url.pathname === '/api/models') { json(response, await models()); return; }
       if (method === 'GET' && url.pathname === '/api/trash') {
@@ -275,13 +292,12 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       }
       if (method === 'POST' && url.pathname === '/api/groups') {
         const body = await readBody(request);
-        if (Object.keys(body).some(key=>!['id','name','conversations','appIdEnv','appSecretEnv'].includes(key))) throw new HttpError(400,'请使用对话组创建格式。');
+        if (Object.keys(body).some(key=>!['id','name','conversations'].includes(key))) throw new HttpError(400,'请使用对话组创建格式。');
         const id = validateGroupId(body.id ?? `cg-${randomBytes(4).toString('hex')}`);
         await exclusive(`init:${id}`, async () => {
           try { await lstat(join(root, id)); throw new HttpError(409, '该群目录已存在。'); }
           catch (error) { if (!missing(error)) throw error; }
-          await initializeGroup(root, id, { name: body.name as string, conversations: body.conversations as Conversation[],
-            appIdEnv: body.appIdEnv as string | undefined, appSecretEnv: body.appSecretEnv as string | undefined });
+          await initializeGroup(root, id, { name: body.name as string, conversations: body.conversations as Conversation[] });
         });
         json(response, { id }, 201); return;
       }
@@ -290,6 +306,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       if (method === 'DELETE' && parts.length === 3) {
         await exclusive(`run:${id}`, async () => {
           if ((launching.get(id) ?? 0) > Date.now()) throw new HttpError(409, '终端正在打开，请等启动完成并停止后重试。');
+          await stopDiscovery(await groupPath(id));
           const result = await deleteGroup(join(root, id));
           launching.delete(id);
           json(response, result);
@@ -297,6 +314,45 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
         return;
       }
       const cwd = await groupPath(id);
+      if (parts[3] === 'credentials' && parts.length === 4 && method === 'PUT') {
+        const body = await readBody(request);
+        if (Object.keys(body).some(key => !['appId', 'appSecret'].includes(key)) || typeof body.appId !== 'string'
+          || (body.appSecret !== undefined && typeof body.appSecret !== 'string')) throw new HttpError(400, '请填写机器人 AppID 和 AppSecret。');
+        await exclusive(`run:${id}`, async () => {
+          await stopDiscovery(cwd);
+          const state = await getProcessStatus(cwd);
+          const busy = state.running || state.starting || (launching.get(id) ?? 0) > Date.now();
+          if (busy) {
+            const current = await credentials((await loadConfig(cwd))!, {}, cwd);
+            if (current.appId !== (body.appId as string).trim()) throw new HttpError(409, '请先停止本组 Pi，再修改机器人 AppID。');
+          }
+          try {
+            const saved = await saveCredentials(cwd, { appId: body.appId as string, appSecret: body.appSecret as string | undefined });
+            json(response, { credential: { appId: saved.appId, hasSecret: saved.hasSecret, available: saved.available,
+              managed: true, source: '机器人凭据已保存在本机。' }, restartRequired: busy });
+          } catch (error) {
+            if (error instanceof ManagedCredentialError) throw error;
+            throw new HttpError(400, '保存机器人凭据失败，请在本机重试。');
+          }
+        });
+        return;
+      }
+      if (parts[3] === 'discovery' && parts.length === 4) {
+        if (method === 'GET') { json(response, discovery.snapshot(cwd)); return; }
+        if (method === 'POST' || method === 'DELETE') {
+          const body = await readBody(request, method === 'DELETE');
+          if (Object.keys(body).length) throw new HttpError(400, '发现对话不需要额外参数。');
+          await exclusive(`run:${id}`, async () => {
+            if (method === 'DELETE') { json(response, await discovery.stop(cwd)); return; }
+            const state = await getProcessStatus(cwd);
+            if (state.running || state.starting || (launching.get(id) ?? 0) > Date.now()) throw new HttpError(409, '请先停止本组 Pi，再发现对话。');
+            const config = (await loadConfig(cwd))!;
+            if (!(await credentials(config, {}, cwd)).available) throw new HttpError(400, '请先填写并保存机器人 AppID 和 AppSecret。');
+            json(response, await discovery.start(cwd));
+          });
+          return;
+        }
+      }
       if (parts[3] === 'model' && parts.length === 4) {
         const runtimeState = async () => {
           const owner = await getRunningOwner(cwd);
@@ -323,7 +379,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
         const logs = await logIndex(cwd, config);
         json(response, { id, name: config.name, conversations: config.conversations, path: cwd, ...await runtime(cwd), config,
           configRevision: revision(await textFile(await safeFile(cwd, 'PIQ.md'))),
-          documents: [...DOCS], logs, credential: await credentials(config) }); return;
+          documents: [...DOCS], logs, credential: await credentials(config, {}, cwd) }); return;
       }
       if (parts[3] === 'documents' && parts.length === 5 && DOCS.has(parts[4]!)) {
         const file = parts[4]!;
@@ -371,7 +427,7 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
         const config = validateConfig(body.config);
         if (config.id !== id) throw new HttpError(400, '此处不能更改对话组标识。');
         const saved = await saveGroupConfig(cwd,config,body.revision as string);
-        json(response, { ...saved, credential: await credentials(saved.config) }); return;
+        json(response, { ...saved, credential: await credentials(saved.config, {}, cwd) }); return;
       }
       if (method === 'POST' && parts.length === 4 && ['open', 'start', 'new-session'].includes(parts[3]!)) {
         const body = await readBody(request);
@@ -410,5 +466,13 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('WebUI 启动失败。');
   port = address.port;
-  return { server, url: `http://127.0.0.1:${port}`, close: () => new Promise<void>((resolve, reject) => { server.close(error => error ? reject(error) : resolve()); server.closeIdleConnections(); }) };
+  let closePromise: Promise<void> | undefined;
+  return { server, url: `http://127.0.0.1:${port}`, close: () => {
+    closing = true;
+    closePromise ??= (async () => {
+      try { await discovery.close(); }
+      finally { await new Promise<void>((resolve, reject) => { server.close(error => error ? reject(error) : resolve()); server.closeIdleConnections(); }); }
+    })();
+    return closePromise;
+  } };
 }

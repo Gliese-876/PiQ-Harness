@@ -10,7 +10,7 @@ import { claimBotAccount } from '../src/bot-owner.ts';
 import { discoverGroup, type DiscoverOptions } from '../src/discover.ts';
 import type { ConversationEvent, TransportOptions } from '../src/transport.ts';
 
-const env = { QQBOT_APP_ID: 'synthetic-app-id', QQBOT_APP_SECRET: 'synthetic-app-secret' };
+const credentials = { appId: 'synthetic-app-id', appSecret: 'synthetic-app-secret', hasSecret: true, available: true };
 
 async function fixture(t: TestContext, config: Record<string, unknown> | null = { id: 'discovery', name: '发现会话', conversations: [] }) {
   const parent = resolve('.test-tmp');
@@ -24,7 +24,9 @@ async function fixture(t: TestContext, config: Record<string, unknown> | null = 
   if (config) await writeFile(join(cwd, 'PIQ.md'), `# QQ 机器人\n\n\`\`\`json\n${JSON.stringify(config)}\n\`\`\`\n`);
   const lines: string[] = [];
   const controller = new AbortController();
-  const options: DiscoverOptions = { env, output: line => { lines.push(line); }, signal: controller.signal, claimAccount: async () => async () => {} };
+  const options: DiscoverOptions = { env: {}, output: line => { lines.push(line); }, signal: controller.signal,
+    readManagedCredentials: async directory => { assert.equal(directory, cwd); return { ...credentials }; },
+    claimAccount: async () => async () => {} };
   return { cwd, lines, controller, options };
 }
 
@@ -56,18 +58,18 @@ test('discovery reports invalid configuration without echoing its contents', asy
   assert.doesNotMatch(f.lines.join('\n'), /PRIVATE-CONFIG-SECRET/);
 });
 
-test('discovery explains missing credential variables without printing available values', async t => {
-  const f = await fixture(t, { id: 'discovery', name: '发现会话', conversations: [], appIdEnv: 'DISCOVERY_APP_ID', appSecretEnv: 'DISCOVERY_APP_SECRET' });
+test('discovery explains incomplete managed credentials without printing available values', async t => {
+  const f = await fixture(t);
   let created = false;
   let claimed = false;
   assert.equal(await discoverGroup(f.cwd, {
-    ...f.options, env: { DISCOVERY_APP_ID: 'PRIVATE-APP-ID' },
+    ...f.options, readManagedCredentials: async () => ({ appId: 'PRIVATE-APP-ID', hasSecret: false, available: false }),
     claimAccount: async () => { claimed = true; return async () => {}; },
     createTransport: () => { created = true; throw new Error('unexpected'); },
   }), 1);
   assert.equal(created, false);
   assert.equal(claimed, false);
-  assert.match(f.lines.join('\n'), /DISCOVERY_APP_SECRET/);
+  assert.match(f.lines.join('\n'), /AppSecret|凭据|连接设置/);
   assert.doesNotMatch(f.lines.join('\n'), /PRIVATE-APP-ID/);
 });
 
@@ -79,7 +81,7 @@ test('discovery prints each observed conversation once and never persists or rep
   assert.equal(await discoverGroup(f.cwd, {
     ...f.options,
     claimAccount: async appId => {
-      assert.equal(appId, env.QQBOT_APP_ID);
+      assert.equal(appId, credentials.appId);
       lifecycle.push('claim');
       return async () => { lifecycle.push('release'); };
     },
@@ -105,8 +107,8 @@ test('discovery prints each observed conversation once and never persists or rep
       };
     },
   }), 0);
-  assert.equal(received?.appId, env.QQBOT_APP_ID);
-  assert.equal(received?.appSecret, env.QQBOT_APP_SECRET);
+  assert.equal(received?.appId, credentials.appId);
+  assert.equal(received?.appSecret, credentials.appSecret);
   assert.equal(closed, 1);
   assert.deepEqual(lifecycle, ['claim', 'create', 'connect', 'close', 'release']);
   assert.deepEqual(f.lines.filter(line => line.startsWith('{')).map(line => JSON.parse(line)), [
@@ -119,13 +121,16 @@ test('discovery prints each observed conversation once and never persists or rep
   assert.deepEqual(await readdir(f.cwd), ['PIQ.md']);
 });
 
-test('discovery resolves the configured credential names through the supplied environment reader', async t => {
-  const f = await fixture(t, { id: 'discovery', name: '发现会话', conversations: [], appIdEnv: 'DISCOVERY_APP_ID', appSecretEnv: 'DISCOVERY_APP_SECRET' });
-  const requested: string[][] = [];
-  const parentEnv = Object.freeze({ DISCOVERY_APP_ID: 'PRIVATE-CUSTOM-ID' });
+test('discovery resolves credentials for its workspace through the supplied managed reader', async t => {
+  const f = await fixture(t);
+  const requested: string[] = [];
+  const parentEnv = Object.freeze({ UNRELATED_SETTING: 'preserved' });
   assert.equal(await discoverGroup(f.cwd, {
     ...f.options, env: parentEnv,
-    readUserEnvironment: async names => { requested.push([...names]); return { DISCOVERY_APP_SECRET: 'PRIVATE-CUSTOM-SECRET' }; },
+    readManagedCredentials: async directory => {
+      requested.push(directory);
+      return { appId: 'PRIVATE-CUSTOM-ID', appSecret: 'PRIVATE-CUSTOM-SECRET', hasSecret: true, available: true };
+    },
     createTransport: specification => ({
       async connect() {
         assert.equal(specification.appId, 'PRIVATE-CUSTOM-ID');
@@ -135,8 +140,8 @@ test('discovery resolves the configured credential names through the supplied en
       close() {},
     }),
   }), 0);
-  assert.deepEqual(requested, [['DISCOVERY_APP_SECRET']]);
-  assert.deepEqual(parentEnv, { DISCOVERY_APP_ID: 'PRIVATE-CUSTOM-ID' });
+  assert.deepEqual(requested, [f.cwd]);
+  assert.deepEqual(parentEnv, { UNRELATED_SETTING: 'preserved' });
   assert.doesNotMatch(f.lines.join('\n'), /PRIVATE-CUSTOM/);
 });
 
@@ -215,7 +220,7 @@ test('SIGINT and SIGTERM close discovery and remove their process listeners', as
       'const before = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];',
       'let closed = 0;',
       'let released = 0;',
-      `const code = await discoverGroup(process.cwd(), { env: ${JSON.stringify(env)}, output() {},`,
+      `const code = await discoverGroup(process.cwd(), { env: {}, readManagedCredentials: async () => (${JSON.stringify(credentials)}), output() {},`,
       '  claimAccount: async () => async () => { released++; },',
       '  createTransport: () => ({',
       `    async connect() { queueMicrotask(() => process.emit(${JSON.stringify(signal)})); },`,
@@ -238,7 +243,7 @@ test('SIGINT and SIGTERM close discovery and remove their process listeners', as
 test('discovery refuses an owned application before creating the SDK and keeps its error private', async t => {
   const f = await fixture(t);
   const namespace = `discovery-conflict-${randomUUID()}`;
-  const release = await claimBotAccount(env.QQBOT_APP_ID, { namespace });
+  const release = await claimBotAccount(credentials.appId, { namespace });
   t.after(release);
   let created = false;
   assert.equal(await discoverGroup(f.cwd, {

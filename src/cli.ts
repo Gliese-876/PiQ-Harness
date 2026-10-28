@@ -27,8 +27,6 @@ export interface CliOptions {
   name?: string;
   conversations?: Conversation[];
   root?: string;
-  appIdEnv?: string;
-  appSecretEnv?: string;
   freshSession?: boolean;
   piArgs: string[];
 }
@@ -55,7 +53,7 @@ export function parseArgs(args: string[]): CliOptions {
       result.conversations!.push(parseConversationKey(args[++i]));
       continue;
     }
-    const key = arg === "--root" ? "root" : arg === "--app-id-env" ? "appIdEnv" : arg === "--app-secret-env" ? "appSecretEnv" : arg === '--name' ? 'name' : null;
+    const key = arg === "--root" ? "root" : arg === '--name' ? 'name' : null;
     if (!key) throw new Error(`未知参数：${arg}`);
     const value = args[++i];
     if (!value || value.startsWith("--")) throw new Error(`${arg} 缺少值。`);
@@ -189,12 +187,13 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     console.log([
       "PiQ — 让多个对话共用一个独立的 Pi 工作目录", "",
       "node src/cli.ts init <对话组标识> --name <名称> [--conversation group:group_openid] [--conversation private:user_openid]",
-      "  [--root <目录>] [--app-id-env <变量名>] [--app-secret-env <变量名>]",
+      "  [--root <目录>]",
       "node src/cli.ts open <对话组标识> [--root <目录>] [--new-session] [-- <Pi参数...>]",
       "node src/cli.ts discover <对话组标识> [--root <目录>]",
       "node src/cli.ts path <对话组标识> [--root <目录>]", "",
       "默认目录：文档/PiQ-Messages/<对话组标识>。每个对话只能属于一个对话组。",
       "--conversation 可以重复使用；未添加对话的空组可先编辑配置。",
+      "QQ 机器人凭据请在工作台填写，自动发现收到事件的群聊或私聊。",
       "discover 仅监听 QQ 机器人事件并显示对话标识，不发送消息、不输出正文；Ctrl+C 退出。",
       "open 继承当前终端、模型配置和环境变量，并继续本组 .pi/sessions 中的最近会话。",
       "--new-session 新建空上下文，保留已有会话、聊天日志、记忆与资料；关闭终端即停止运行。",
@@ -208,8 +207,6 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     console.log(await initializeGroup(root, options.id!, {
       name: options.name!,
       conversations: options.conversations!,
-      appIdEnv: options.appIdEnv,
-      appSecretEnv: options.appSecretEnv,
     }));
     return 0;
   }
