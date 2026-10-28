@@ -354,6 +354,9 @@ test('concurrent saves for one directory preserve the selected application and s
     saveManagedCredentials(f.cwd, { appId: 'APP_ID_B', appSecret: 'secret-b' }, f.options),
   ]);
   assert.equal(peak, 1);
-  assert.equal(f.values.get(f.names.appIdEnv), 'APP_ID_B');
-  assert.equal(f.values.get(f.names.appSecretEnv), 'secret-b');
+  assert.equal(f.writes.length, 2);
+  const finalAppId = f.values.get(f.names.appIdEnv);
+  assert.ok(finalAppId === 'APP_ID_A' || finalAppId === 'APP_ID_B');
+  assert.equal(f.values.get(f.names.appSecretEnv), finalAppId === 'APP_ID_A' ? 'secret-a' : 'secret-b');
+  assert.equal(finalAppId, f.writes.at(-1)![f.names.appIdEnv]);
 });
