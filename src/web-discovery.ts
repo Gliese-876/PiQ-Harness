@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 import { conversationKey, parseConversationKey, validateOpenId } from './conversations.ts';
-import { discoverGroup } from './discover.ts';
+import { discoverGroup, DISCOVERY_BOT_STATE_ERROR } from './discover.ts';
 
 export interface WebDiscoverySnapshot {
   state: 'idle' | 'connecting' | 'connected' | 'error';
@@ -26,6 +26,7 @@ interface Entry {
   seen: Set<string>;
   error?: string;
   cleanupFailed?: boolean;
+  connectionError?: string;
   controller?: AbortController;
   run?: Promise<void>;
   timer?: ReturnType<typeof setTimeout>;
@@ -60,14 +61,17 @@ export function createWebDiscovery(options: WebDiscoveryOptions = {}): WebDiscov
       case 'QQ 官方机器人连接已断开，等待重新连接。':
         entry.state = 'connecting'; delete entry.error; return;
       case 'QQ 官方机器人已连接，等待会话事件。':
-        entry.state = 'connected'; delete entry.error; return;
+        entry.state = 'connected'; delete entry.error; delete entry.connectionError; return;
       case 'QQ 官方机器人连接发生错误，请检查应用配置和网络。':
+        entry.state = 'connecting'; entry.error = entry.connectionError ?? '连接暂时异常，正在等待重新连接。'; return;
       case '无法启动 QQ 官方机器人连接，请检查应用配置和网络。':
-        entry.state = 'error'; entry.error = failed; return;
+        entry.state = 'error'; entry.error = entry.connectionError ?? failed; return;
+      case DISCOVERY_BOT_STATE_ERROR:
+        entry.connectionError = DISCOVERY_BOT_STATE_ERROR; entry.error = DISCOVERY_BOT_STATE_ERROR; return;
       case '无法读取 PIQ.md，请检查当前对话组配置。':
       case '当前对话组缺少 PIQ.md，请先初始化对话组。':
         entry.state = 'error'; entry.error = '无法读取当前对话组配置，请检查 PIQ.md。'; return;
-      case '无法读取 QQ 机器人凭据，请检查应用环境变量。':
+      case '无法读取 QQ 机器人凭据，请检查工作台的连接设置。':
         entry.state = 'error'; entry.error = '无法读取机器人凭据，请在连接设置保存机器人凭据。'; return;
       case '无法取得 QQ 机器人运行占用；同一 AppID 可能已有 PiQ 对话组运行，请先结束相关组并检查本机 socket 占用。':
         entry.state = 'error'; entry.error = '机器人运行占用不可用，请先停止其他 PiQ 实例并检查本机 socket 权限。'; return;
@@ -75,7 +79,7 @@ export function createWebDiscovery(options: WebDiscoveryOptions = {}): WebDiscov
       case '无法释放 QQ 机器人的本机运行占用，请结束当前进程。':
         entry.state = 'error'; entry.error = failedStop; entry.cleanupFailed = true; return;
     }
-    // Credential variable names can vary; the original diagnostic is never returned.
+    // Credential diagnostics are reduced to fixed text without exposing their contents.
     if (value.startsWith('无法连接 QQ 官方机器人：')) {
       entry.state = 'error'; entry.error = '机器人凭据不完整，请在连接设置保存机器人凭据。'; return;
     }
@@ -104,6 +108,7 @@ export function createWebDiscovery(options: WebDiscoveryOptions = {}): WebDiscov
       entry.state = 'idle'; delete entry.error;
     }
     if (entry.cleanupFailed) { entry.state = 'error'; entry.error = failedStop; }
+    else { entry.state = 'idle'; delete entry.error; }
     return copy(entry);
   }
 
@@ -128,7 +133,6 @@ export function createWebDiscovery(options: WebDiscoveryOptions = {}): WebDiscov
         })).then(code => {
           if (code === 0 && !entry.cleanupFailed) { entry.state = 'idle'; delete entry.error; }
           else {
-            if (controller.signal.aborted) entry.cleanupFailed = true;
             entry.state = 'error'; entry.error = entry.cleanupFailed ? failedStop : entry.error ?? failed;
           }
         }, () => {

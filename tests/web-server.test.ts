@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
-import { mkdir, mkdtemp, readFile, writeFile, rm, symlink, realpath, unlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm, symlink, realpath, unlink, readdir } from 'node:fs/promises';
 import { join, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, type TestContext } from 'node:test';
@@ -13,6 +13,7 @@ import { createWebDiscovery, type WebDiscovery } from '../src/web-discovery.ts';
 import type { ModelCatalog } from '../src/web-models.ts';
 import { getProcessStatus } from '../src/process-manager.ts';
 import { prepareTerminalLaunch, registerTerminal } from '../src/terminal-monitor.ts';
+import { GroupStore } from '../src/store.ts';
 
 interface State {
   root: string;
@@ -808,4 +809,50 @@ test('an active Pi permits secret rotation but blocks an application change befo
   const rotated = await f.call('/api/groups/123456/credentials', 'PUT', { appId: 'current-app', appSecret: 'new-secret' });
   assert.equal(rotated.status, 200); assert.equal(writes, 1);
   assert.equal((await rotated.json() as { restartRequired: boolean }).restartRequired, true);
+});
+
+test('replacing a bound bot needs confirmation and archives its data before saving new credentials', async t => {
+  let account = 'OLD_APP', writes = 0;
+  const f = await fixture(t, { models: [] }, {
+    credentials: async () => ({ appId: account, available: true, hasSecret: true, managed: true, source: '模拟' }),
+    saveCredentials: async (cwd, input) => {
+      writes++;
+      assert.equal(JSON.parse(await readFile(join(cwd, '.piq/bot-account.json'), 'utf8')).accountId, 'NEW_APP');
+      account = input.appId;
+      return { appId: account, hasSecret: true, available: true };
+    },
+  });
+  const config = (await loadConfig(f.cwd))!;
+  const store = await GroupStore.open(f.cwd, config, 'OLD_APP');
+  await store.append({ conversation: config.conversations[0]!, messageId: 'old-message', selfId: 'OLD_APP', userId: 'Synthetic_User',
+    sender: 'Synthetic', time: 1700000000, rawText: 'old account body', outgoing: false });
+  await store.close();
+  await writeFile(join(f.cwd, 'MEMORY.md'), 'KEEP_MEMORY');
+  const input = { appId: 'NEW_APP', appSecret: 'NEW_SYNTHETIC_SECRET' };
+  assert.equal((await f.call('/api/groups/123456/credentials', 'PUT', input)).status, 409);
+  assert.equal(writes, 0);
+  const replaced = await f.call('/api/groups/123456/credentials', 'PUT', { ...input, replaceAccount: true });
+  assert.equal(replaced.status, 200, await replaced.clone().text());
+  const result = await replaced.json() as { replacedAccount: boolean; archivePath: string; credential: { appId: string }; config: GroupConfig };
+  assert.equal(result.replacedAccount, true); assert.equal(result.credential.appId, 'NEW_APP');
+  assert.deepEqual(result.config.conversations, []); assert.equal(writes, 1);
+  assert.doesNotMatch(JSON.stringify(result), /NEW_SYNTHETIC_SECRET/);
+  assert.equal(await readFile(join(f.cwd, 'MEMORY.md'), 'utf8'), 'KEEP_MEMORY');
+  const archived = join(f.cwd, result.archivePath, conversationDirectory(config.conversations[0]!));
+  const logs = await readdir(archived);
+  assert.equal(JSON.parse((await readFile(join(archived, logs[0]!), 'utf8')).trim()).selfId, 'OLD_APP');
+});
+
+test('failed bot replacement does not leave new binding or cleared conversations behind', async t => {
+  const f = await fixture(t, { models: [] }, {
+    credentials: async () => ({ appId: 'OLD_APP', available: true, hasSecret: true, source: '模拟' }),
+    saveCredentials: async () => { throw new Error('PRIVATE_CREDENTIAL_ERROR'); },
+  });
+  const original = await readFile(join(f.cwd, 'PIQ.md'), 'utf8');
+  const store = await GroupStore.open(f.cwd, (await loadConfig(f.cwd))!, 'OLD_APP'); await store.close();
+  const failed = await f.call('/api/groups/123456/credentials', 'PUT', { appId: 'NEW_APP', appSecret: 'NEW_SYNTHETIC_SECRET', replaceAccount: true });
+  assert.equal(failed.status, 500);
+  assert.doesNotMatch(await failed.text(), /PRIVATE_CREDENTIAL_ERROR|NEW_SYNTHETIC_SECRET/);
+  assert.equal(await readFile(join(f.cwd, 'PIQ.md'), 'utf8'), original);
+  assert.equal(JSON.parse(await readFile(join(f.cwd, '.piq/bot-account.json'), 'utf8')).accountId, 'OLD_APP');
 });

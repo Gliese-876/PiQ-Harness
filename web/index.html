@@ -75,15 +75,16 @@
 
         <section id="panel-conversations" class="tab-panel" role="tabpanel" aria-labelledby="tab-conversations" hidden>
           <div class="section-intro"><div><h2>对话与归属</h2><p>组内对话共用一套文档、记忆、模型和 Pi 会话。每个对话只能属于一个对话组。</p></div><button id="reload-config" class="button subtle" type="button" disabled>重新读取配置</button></div>
-          <div class="settings-card">
+          <div class="settings-card discovery-card">
             <div class="settings-section">
               <div class="setting-heading"><h3>从机器人消息中发现对话</h3><button id="start-discovery" class="button subtle" type="button">发现对话</button></div>
-              <p class="field-help">先保存机器人凭据，再点击发现；给机器人发私聊，或在群里 @ 一下，即可直接加入本组。</p>
+              <p class="field-help">已配置的对话会显示为“已加入本组”。点击发现后，通过新收到的私聊或群消息补充列表；目标群须先添加机器人。</p>
               <div id="discovery-panel" hidden>
                 <p id="discovery-status" class="field-help" role="status" aria-live="polite"></p>
                 <p id="discovery-error" class="inline-error" role="alert" hidden></p>
                 <div id="discovery-list" class="conversation-rows"></div>
-                <button id="stop-discovery" class="button subtle" type="button">结束发现</button>
+                <p id="discovery-empty" class="field-help" hidden>尚未收到可发现的新对话。请在开始发现后，给机器人发私聊，或在目标群里 @ 一下。</p>
+                <div class="discovery-actions"><button id="stop-discovery" class="button subtle" type="button">结束发现</button></div>
               </div>
             </div>
           </div>
@@ -137,6 +138,7 @@
               <div class="setting-heading"><h3>腾讯官方 QQBot</h3><span id="credential-status" class="credential-status"></span></div>
               <div class="field"><label for="qq-app-id">AppID</label><input id="qq-app-id" name="appId" type="text" required autocomplete="off" spellcheck="false" placeholder="从 QQ 开放平台复制 AppID"></div>
               <div class="field"><label for="qq-app-secret">AppSecret</label><input id="qq-app-secret" name="appSecret" type="password" autocomplete="new-password" spellcheck="false" placeholder="填写 AppSecret"><span id="credential-source" class="field-help">保存到本机后，密码框会清空。</span></div>
+              <p id="credential-feedback" class="field-help" role="status" aria-live="polite" hidden></p>
             </div>
             <div class="editor-footer"><button id="save-credentials" class="button primary" type="submit" disabled>保存机器人配置</button><button id="refresh-credentials" class="button subtle" type="button" disabled>刷新状态</button></div>
           </form>

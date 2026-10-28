@@ -146,6 +146,19 @@ function safeFailure(error: unknown, operation: string, uncertain: boolean): Err
   return new TransportError(uncertain ? `${operation}结果未知，请先确认目标对话；未自动重发。` : `${operation}失败，本次尚未发送 QQ 消息。`);
 }
 
+function connectionFailure(error: unknown, fallback: string): Error {
+  let cause = error;
+  for (let depth = 0; depth < 4; depth++) {
+    if (cause instanceof ApiError) {
+      const code = Number.isSafeInteger(cause.bizCode) ? cause.bizCode : undefined;
+      const status = Number.isInteger(cause.httpStatus) && cause.httpStatus >= 0 && cause.httpStatus <= 599 ? cause.httpStatus : 0;
+      return new QQBotApiError(`QQ 机器人连接失败（HTTP ${status}${code === undefined ? '' : `，业务码 ${code}`}），请检查机器人配置与平台状态。`, status, code, false);
+    }
+    cause = cause instanceof Error ? cause.cause : undefined;
+  }
+  return new TransportError(fallback);
+}
+
 function checkBusinessResult(value: unknown): void {
   if (!object(value)) return;
   for (const field of ['err_code', 'code']) {
@@ -259,9 +272,9 @@ export class QQBotTransport {
       this.updateStatus(event.willReconnect ? 'disconnected' : 'error');
       if (!event.willReconnect) this.failRun(new TransportError('QQ 机器人连接已停止，请检查凭据和平台权限后重新打开会话。'));
     });
-    this.listen('error', () => {
+    this.listen('error', error => {
       if (!this.closed && !this.connected) this.updateStatus('error');
-      this.report(new TransportError('QQ 机器人网关暂时异常；请检查连接与平台权限。'));
+      this.report(connectionFailure(error, 'QQ 机器人网关暂时异常；请检查连接与平台权限。'));
     });
     this.listen('message', async (_ctx, message) => {
       if (this.closed) return;
@@ -333,7 +346,7 @@ export class QQBotTransport {
       return this.sdk.start(this.shutdown.signal);
     }).then(() => {
       if (!this.closed) this.failRun(new TransportError('QQ 机器人网关已结束，请重新打开会话。'));
-    }, () => this.failRun(new TransportError('QQ 机器人启动或连接失败，请检查 AppID、AppSecret 和平台权限。')));
+    }, error => this.failRun(connectionFailure(error, 'QQ 机器人启动或连接失败，请检查 AppID、AppSecret 和平台权限。')));
   }
 
   get isConnected(): boolean { return this.connected && !this.closed; }

@@ -5,7 +5,10 @@ import { join, relative, resolve } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { setImmediate as flush } from 'node:timers/promises';
 import { discoverGroup } from '../src/discover.ts';
+import { DISCOVERY_BOT_STATE_ERROR } from '../src/discover.ts';
+import { QQBotApiError } from '../src/transport.ts';
 import { createWebDiscovery } from '../src/web-discovery.ts';
+import type { TransportOptions } from '../src/transport.ts';
 
 async function fixture(t: TestContext) {
   const parent = resolve('.test-tmp'); await mkdir(parent, { recursive: true });
@@ -98,7 +101,9 @@ test('known status transitions are recognized and untrusted errors never reach s
   const run = fake.runs[0]!;
   run.emit('QQ 官方机器人已连接，等待会话事件。'); assert.equal(discovery.snapshot(cwd).state, 'connected');
   run.emit('QQ 官方机器人连接已断开，等待重新连接。'); assert.equal(discovery.snapshot(cwd).state, 'connecting');
-  run.emit('QQ 官方机器人连接发生错误，请检查应用配置和网络。'); assert.equal(discovery.snapshot(cwd).state, 'error');
+  run.emit('QQ 官方机器人连接发生错误，请检查应用配置和网络。');
+  assert.equal(discovery.snapshot(cwd).state, 'connecting');
+  assert.match(discovery.snapshot(cwd).error!, /重新连接/);
   run.emit('QQ 官方机器人已连接，等待会话事件。'); assert.equal(discovery.snapshot(cwd).error, undefined);
   run.emit('无法连接 QQ 官方机器人：PRIVATE-CREDENTIAL。');
   assert.equal(discovery.snapshot(cwd).state, 'error');
@@ -225,4 +230,66 @@ test('cleanup failures are visible through fixed text without leaking the thrown
   assert.deepEqual(await discovery.stop(cwd), result);
   assert.deepEqual(await discovery.start(cwd), result);
   assert.equal(fake.runs.length, 1, 'uncertain cleanup cannot create another channel');
+});
+
+test('real discovery callbacks recover from temporary errors and expose subsequent conversation metadata', async t => {
+  const cwd = await fixture(t); await config(cwd);
+  const created = deferred<void>(), recovered = deferred<void>();
+  let channel!: TransportOptions;
+  let released = false, closed = false;
+  const discovery = createWebDiscovery({ discover: (directory, options) => discoverGroup(directory, {
+    ...options,
+    readManagedCredentials: async () => ({ appId: 'synthetic-app', appSecret: 'SYNTHETIC-SECRET', hasSecret: true, available: true }),
+    claimAccount: async () => async () => { released = true; },
+    createTransport: settings => {
+      channel = settings; created.resolve();
+      return { connect: async () => { await recovered.promise; settings.onStatus?.('connected'); }, close: () => { closed = true; } };
+    },
+  }) });
+  t.after(() => discovery.close());
+  await discovery.start(cwd); await created.promise;
+  channel.onError?.(new Error('PRIVATE-TRANSPORT-ERROR'));
+  assert.equal(discovery.snapshot(cwd).state, 'connecting');
+  recovered.resolve(); await flush();
+  await channel.onMessage({ conversation: { type: 'group', id: 'New_Group' }, messageId: 'new-message', selfId: 'synthetic-app',
+    userId: 'Synthetic_User', sender: 'Synthetic user', time: 1700000000, rawText: 'PRIVATE-MESSAGE-BODY', outgoing: false,
+    attachments: [], raw: { content: 'PRIVATE-MESSAGE-BODY' } });
+  assert.deepEqual(discovery.snapshot(cwd), { state: 'connected', conversations: [{ type: 'group', id: 'New_Group' }] });
+  channel.onError?.(new Error('PRIVATE-NONFATAL-WARNING'));
+  assert.equal(discovery.snapshot(cwd).state, 'connected', 'a diagnostic must not override a healthy gateway status');
+  assert.doesNotMatch(JSON.stringify(discovery.snapshot(cwd)), /PRIVATE-|SYNTHETIC-SECRET/);
+  await discovery.stop(cwd);
+  assert.equal(closed, true); assert.equal(released, true);
+});
+
+test('a normal startup failure racing with stop does not poison later credential correction', async t => {
+  const cwd = await fixture(t), fake = simulated(false);
+  const discovery = createWebDiscovery({ discover: fake.discover }); t.after(() => discovery.close());
+  await discovery.start(cwd);
+  fake.runs[0]!.emit('无法启动 QQ 官方机器人连接，请检查应用配置和网络。');
+  const stopping = discovery.stop(cwd);
+  fake.runs[0]!.finish(1);
+  assert.equal((await stopping).state, 'idle');
+  await discovery.start(cwd);
+  assert.equal(fake.runs.length, 2);
+  fake.runs[1]!.finish(); await flush();
+});
+
+test('the real discovery path surfaces a bot-state rejection and still permits correcting credentials', async t => {
+  const cwd = await fixture(t); await config(cwd);
+  const finished = deferred<void>();
+  const discovery = createWebDiscovery({ discover: (directory, options) => discoverGroup(directory, {
+    ...options,
+    readManagedCredentials: async () => ({ appId: 'APP', appSecret: 'SYNTHETIC-SECRET', hasSecret: true, available: true }),
+    claimAccount: async () => async () => {},
+    createTransport: settings => ({ connect: async () => {
+      const error = new QQBotApiError('PRIVATE-SDK-TEXT', 400, 11700, false);
+      settings.onError?.(error); throw error;
+    }, close: () => { finished.resolve(); } }),
+  }) });
+  t.after(() => discovery.close());
+  await discovery.start(cwd); await finished.promise; await flush();
+  assert.equal(discovery.snapshot(cwd).error, DISCOVERY_BOT_STATE_ERROR);
+  assert.doesNotMatch(JSON.stringify(discovery.snapshot(cwd)), /PRIVATE-SDK-TEXT|SYNTHETIC-SECRET/);
+  assert.equal((await discovery.stop(cwd)).state, 'idle');
 });

@@ -304,7 +304,7 @@ test('saving waits for an in-progress read to return the complete previous crede
   }
   assert.deepEqual(await reading, { appId: 'OLD_APP_ID', appSecret: 'old-synthetic-secret', hasSecret: true, available: true });
   assert.deepEqual(await saving, { appId: 'NEW_APP_ID', hasSecret: true, available: true });
-  assert.deepEqual(events, ['read:id', 'read:secret', 'save:read', 'save:write']);
+  assert.deepEqual(events, ['read:id', 'read:secret', 'save:read', 'save:write', 'save:read']);
   assert.equal(f.values.get(f.names.appIdEnv), 'NEW_APP_ID');
   assert.equal(f.values.get(f.names.appSecretEnv), 'new-synthetic-secret');
 });
@@ -336,7 +336,7 @@ test('reading waits until a partially written credential pair has fully committe
   }
   await saving;
   assert.deepEqual(await reading, { appId: 'NEW_APP_ID', appSecret: 'new-synthetic-secret', hasSecret: true, available: true });
-  assert.equal(f.reads.length, 2); assert.equal(f.writes.length, 1);
+  assert.equal(f.reads.length, 3); assert.equal(f.writes.length, 1);
 });
 
 test('concurrent saves for one directory preserve the selected application and secret as a pair', async t => {
@@ -359,4 +359,12 @@ test('concurrent saves for one directory preserve the selected application and s
   assert.ok(finalAppId === 'APP_ID_A' || finalAppId === 'APP_ID_B');
   assert.equal(f.values.get(f.names.appSecretEnv), finalAppId === 'APP_ID_A' ? 'secret-a' : 'secret-b');
   assert.equal(finalAppId, f.writes.at(-1)![f.names.appIdEnv]);
+});
+
+test('a successful write acknowledgement is not reported saved until the stored pair matches', async t => {
+  const f = await fixture(t);
+  f.values.set(f.names.appIdEnv, 'APP_ID_A'); f.values.set(f.names.appSecretEnv, 'old-synthetic-secret');
+  f.storage.write = async () => {};
+  await assert.rejects(saveManagedCredentials(f.cwd, { appId: 'APP_ID_A', appSecret: 'new-synthetic-secret' }, f.options), rejected(500, 'new-synthetic-secret'));
+  assert.equal(f.values.get(f.names.appSecretEnv), 'old-synthetic-secret');
 });

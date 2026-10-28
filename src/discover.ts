@@ -1,7 +1,7 @@
 import { claimBotAccount } from './bot-owner.ts';
 import { loadConfig } from './config.ts';
 import { conversationKey, validateOpenId } from './conversations.ts';
-import { QQBotTransport, type TransportOptions } from './transport.ts';
+import { QQBotTransport, QQBotApiError, type TransportOptions } from './transport.ts';
 import { resolveGroupEnvironment, type CredentialOptions } from './web-terminal.ts';
 
 export interface DiscoverOptions extends CredentialOptions {
@@ -17,6 +17,7 @@ const statusMessages = {
   disconnected: 'QQ 官方机器人连接已断开，等待重新连接。',
   error: 'QQ 官方机器人连接发生错误，请检查应用配置和网络。',
 } as const;
+export const DISCOVERY_BOT_STATE_ERROR = 'QQ 平台返回 11700：机器人状态异常。请核对当前机器人的启用状态和 WebSocket 接入方式。';
 
 /** Discover conversation OpenIDs from incoming events without persisting or replying. */
 export async function discoverGroup(cwd: string, options: DiscoverOptions = {}): Promise<number> {
@@ -95,7 +96,11 @@ export async function discoverGroup(cwd: string, options: DiscoverOptions = {}):
             output(JSON.stringify({ conversationKey: key, userId }));
           },
           onStatus: reportStatus,
-          onError: () => reportStatus('error'),
+          onError: error => {
+            if (lastStatus === 'connected') return;
+            reportStatus('error');
+            if (error instanceof QQBotApiError && error.bizCode === 11700) output(DISCOVERY_BOT_STATE_ERROR);
+          },
         });
         if (stopped) return 0;
         const connected = Promise.resolve().then(() => transport!.connect()).then(

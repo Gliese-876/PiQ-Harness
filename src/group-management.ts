@@ -121,7 +121,7 @@ async function stoppedRuntime(directory: string): Promise<void> {
 }
 
 /** The root registry lock must be held by the caller throughout this operation. */
-async function withStoppedDirectory<T>(cwd: string, operation: (relocated: (path: string) => void) => Promise<T>): Promise<T> {
+export async function withStoppedGroupDirectory<T>(cwd: string, operation: (relocated: (path: string) => void) => Promise<T>): Promise<T> {
   const directory = join(cwd, '.piq');
   try { await ordinary(directory, true); }
   catch (error) { if (!missing(error)) throw error; await mkdir(directory); }
@@ -180,7 +180,7 @@ export async function deleteGroup(cwd: string): Promise<DeletedGroup & { deleted
   await ordinary(dirname(requested), true);
   return withRootLock(dirname(requested), async root => {
     const config = await groupConfig(requested, id);
-    return withStoppedDirectory(requested, async relocated => {
+    return withStoppedGroupDirectory(requested, async relocated => {
       const trash = join(root, '.trash');
       await mkdir(trash, { recursive: true });
       await ordinary(trash, true);
@@ -226,7 +226,7 @@ export async function restoreGroup(rootInput: string, tokenInput: string): Promi
     try { await lstat(path); throw new ConfigError(409, '同标识的对话组或目录已经存在，请先处理后再恢复。'); }
     catch (error) { if (!missing(error)) throw error; }
     await checkAssignments(root, config);
-    return withStoppedDirectory(source, async relocated => {
+    return withStoppedGroupDirectory(source, async relocated => {
       await ordinary(source, true);
       await rename(source, path);
       relocated(path);

@@ -196,6 +196,20 @@ function renderGroups() {
   renderRunStatus();
 }
 
+function renderConnectionStatus() {
+  const current = state.groups.find(group => group.id === state.selected);
+  const runtime = current?.runtime === undefined ? state.detail?.runtime : current.runtime;
+  const discovering = !current?.running && state.discoveryGroup === state.selected && state.discoveryOpen && state.discoveryState !== 'idle';
+  const connection = discovering ? state.discoveryState : current?.running ? runtime?.connection : 'disconnected';
+  const labels = discovering
+    ? { connected: '发现已连接', connecting: '发现连接中', error: '发现连接异常' }
+    : { connected: 'QQBot 已连接', connecting: 'QQBot 连接中', disconnected: 'QQBot 未连接', error: 'QQBot 连接异常' };
+  $('connection-status').textContent = labels[connection] || '连接状态待更新';
+  $('connection-status').className = `connection-status ${connection || 'unknown'}`;
+  $('connection-status').title = discovering ? state.discoveryError || '临时发现连接，仅接收对话标识。'
+    : ['connected', 'ready'].includes(connection) ? '' : runtime?.lastError || '';
+}
+
 function renderRunStatus() {
   const current = state.groups.find(group => group.id === state.selected);
   const running = !!current?.running;
@@ -209,10 +223,7 @@ function renderRunStatus() {
   $('run-status').classList.toggle('paused', paused);
   $('run-status').title = running && current.pid ? `进程 ${current.pid}` : '';
   const connection = running ? runtime?.connection : 'disconnected';
-  const connectionLabels = { connected: 'QQBot 已连接', connecting: 'QQBot 连接中', disconnected: 'QQBot 未连接', error: 'QQBot 连接异常' };
-  $('connection-status').textContent = connectionLabels[connection] || '连接状态待更新';
-  $('connection-status').className = `connection-status ${connection || 'unknown'}`;
-  $('connection-status').title = ['connected', 'ready'].includes(connection) ? '' : runtime?.lastError || '';
+  renderConnectionStatus();
   $('terminal-note').textContent = !running ? '打开终端继续最近会话' : '关闭终端即停止本组 Pi';
   const descriptions = [];
   if (state.detail && !running && !starting && !state.detail.config.conversations.length) descriptions.push('添加并保存至少一个对话后即可启动 Pi');
@@ -268,6 +279,7 @@ function renderGroupManagement() {
 }
 
 function renderDiscovery() {
+  renderConnectionStatus();
   const live = state.discoveryOpen && ['connecting', 'connected'].includes(state.discoveryState);
   $('start-discovery').disabled = !state.detail || !state.detail.credential?.available || state.busy || state.configLoading || membershipLocked() || state.discoveryPending || live;
   $('start-discovery').title = membershipLocked() ? '请先停止本组 Pi，再发现对话。' : !state.detail?.credential?.available ? '请先在连接设置中配置机器人。' : '临时接收机器人消息，最多持续 3 分钟';
@@ -275,17 +287,22 @@ function renderDiscovery() {
   $('discovery-error').hidden = !state.discoveryError;
   $('discovery-error').textContent = state.discoveryError;
   $('discovery-status').textContent = state.discoveryPending ? '正在连接或结束发现…'
-    : state.discoveryState === 'connected' ? '已连接。给机器人发私聊，或在群里 @ 一下；点击下方按钮加入本组。最多发现 3 分钟。'
-      : state.discoveryState === 'connecting' ? '正在连接腾讯官方 QQBot…' : '发现已结束。可以加入已找到的对话，或重新开始发现。';
+    : state.discoveryState === 'connected' ? '已连接，正在等待新消息。给机器人发私聊，或在已添加机器人的群里 @ 一下；发现最多持续 3 分钟。'
+      : state.discoveryState === 'connecting' ? '正在连接腾讯官方 QQBot…'
+        : state.discoveryState === 'error' ? '发现连接异常，请结束后重试。' : '发现已结束。可以加入已找到的对话，或重新开始发现。';
   const list = $('discovery-list'); list.replaceChildren();
-  const existing = new Set((state.detail?.config.conversations || []).map(conversationKey));
-  for (const conversation of state.discovered) {
-    const row = document.createElement('div'); row.className = 'setting-heading';
-    const label = document.createElement('span');
+  const configured = new Map((state.detail?.config.conversations || []).map(conversation => [conversationKey(conversation), conversation]));
+  const candidates = new Map([...configured, ...state.discovered.map(conversation => [conversationKey(conversation), conversation])]);
+  $('discovery-empty').hidden = !state.discoveryOpen || candidates.size > 0 || state.discoveryPending || !['connected', 'idle'].includes(state.discoveryState);
+  $('stop-discovery').hidden = !state.discoveryGroup || (state.discoveryState === 'idle' && !state.discoveryPending);
+  $('stop-discovery').disabled = state.discoveryPending;
+  for (const conversation of candidates.values()) {
+    const row = document.createElement('div'); row.className = 'discovery-result';
+    const label = document.createElement('span'); label.className = 'discovery-label';
     const short = conversation.id.length > 20 ? conversation.id.slice(0, 12) + '…' + conversation.id.slice(-4) : conversation.id;
-    label.textContent = (conversation.type === 'group' ? '群聊 · ' : '私聊 · ') + short; label.title = conversation.id;
+    label.textContent = (conversation.type === 'group' ? '群聊 · ' : '私聊 · ') + (configured.get(conversationKey(conversation))?.name || short); label.title = conversation.id;
     const button = document.createElement('button'); button.type = 'button'; button.className = 'button subtle';
-    const added = existing.has(conversationKey(conversation));
+    const added = configured.has(conversationKey(conversation));
     button.textContent = added ? '已加入本组' : '加入本组';
     button.disabled = added || state.busy || membershipLocked() || state.discoveryPending;
     button.addEventListener('click', () => addDiscoveredConversation(conversation));
@@ -353,14 +370,16 @@ async function stopDiscovery(keepPanel = false) {
   state.discoveryPending = true; renderDiscovery();
   try {
     await state.discoveryStart?.catch(() => {});
-    await api(groupUrl(id) + '/discovery', { method: 'DELETE' });
+    const snapshot = await api(groupUrl(id) + '/discovery', { method: 'DELETE' });
+    if (!snapshot || snapshot.state !== 'idle' || !Array.isArray(snapshot.conversations)) throw new Error(snapshot?.error || '发现连接尚未结束，请重试。');
     if (version === state.discoveryVersion) {
       state.discoveryGroup = keepPanel ? id : null; state.discoveryState = 'idle'; state.discoveryError = '';
-      if (!keepPanel) state.discovered = [];
+      if (keepPanel) acceptDiscovery(snapshot);
+      else state.discovered = [];
     }
     return true;
   } catch (error) {
-    if (version === state.discoveryVersion) { state.discoveryOpen = true; state.discoveryError = '结束发现失败：' + error.message; }
+    if (version === state.discoveryVersion) { state.discoveryOpen = true; state.discoveryState = 'error'; state.discoveryError = '结束发现失败：' + error.message; }
     notice('暂时无法结束对话发现，请重试后再切换或打开 Pi 终端。', true);
     return false;
   } finally { if (version === state.discoveryVersion) { state.discoveryPending = false; renderDiscovery(); } }
@@ -600,7 +619,7 @@ async function controlRun(requestedAction) {
 }
 
 async function refreshState(initial = false) {
-  if (state.loadingState) return;
+  if (state.loadingState || state.credentialPending) return;
   state.loadingState = true;
   const registryVersion = state.registryVersion;
   try {
@@ -701,7 +720,16 @@ function setConfig(detail) {
 
 function credentialMetadata(value) {
   return { available: value?.available === true, managed: value?.managed === true, hasSecret: value?.hasSecret === true,
-    appId: typeof value?.appId === 'string' ? value.appId : '' };
+    appId: typeof value?.appId === 'string' ? value.appId : '',
+    ...(typeof value?.boundAppId === 'string' ? { boundAppId: value.boundAppId } : {}) };
+}
+
+function credentialFeedback(message = '', error = false) {
+  const element = $('credential-feedback');
+  element.textContent = message; element.hidden = !message;
+  element.className = error ? 'inline-error' : 'field-help';
+  element.dataset.status = error ? 'error' : 'info';
+  element.setAttribute('role', error ? 'alert' : 'status');
 }
 
 function renderCredential(value, resetInputs = false) {
@@ -713,6 +741,7 @@ function renderCredential(value, resetInputs = false) {
     $('qq-app-id').value = credential.appId;
     $('qq-app-secret').value = '';
   }
+  if (resetInputs) credentialFeedback();
   state.credentialLoaded = !!state.detail;
   $('credential-status').textContent = credential.available ? '机器人已配置' : '机器人尚未配置';
   $('credential-status').classList.toggle('available', credential.available);
@@ -726,6 +755,7 @@ function updateCredentialControls() {
   $('save-credentials').disabled = disabled || state.busy || !credentialsDirty(); $('refresh-credentials').disabled = disabled;
   $('qq-app-id').disabled = disabled; $('qq-app-secret').disabled = disabled;
   $('save-credentials').textContent = state.credentialPending ? '正在处理…' : '保存机器人配置';
+  if (!state.credentialPending && credentialsDirty() && $('credential-feedback').dataset.status !== 'error') credentialFeedback('修改尚未保存。');
 }
 
 async function saveCredentials(event) {
@@ -733,17 +763,44 @@ async function saveCredentials(event) {
   if (!state.selected || !state.detail || state.credentialPending || state.busy || state.groupPending.has(state.selected) || !credentialsDirty() || !$('credentials-form').reportValidity()) return;
   const id = state.selected, sequence = state.detailSequence;
   const appId = $('qq-app-id').value.trim(), appSecret = $('qq-app-secret').value;
-  if (!appId || (!appSecret && !state.detail.credential?.hasSecret)) { notice('请填写 AppID 和 AppSecret。', true); return; }
+  const previousAccountId = state.detail.credential?.boundAppId || state.credentialAppId;
+  const replacing = !!previousAccountId && previousAccountId !== appId;
+  if (!appId || ((!appSecret.trim() && !state.detail.credential?.hasSecret) || (replacing && !appSecret.trim()))) {
+    const message = replacing ? '更换机器人时请同时填写新的 AppID 和 AppSecret。' : '请填写 AppID 和 AppSecret。';
+    credentialFeedback(message, true); notice(message, true); return;
+  }
+  if (replacing && !window.confirm('更换机器人会先结束当前 Pi 会话，并归档旧机器人的聊天记录和 Pi 会话。人设、记忆和资料保留；更换后需要重新发现对话。确认更换吗？')) {
+    credentialFeedback('已取消更换，当前修改尚未保存。'); return;
+  }
   if (state.discoveryGroup && !(await stopDiscovery())) return;
   if (id !== state.selected || sequence !== state.detailSequence) return;
-  state.credentialPending = true; updateCredentialControls();
+  state.credentialPending = true; credentialFeedback('正在保存机器人配置…'); updateCredentialControls();
   try {
-    const result = await api(groupUrl(id) + '/credentials', { method: 'PUT', body: { appId, ...(appSecret ? { appSecret } : {}) } });
+    const result = await api(groupUrl(id) + '/credentials', { method: 'PUT', body: { appId, ...(appSecret ? { appSecret } : {}), ...(replacing ? { replaceAccount: true } : {}) } });
     if (id === state.selected && sequence === state.detailSequence) {
+      if (result.replacedAccount) {
+        state.registryVersion++; state.logSequence++; state.modelSequence++;
+        Object.assign(state.detail, { config: result.config, configRevision: result.revision, logs: {}, running: false, starting: false, runtime: null, pid: null });
+        const summary = state.groups.find(group => group.id === id);
+        if (summary) Object.assign(summary, { conversations: result.config.conversations, running: false, starting: false, runtime: null, pid: null });
+        setConfig(state.detail); setLogOptions({}); renderGroups();
+      }
+      else if (replacing) {
+        await reloadConfiguration(true);
+        if (id !== state.selected || sequence !== state.detailSequence) return;
+      }
       renderCredential(result.credential, true); renderDiscovery();
-      notice(result.restartRequired ? '机器人配置已保存到本机。请重开本组 Pi 终端，使新配置生效。' : '机器人配置已保存到本机，可以到“对话”页发现并加入会话。');
+      const message = result.replacedAccount ? '新机器人配置已保存，旧账号记录已归档。请重新发现并加入群聊或私聊。'
+        : result.restartRequired ? '机器人配置已保存。请重开本组 Pi 终端，使新配置生效。' : '机器人配置已保存，可以到“对话”页发现并加入会话。';
+      credentialFeedback(message); notice(message);
     }
-  } catch (error) { if (id === state.selected && sequence === state.detailSequence) notice(appSecret ? error.message.replaceAll(appSecret, '[已隐藏]') : error.message, true); }
+  } catch (error) {
+    if (id === state.selected && sequence === state.detailSequence) {
+      const prefix = Number.isInteger(error.status) && error.status < 500 ? '未保存：' : '保存结果未确认，请重试或刷新状态：';
+      const message = prefix + (appSecret ? error.message.replaceAll(appSecret, '[已隐藏]') : error.message);
+      credentialFeedback(message, true); notice(message, true);
+    }
+  }
   finally { state.credentialPending = false; updateCredentialControls(); }
 }
 
@@ -755,7 +812,9 @@ async function refreshCredentials() {
     const detail = await api(groupUrl(id));
     if (id === state.selected && sequence === state.detailSequence) {
       renderCredential(detail.credential);
-      notice(detail.credential?.available ? '机器人已配置，可以发现对话。' : '尚未配置完成，请填写 AppID 和 AppSecret 后保存。', !detail.credential?.available);
+      const message = credentialsDirty() ? '已读取保存的配置；当前输入的修改仍未保存。'
+        : detail.credential?.available ? '已读取保存的机器人配置，可以发现对话。' : '尚未配置完成，请填写 AppID 和 AppSecret 后保存。';
+      credentialFeedback(message, !detail.credential?.available); notice(message, !detail.credential?.available);
       renderDiscovery();
     }
   } catch (error) { if (id === state.selected && sequence === state.detailSequence) notice(error.message, true); }
@@ -898,7 +957,6 @@ async function saveMembership(event) {
 }
 
 function setTab(tab) {
-  if (tab !== 'conversations' && state.discoveryGroup) void stopDiscovery();
   state.tab = tab;
   document.querySelectorAll('[data-tab]').forEach(button => {
     const active = button.dataset.tab === tab;
@@ -1281,7 +1339,7 @@ $('credentials-form').addEventListener('input', updateCredentialControls);
 $('credentials-form').addEventListener('submit', saveCredentials);
 $('refresh-credentials').addEventListener('click', refreshCredentials);
 $('start-discovery').addEventListener('click', startDiscovery);
-$('stop-discovery').addEventListener('click', () => stopDiscovery());
+$('stop-discovery').addEventListener('click', () => stopDiscovery(true));
 $('connection-form').addEventListener('input', updateConfigState);
 $('connection-form').addEventListener('submit', saveConfig);
 $('membership-form').addEventListener('input', updateMembershipState);

@@ -352,12 +352,13 @@ test('credentials save through the dedicated body, clear the password, and never
   assert.equal(ui.run('credentialsDirty()'), false);
 });
 
-test('a blank password retains saved credentials and status refresh preserves all unsaved drafts', async () => {
+test('an account change needs a new password and status refresh preserves all unsaved drafts', async () => {
   const ui = page();
   ui.run("renderCredential({available:true,appId:'123456',hasSecret:true}); $('qq-app-id').value='654321'; $('quiet-ms').value='2000';");
   ui.respond(async () => ({ credential: { available: true, appId: '654321', hasSecret: true, managed: true } }));
   await ui.run('saveCredentials({preventDefault(){}})');
-  assert.deepEqual(JSON.parse(String(ui.requests[0]!.options.body)), { appId: '654321' });
+  assert.equal(ui.requests.length, 0);
+  assert.match(ui.get('credential-feedback').textContent, /同时填写/);
   ui.run("$('qq-app-secret').value='DRAFT_SECRET';");
   await ui.run('refreshCredentials()');
   assert.equal(ui.get('qq-app-secret').value, 'DRAFT_SECRET');
@@ -416,10 +417,11 @@ test('discovery starts only after a click, polls while open, and stops before op
   const ui = page();
   ui.run('state.detail.credential={available:true}; renderRunStatus(); refreshState=async()=>{};');
   assert.equal(ui.requests.length, 0);
-  ui.respond(async path => path.endsWith('/discovery') ? { state: 'connected', conversations: [{ type: 'private', id: 'Discovered_OpenID_1' }] } : {});
+  ui.respond(async (path, options) => path.endsWith('/discovery') ? { state: options.method === 'DELETE' ? 'idle' : 'connected', conversations: [{ type: 'private', id: 'Discovered_OpenID_1' }] } : {});
   await ui.run('startDiscovery()');
   assert.equal(ui.requests[0]!.options.method, 'POST');
   assert.equal(ui.get('discovery-panel').hidden, false);
+  assert.equal(ui.get('connection-status').textContent, '发现已连接');
   assert.match(ui.get('discovery-status').textContent, /发私聊/);
   assert.equal(ui.timers.size, 1);
   const poll = [...ui.timers.values()][0]!;
@@ -479,7 +481,7 @@ test('discovery expiration stops its connection and preserves found choices', as
   assert.equal(ui.run('state.discovered[0].id'), 'Found_OpenID');
 });
 
-test('leaving the conversations panel releases discovery and late polls cannot cancel a new session timer', async () => {
+test('changing tabs keeps discovery connected and stale polls cannot cancel a later session timer', async () => {
   const ui = page();
   ui.run('state.detail.credential={available:true};');
   ui.respond(async (_path, options) => ({ state: options.method === 'DELETE' ? 'idle' : 'connected', conversations: [] }));
@@ -487,8 +489,12 @@ test('leaving the conversations panel releases discovery and late polls cannot c
   const previousVersion = ui.run('state.discoveryVersion');
   ui.run("setTab('connection')");
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(ui.requests.at(-1)!.options.method, 'DELETE');
-  assert.equal(ui.run('state.discoveryOpen'), false);
+  assert.equal(ui.requests.filter(request => request.options.method === 'DELETE').length, 0);
+  assert.equal(ui.run('state.discoveryOpen'), true);
+  const poll = ui.timers.get(ui.run('state.discoveryTimer'))!;
+  await poll();
+  assert.equal(ui.requests.at(-1)!.options.method, undefined);
+  await ui.run('stopDiscovery()');
   await ui.run('startDiscovery()');
   const currentTimer = ui.run('state.discoveryTimer');
   ui.run(`scheduleDiscoveryPoll(${previousVersion})`);
@@ -539,5 +545,104 @@ test('document saves keep credential drafts editable and reenable saving on comp
     assert.equal(ui.get('save-credentials').disabled, false);
     assert.equal(ui.get('qq-app-secret').value, 'draft-synthetic-secret');
     assert.doesNotMatch(JSON.stringify(ui.run('state')), /draft-synthetic-secret/);
+  }
+});
+
+test('ending discovery retains final results and lets the user join them after the connection closes', async () => {
+  const ui = page();
+  const found = { type: 'private', id: 'Found_While_Stopping' };
+  ui.run('state.detail.credential={available:true};');
+  ui.respond(async (path, options) => {
+    if (path.endsWith('/discovery')) return { state: options.method === 'DELETE' ? 'idle' : 'connected', conversations: options.method === 'DELETE' ? [found] : [] };
+    return { config: JSON.parse(String(options.body)).config, revision: 'joined-after-stop' };
+  });
+  await ui.run('startDiscovery()');
+  assert.equal(await ui.run('stopDiscovery(true)'), true);
+  assert.equal(ui.get('discovery-panel').hidden, false);
+  assert.equal(ui.get('stop-discovery').hidden, true);
+  assert.equal(ui.get('connection-status').textContent, 'QQBot 未连接');
+  assert.match(ui.get('discovery-list').textContent, /Found_While_Stopping/);
+  await ui.run(`addDiscoveredConversation(${JSON.stringify(found)})`);
+  assert.equal(ui.requests.at(-1)!.path, '/api/groups/one/config');
+  assert.match(ui.get('discovery-list').textContent, /已加入本组/);
+});
+
+test('known configured conversations appear immediately and reconnecting discoveries keep polling', async () => {
+  const ui = page();
+  ui.run("state.detail.credential={available:true}; state.detail.config.conversations[0].name='已有群聊';");
+  ui.respond(async (_path, options) => options.method === 'POST'
+    ? { state: 'connecting', error: '连接暂时异常，正在等待重新连接。', conversations: [] }
+    : { state: 'connected', conversations: [{ type: 'private', id: 'Recovered_OpenID' }] });
+  await ui.run('startDiscovery()');
+  assert.match(ui.get('discovery-list').textContent, /已有群聊/);
+  assert.match(ui.get('discovery-list').textContent, /已加入本组/);
+  assert.equal(ui.get('discovery-empty').hidden, true);
+  await ui.timers.get(ui.run('state.discoveryTimer'))!();
+  assert.match(ui.get('discovery-list').textContent, /Recovered_OpenID/);
+  assert.equal(ui.get('discovery-error').hidden, true);
+});
+
+test('failed discovery cleanup remains visible and prevents Pi from opening', async () => {
+  const ui = page();
+  ui.run('state.detail.credential={available:true}; refreshState=async()=>{};');
+  ui.respond(async (_path, options) => ({ state: options.method === 'DELETE' ? 'error' : 'connected', conversations: [], error: options.method === 'DELETE' ? '连接未能关闭' : undefined }));
+  await ui.run('startDiscovery()');
+  await ui.run('openTerminal()');
+  assert.equal(ui.requests.some(request => request.path.endsWith('/open')), false);
+  assert.equal(ui.get('discovery-panel').hidden, false);
+  assert.equal(ui.get('stop-discovery').hidden, false);
+  assert.match(ui.get('discovery-error').textContent, /连接未能关闭/);
+});
+
+test('a confirmed bot replacement saves both credentials and resets old conversation state', async () => {
+  const ui = page();
+  ui.run("renderCredential({appId:'OLD_APP',boundAppId:'OLD_APP',hasSecret:true,available:true}); $('qq-app-id').value='NEW_APP'; $('qq-app-secret').value='NEW_SYNTHETIC_SECRET';");
+  ui.confirm(false);
+  await ui.run('saveCredentials({preventDefault(){}})');
+  assert.equal(ui.requests.length, 0);
+  assert.match(ui.get('credential-feedback').textContent, /尚未保存/);
+  ui.confirm(true);
+  ui.respond(async () => ({ replacedAccount: true, config: { id: 'one', name: '原组', conversations: [] }, revision: 'replaced',
+    credential: { appId: 'NEW_APP', boundAppId: 'NEW_APP', hasSecret: true, available: true } }));
+  await ui.run('saveCredentials({preventDefault(){}})');
+  assert.deepEqual(JSON.parse(String(ui.requests[0]!.options.body)), { appId: 'NEW_APP', appSecret: 'NEW_SYNTHETIC_SECRET', replaceAccount: true });
+  assert.deepEqual(JSON.parse(ui.run('JSON.stringify(state.detail.config.conversations)')), []);
+  assert.equal(ui.get('qq-app-secret').value, '');
+  assert.match(ui.get('credential-feedback').textContent, /已保存.*已归档/);
+  assert.doesNotMatch(ui.run('JSON.stringify(state)'), /NEW_SYNTHETIC_SECRET/);
+});
+
+test('a rejected credential save is visible in the form and retains the unsaved password', async () => {
+  const ui = page();
+  ui.run("renderCredential({appId:'APP',hasSecret:true,available:true}); $('qq-app-secret').value='UNSAVED_SYNTHETIC_SECRET';");
+  ui.respond(async () => { throw Object.assign(new Error('模拟保存失败'), { status: 400 }); });
+  await ui.run('saveCredentials({preventDefault(){}})');
+  assert.equal(ui.get('credential-feedback').hidden, false);
+  assert.match(ui.get('credential-feedback').textContent, /未保存.*模拟保存失败/);
+  assert.equal(ui.get('qq-app-secret').value, 'UNSAVED_SYNTHETIC_SECRET');
+  assert.equal(ui.get('save-credentials').disabled, false);
+  assert.doesNotMatch(ui.run('JSON.stringify(state)'), /UNSAVED_SYNTHETIC_SECRET/);
+});
+
+test('a repeated bot replacement reloads the current account context and respects a later group selection', async () => {
+  for (const switchGroup of [false, true]) {
+    const ui = page();
+    ui.run("renderCredential({appId:'OLD_APP',boundAppId:'OLD_APP',hasSecret:true,available:true}); $('qq-app-id').value='NEW_APP'; $('qq-app-secret').value='NEW_SYNTHETIC_SECRET';");
+    let finish!: (value: unknown) => void;
+    ui.respond(async (_path, options) => options.method === 'PUT'
+      ? { credential: { appId: 'NEW_APP', hasSecret: true, available: true } }
+      : new Promise(resolve => { finish = resolve; }));
+    const saving = ui.run('saveCredentials({preventDefault(){}})');
+    const deadline = Date.now() + 2000;
+    while (!finish) { if (Date.now() >= deadline) assert.fail('The current account context was not requested'); await new Promise(resolve => setImmediate(resolve)); }
+    if (switchGroup) ui.run("state.selected='two'; state.detailSequence++; state.detail={config:{id:'two',name:'第二组',conversations:[]}}; renderCredential({available:false},true); $('qq-app-secret').value='SECOND_GROUP_DRAFT';");
+    finish({ config: { id: 'one', name: '原组', conversations: [{ type: 'group', id: 'New_Account_Group' }] }, configRevision: 'new-context', logs: {},
+      credential: { appId: 'NEW_APP', boundAppId: 'NEW_APP', available: true, hasSecret: true } });
+    await saving;
+    if (switchGroup) assert.equal(ui.get('qq-app-secret').value, 'SECOND_GROUP_DRAFT');
+    else {
+      assert.equal(ui.run('state.detail.config.conversations[0].id'), 'New_Account_Group');
+      assert.equal(ui.get('qq-app-secret').value, '');
+    }
   }
 });

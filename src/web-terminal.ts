@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { createFreshSession, groupTemporaryEnvironment, resolvePiCommand } from './cli.ts';
 import { loadConfig, type GroupConfig } from './config.ts';
 import { clearTerminalLaunch, prepareTerminalLaunch, withTerminalStartupLock } from './terminal-monitor.ts';
-import { readManagedCredentials, type ManagedCredentials } from './bot-credentials.ts';
+import { readManagedCredentials, readBoundBotAccount, type ManagedCredentials } from './bot-credentials.ts';
 
 export interface CredentialStatus {
   available: boolean;
@@ -13,6 +13,7 @@ export interface CredentialStatus {
   appId?: string;
   hasSecret?: boolean;
   managed?: boolean;
+  boundAppId?: string;
 }
 
 export interface CredentialOptions {
@@ -48,7 +49,9 @@ export async function resolveGroupEnvironment(
 
 /** Browser metadata contains only the application id and whether a secret exists. */
 export async function credentialStatus(config: GroupConfig, options: CredentialOptions = {}, cwd = ''): Promise<CredentialStatus> {
-  return (await resolveGroupEnvironment(cwd, config, options)).credential;
+  const credential = (await resolveGroupEnvironment(cwd, config, options)).credential;
+  const boundAppId = cwd ? await readBoundBotAccount(cwd) : undefined;
+  return { ...credential, ...(boundAppId ? { boundAppId } : {}) };
 }
 
 export async function getRunningOwner(cwd: string): Promise<{ running: boolean; pid: number | null }> {

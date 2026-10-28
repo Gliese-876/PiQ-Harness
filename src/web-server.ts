@@ -9,7 +9,8 @@ import { initializeGroup, listGroupConfigs, loadConfig, saveGroupConfig, validat
 import { deleteGroup, listDeletedGroups, restoreGroup } from './group-management.ts';
 import { conversationKey, conversationDirectory, parseConversationKey, type Conversation } from './conversations.ts';
 import { credentialStatus, getRunningOwner, openGroupTerminal } from './web-terminal.ts';
-import { saveManagedCredentials, ManagedCredentialError } from './bot-credentials.ts';
+import { saveManagedCredentials, ManagedCredentialError, readBoundBotAccount, validateManagedCredentialInput } from './bot-credentials.ts';
+import { replaceBotAccount } from './bot-replacement.ts';
 import { createWebDiscovery } from './web-discovery.ts';
 import { getModelPreference, listModels, saveModelPreference, type ModelCatalog } from './web-models.ts';
 import { readModelStatus, requestModelChange } from './model-control.ts';
@@ -316,22 +317,34 @@ export async function startWebServer(options: WebOptions = {}): Promise<{ server
       const cwd = await groupPath(id);
       if (parts[3] === 'credentials' && parts.length === 4 && method === 'PUT') {
         const body = await readBody(request);
-        if (Object.keys(body).some(key => !['appId', 'appSecret'].includes(key)) || typeof body.appId !== 'string'
-          || (body.appSecret !== undefined && typeof body.appSecret !== 'string')) throw new HttpError(400, '请填写机器人 AppID 和 AppSecret。');
+        if (Object.keys(body).some(key => !['appId', 'appSecret', 'replaceAccount'].includes(key)) || typeof body.appId !== 'string'
+          || (body.appSecret !== undefined && typeof body.appSecret !== 'string')
+          || (body.replaceAccount !== undefined && typeof body.replaceAccount !== 'boolean')) throw new HttpError(400, '请填写机器人 AppID 和 AppSecret。');
         await exclusive(`run:${id}`, async () => {
           await stopDiscovery(cwd);
+          const input = validateManagedCredentialInput({ appId: body.appId as string, appSecret: body.appSecret as string | undefined });
           const state = await getProcessStatus(cwd);
           const busy = state.running || state.starting || (launching.get(id) ?? 0) > Date.now();
-          if (busy) {
-            const current = await credentials((await loadConfig(cwd))!, {}, cwd);
-            if (current.appId !== (body.appId as string).trim()) throw new HttpError(409, '请先停止本组 Pi，再修改机器人 AppID。');
-          }
+          const current = await credentials((await loadConfig(cwd))!, {}, cwd);
+          const previousAccountId = await readBoundBotAccount(cwd) ?? current.appId;
+          const replacing = !!previousAccountId && previousAccountId !== input.appId;
+          if (replacing && body.replaceAccount !== true) throw new HttpError(409, '更换机器人需要归档旧账号记录，请在工作台确认更换。');
           try {
-            const saved = await saveCredentials(cwd, { appId: body.appId as string, appSecret: body.appSecret as string | undefined });
+            if (replacing) {
+              if (!input.appSecret) throw new HttpError(400, '更换机器人时请同时填写新的 AppID 和 AppSecret。');
+              await stopSession(cwd);
+              launching.delete(id);
+              const replaced = await replaceBotAccount(cwd, input, previousAccountId!, () => saveCredentials(cwd, input));
+              json(response, { credential: { appId: replaced.credential.appId, hasSecret: replaced.credential.hasSecret,
+                available: replaced.credential.available, managed: true, boundAppId: input.appId, source: '机器人凭据已保存在本机。' },
+                replacedAccount: true, archivePath: replaced.archivePath, config: replaced.config, revision: replaced.revision, restartRequired: false });
+              return;
+            }
+            const saved = await saveCredentials(cwd, input);
             json(response, { credential: { appId: saved.appId, hasSecret: saved.hasSecret, available: saved.available,
-              managed: true, source: '机器人凭据已保存在本机。' }, restartRequired: busy });
+              ...(previousAccountId ? { boundAppId: previousAccountId } : {}), managed: true, source: '机器人凭据已保存在本机。' }, restartRequired: busy });
           } catch (error) {
-            if (error instanceof ManagedCredentialError) throw error;
+            if (error instanceof ManagedCredentialError || error instanceof HttpError) throw error;
             throw new HttpError(400, '保存机器人凭据失败，请在本机重试。');
           }
         });

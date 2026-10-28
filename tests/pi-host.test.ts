@@ -199,11 +199,14 @@ test('one session aggregates group and private records while preserving their di
     fauxAssistantMessage(fauxToolCall('qq_send', { conversation: conversationKey(conversations[1]!), text: 'Reply to private only' }), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('qq_send', { conversation: 'group:outside-group', text: 'Must be blocked' }), { stopReason: 'toolUse' }),
     fauxAssistantMessage('Finished.'),
-  ], { conversations });
+  ], { conversations, offline: true });
   for (const conversation of conversations) {
     const event = message(conversation, 'same-message-id', 'Shared source text');
     host.channels[0]!.receive(event); host.channels[0]!.receive(event);
   }
+  await eventually(async () => (await records(host.cwd, conversations[0]!)).length === 1
+    && (await records(host.cwd, conversations[1]!)).length === 1, 'both source journals to commit before connection');
+  host.channels[0]!.status('connected');
   await eventually(() => host.faux.state.callCount === 3 && host.session.isIdle, 'shared conversation processing');
   assert.equal(signals(host.session).length, 1); assert.match(JSON.stringify(signals(host.session)), /2 条新消息/);
   assert.equal((await records(host.cwd, conversations[0]!)).length, 1);

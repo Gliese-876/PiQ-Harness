@@ -34,3 +34,15 @@
 /* Group management and recycle bin share the active palette. */
 .trash-link{margin-top:9px;padding:9px 8px;border:0;border-radius:5px;background:transparent;color:var(--muted);font-size:12px;text-align:center}.trash-link:hover{background:var(--hover);color:var(--accent-text)}.group-menu{position:relative}.group-menu>summary{list-style:none;min-height:42px;cursor:pointer}.group-menu>summary::-webkit-details-marker{display:none}.group-menu-panel{position:absolute;right:0;top:calc(100% + 8px);z-index:10;width:245px;padding:8px;border:1px solid var(--line);border-radius:7px;background:var(--surface);box-shadow:0 8px 28px var(--shadow-color)}.group-menu-panel>button{display:block;width:100%;padding:10px;border:0;border-radius:4px;background:transparent;text-align:left;color:var(--ink);font-size:12px}.group-menu-panel>button:hover{background:var(--hover)}.group-menu-panel>button.danger-action{color:var(--danger)}.group-menu-panel>p{padding:8px 10px 5px;color:var(--muted);font-size:11px;line-height:1.65}.trash-toolbar{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:12px}.trash-toolbar .button{min-height:31px;padding:6px 11px}.trash-list{max-height:55vh;overflow:auto}.trash-entry{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:16px 0;border-bottom:1px solid var(--line)}.trash-entry-copy{min-width:0}.trash-entry h3{font-size:13px;font-weight:550;overflow-wrap:anywhere}.trash-entry p{margin-top:7px;color:var(--muted);font-size:11px;line-height:1.6;overflow-wrap:anywhere}.trash-entry>.button{flex-shrink:0}.trash-empty{padding:30px 0;text-align:center;color:var(--muted);font-size:12px}.trash-dialog .dialog-actions{padding-top:20px}@media(max-width:740px){.run-actions .group-menu{flex:1 1 45%}.group-menu>summary{width:100%}.group-menu-panel{width:min(245px,calc(100vw - 36px))}.trash-entry{gap:10px}.trash-entry p{font-size:10px}}
 .group-menu[open]>summary{border-color:var(--accent-border);background:var(--accent-soft);color:var(--accent-text)}
+
+/* Conversation discovery stays separate from membership editing. */
+.discovery-card{margin-bottom:24px}
+.discovery-card .setting-heading h3{margin-bottom:0}
+.discovery-card>.settings-section>.field-help{margin-top:12px}
+#discovery-panel:not([hidden]){display:grid;gap:14px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}
+#discovery-panel>.field-help,#discovery-panel>.inline-error{margin:0}
+#discovery-list{margin:0;gap:10px}
+.discovery-result{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border:1px solid var(--line);border-radius:6px}
+.discovery-label{min-width:0;overflow-wrap:anywhere;font-size:12px;line-height:1.6}
+.discovery-result .button{flex-shrink:0}
+.discovery-actions{display:flex;justify-content:flex-end}

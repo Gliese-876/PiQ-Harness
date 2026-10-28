@@ -150,6 +150,20 @@ test('only a confirmed send in the same target marks a received echo as outgoing
   assert.equal(f.messages[1]!.outgoing, false, 'message ids from another group cannot borrow our sent proof');
 });
 
+test('gateway startup errors retain numeric platform codes without returning the SDK response text', async t => {
+  const f = fixture(t, false);
+  const connecting = f.transport.connect();
+  void connecting.catch(() => {});
+  await eventually(() => f.starts() === 1);
+  const error = new ApiError('PRIVATE-SDK-RESPONSE', 400, '/gateway', 11700);
+  await f.emit('error', error);
+  assert.ok(f.errors.at(-1) instanceof QQBotApiError);
+  assert.match(f.errors.at(-1)!.message, /11700/);
+  assert.doesNotMatch(f.errors.at(-1)!.message, /PRIVATE-SDK-RESPONSE/);
+  f.failStart(new Error('PRIVATE-WRAPPER', { cause: error }));
+  await assert.rejects(connecting, result => result instanceof QQBotApiError && result.bizCode === 11700);
+});
+
 test('gateway creation uses fixed official hosts and only the requested group/C2C intents', async t => {
   const f = fixture(t);
   await Promise.all([f.transport.connect(), f.transport.connect()]);

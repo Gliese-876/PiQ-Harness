@@ -190,7 +190,7 @@ export async function readManagedCredentials(cwd: string, options: ManagedCreden
   });
 }
 
-async function checkAccountBinding(cwd: string, requestedAppId: string): Promise<void> {
+export async function readBoundBotAccount(cwd: string): Promise<string | undefined> {
   try {
     const folder = join(cwd, '.piq');
     const folderInfo = await lstat(folder);
@@ -200,20 +200,28 @@ async function checkAccountBinding(cwd: string, requestedAppId: string): Promise
     if (!info.isFile() || info.isSymbolicLink() || info.nlink > 1 || info.size > 4_096 || !samePath(file, await realpath(file))) throw new Error();
     const value: unknown = JSON.parse(await readFile(file, 'utf8'));
     if (!object(value) || value.version !== 1 || Object.keys(value).some(key => key !== 'version' && key !== 'accountId')) throw new Error();
-    const boundAppId = validateOpenId(value.accountId);
-    if (boundAppId !== requestedAppId) throw new ManagedCredentialError('本组已有其他 AppID 的消息记录，请为新机器人创建新的对话组。', 409);
+    return validateOpenId(value.accountId);
   } catch (error) {
-    if (missing(error)) return;
-    if (error instanceof ManagedCredentialError && error.status === 409) throw error;
+    if (missing(error)) return undefined;
     throw new ManagedCredentialError('本组机器人绑定记录无效，请先检查后再保存凭据。', 409);
   }
+}
+
+async function checkAccountBinding(cwd: string, requestedAppId: string): Promise<void> {
+  const boundAppId = await readBoundBotAccount(cwd);
+  if (boundAppId !== undefined && boundAppId !== requestedAppId) throw new ManagedCredentialError('更换机器人需要归档旧账号记录，请在工作台确认更换。', 409);
+}
+
+export function validateManagedCredentialInput(input: { appId: string; appSecret?: string }): { appId: string; appSecret?: string } {
+  if (!object(input)) throw new ManagedCredentialError('机器人凭据格式无效。');
+  return { appId: appId(input.appId), appSecret: secret(input.appSecret, true) };
 }
 
 export async function saveManagedCredentials(cwd: string, input: { appId: string; appSecret?: string },
   options: ManagedCredentialOptions = {}): Promise<ManagedCredentialMetadata> {
   if ((options.platform ?? process.platform) !== 'win32') throw new ManagedCredentialError('当前平台暂不支持保存，请在 Windows 工作台中配置机器人。', 501);
-  if (!object(input)) throw new ManagedCredentialError('机器人凭据格式无效。');
-  const id = appId(input.appId), suppliedSecret = secret(input.appSecret, true);
+  const validated = validateManagedCredentialInput(input);
+  const id = validated.appId, suppliedSecret = validated.appSecret;
   const cwdPath = await directory(cwd), names = await managedCredentialNames(cwdPath), storage = options.storage ?? userStorage;
   return withCredentialOperation(names.appIdEnv, async () => {
     await checkAccountBinding(cwdPath, id);
@@ -223,7 +231,11 @@ export async function saveManagedCredentials(cwd: string, input: { appId: string
     const savedSecret = suppliedSecret ?? secret(original[names.appSecretEnv], true);
     if (!savedSecret) throw new ManagedCredentialError('首次保存时请同时填写 AppID 和 AppSecret。');
     await checkAccountBinding(cwdPath, id);
-    try { await storage.write({ [names.appIdEnv]: id, [names.appSecretEnv]: savedSecret }); }
+    try {
+      await storage.write({ [names.appIdEnv]: id, [names.appSecretEnv]: savedSecret });
+      const persisted = await readValues(storage, names);
+      if (persisted[names.appIdEnv] !== id || persisted[names.appSecretEnv] !== savedSecret) throw new Error('Credential persistence verification failed.');
+    }
     catch {
       try { await storage.write(original); }
       catch { throw new ManagedCredentialError('凭据保存失败，原值恢复也未完成；请重新保存 AppID 和 AppSecret。', 500); }
