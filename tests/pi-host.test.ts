@@ -100,8 +100,13 @@ async function fixture(t: TestContext) {
     await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ packages: [], cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } }));
     const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
     const channels: FakeChannel[] = [];
-    let settledTurns = 0;
+    let settledTurns = 0, signalDispatches = 0;
     const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, extensionFactories: [api => {
+      const sendMessage = api.sendMessage.bind(api);
+      api.sendMessage = (message, options) => {
+        if (message.customType === 'piq:messages') signalDispatches++;
+        sendMessage(message, options);
+      };
       piq(api, {
         readManagedCredentials: async directory => {
           assert.equal(directory, cwd);
@@ -129,7 +134,8 @@ async function fixture(t: TestContext) {
       return options.credentials === false || options.accountConflict ? state?.connection === 'error'
         : options.offline ? channels.length === 1 : state?.connection === 'connected';
     }, 'the isolated extension to initialize');
-    return { id, cwd, conversations, session, faux, channels, errors, notices, get settledTurns() { return settledTurns; } };
+    return { id, cwd, conversations, session, faux, channels, errors, notices,
+      get settledTurns() { return settledTurns; }, get signalDispatches() { return signalDispatches; } };
   }
   return { root, host };
 }
@@ -257,6 +263,46 @@ test('messages keep accumulating during a model turn and produce one follow-up s
     assert.equal(host.channels[0]!.sent.length, 0);
     assert.deepEqual(host.errors, []);
   } finally { release(); }
+});
+
+test('new arrivals wait for asynchronous settlement even when Pi already reports idle', async t => {
+  const f = await fixture(t);
+  let reached = false, release = () => {};
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const markBusy = RunController.prototype.markBusy;
+  t.mock.method(RunController.prototype, 'markBusy', async function (this: RunController, busy: boolean) {
+    await markBusy.call(this, busy);
+    if (!busy && !reached) { reached = true; await gate; }
+  });
+  const host = await f.host('settlement-arrivals', [fauxAssistantMessage('First complete.'), fauxAssistantMessage('Next batch handled.')]);
+  try {
+    host.channels[0]!.receive(message(host.conversations[0]!, 'first', 'FIRST'));
+    await eventually(() => reached, 'the asynchronous settlement window');
+    assert.equal(host.session.isIdle, true, 'Pi exposes idle before asynchronous settlement handlers finish');
+    host.channels[0]!.receive(message(host.conversations[0]!, 'second', 'SECOND'));
+    await eventually(async () => (await records(host.cwd, host.conversations[0]!)).length === 2, 'the new message to persist');
+    await delay(150);
+    assert.equal(host.signalDispatches, 1, 'no second signal is queued into the previous settlement');
+    release();
+    await eventually(() => host.faux.state.callCount === 2 && host.settledTurns === 2, 'the next batch to complete');
+    assert.equal(host.signalDispatches, 2);
+    assert.equal(signals(host.session).length, 2);
+    assert.deepEqual(host.errors, []);
+  } finally { release(); }
+});
+
+test('an empty successful model response is visible locally and the next batch still runs once', async t => {
+  const f = await fixture(t);
+  const host = await f.host('empty-response', [fauxAssistantMessage(''), fauxAssistantMessage('Next batch handled.')]);
+  host.channels[0]!.receive(message(host.conversations[0]!, 'empty', 'Decide whether to act.'));
+  await eventually(() => host.settledTurns === 1, 'the empty model turn');
+  assert.ok(host.notices.some(notice => /已触发模型.*返回空内容.*未调用工具/.test(notice)));
+  await delay(150); assert.equal(host.faux.state.callCount, 1, 'silence must not cause automatic model retries');
+  host.channels[0]!.receive(message(host.conversations[0]!, 'next', 'New independent message.'));
+  await eventually(() => host.faux.state.callCount === 2 && host.settledTurns === 2, 'the next independent notification');
+  assert.equal(host.signalDispatches, 2);
+  assert.equal(host.channels[0]!.sent.length, 0);
+  assert.deepEqual(host.errors, []);
 });
 
 test('file sending accepts four media kinds inside the group and rejects foreign destinations or paths', async t => {

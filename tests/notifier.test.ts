@@ -42,9 +42,40 @@ test('coalesces a burst, waits through busy runs, and caps one outstanding signa
   notifier.confirm(100);
   t.mock.timers.tick(20000);
   assert.equal(sent.length, 1);
-  idle = true; notifier.schedule(); t.mock.timers.tick(0);
+  idle = true; notifier.settle(100); notifier.schedule(); t.mock.timers.tick(0);
   assert.equal(sent.length, 2);
-  queue = null; notifier.confirm(101);
+  queue = null; notifier.confirm(101); notifier.settle(101);
+});
+
+test('a receipt cannot release the next batch while the previous turn is settling', t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100000 });
+  let queue = pending(); let sent = 0;
+  const notifier = new Notifier(timing, {
+    pending: () => queue, lastNotifiedAt: () => 0, isIdle: () => true,
+    send: () => sent++, stalled: error => assert.fail(String(error)),
+  });
+  t.after(() => notifier.close());
+  notifier.schedule(); t.mock.timers.tick(1500);
+  queue = { ...pending(Date.now()), through: 2 };
+  notifier.confirm(1); notifier.schedule(); t.mock.timers.tick(120000);
+  assert.equal(sent, 1, 'an early idle indication cannot override the outstanding turn');
+  notifier.settle(999); t.mock.timers.tick(0); assert.equal(sent, 1);
+  notifier.settle(1); t.mock.timers.tick(0); assert.equal(sent, 2);
+});
+
+test('settlement before asynchronous receipt persistence still waits for that receipt', t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100000 });
+  let queue = pending(); let sent = 0;
+  const notifier = new Notifier(timing, {
+    pending: () => queue, lastNotifiedAt: () => 0, isIdle: () => true,
+    send: () => sent++, stalled: error => assert.fail(String(error)),
+  });
+  t.after(() => notifier.close());
+  notifier.schedule(); t.mock.timers.tick(1500);
+  queue = { ...pending(Date.now()), through: 2 };
+  notifier.settle(1); notifier.schedule(); t.mock.timers.tick(2000);
+  assert.equal(sent, 1);
+  notifier.confirm(1); t.mock.timers.tick(0); assert.equal(sent, 2);
 });
 
 test('continuous arrivals cannot keep resetting max wait', t => {

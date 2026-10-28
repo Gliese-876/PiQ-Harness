@@ -25,6 +25,8 @@ export class Notifier {
   private timer?: ReturnType<typeof setTimeout>;
   private receiptTimer?: ReturnType<typeof setTimeout>;
   private inFlight?: number;
+  private received = false;
+  private turnSettled = false;
   private stopped = false;
   private paused = false;
   private readonly timing: Timing;
@@ -66,6 +68,8 @@ export class Notifier {
       return;
     }
     this.inFlight = pending.through;
+    this.received = false;
+    this.turnSettled = false;
     this.receiptTimer = setTimeout(() => this.fail(new Error(
       'Pi 未确认接收消息信号。待通知消息已保留；检查模型配置后运行 /piq retry。',
     )), 60_000);
@@ -76,6 +80,20 @@ export class Notifier {
   confirm(through: number): void {
     if (this.inFlight !== through || this.stopped) return;
     clearTimeout(this.receiptTimer);
+    this.received = true;
+    this.releaseIfComplete();
+  }
+
+  settle(through: number): void {
+    if (this.inFlight !== through || this.stopped) return;
+    this.turnSettled = true;
+    this.releaseIfComplete();
+  }
+
+  private releaseIfComplete(): void {
+    // Receipt only proves that the custom message reached Pi, not that its
+    // model/tool loop finished. Either asynchronous callback can arrive first.
+    if (!this.received || !this.turnSettled) return;
     this.inFlight = undefined;
     this.schedule();
   }

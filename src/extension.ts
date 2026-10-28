@@ -31,6 +31,8 @@ interface Binding {
   sendAbort: AbortController; resumeTurn: boolean; lastError?: string;
   notificationError?: string; receiveError?: string; receiving: Promise<void>;
   confirmedSends: Set<string>;
+  agentBusy: boolean;
+  signalTurn?: { through: number; requests: number; toolCalls: number; hasText: boolean; stopReason?: string };
 }
 
 export async function resolveImage(cwd: string, path: string): Promise<string> { return workspaceFile(cwd, path); }
@@ -42,7 +44,7 @@ export default function piq(pi: ExtensionAPI, options: PiQOptions = {}): void {
     if (!current.closed) current.ctx.ui.notify(`PiQ: ${message}`, 'error');
   }
   function resumeIfReady(current: Binding): void {
-    if (current.closed || !current.resumeTurn || current.control?.paused || !current.transport?.isConnected || !current.ctx.isIdle()) return;
+    if (current.closed || current.agentBusy || !current.resumeTurn || current.control?.paused || !current.transport?.isConnected || !current.ctx.isIdle()) return;
     current.resumeTurn = false;
     if (current.store.pending()) { current.notifier.schedule(); return; }
     pi.sendMessage({ customType: 'piq:resume', content: 'PiQ 已恢复，可继续处理刚才中断的对话任务。', display: true },
@@ -89,6 +91,7 @@ export default function piq(pi: ExtensionAPI, options: PiQOptions = {}): void {
       try { await cleanup(); } catch (error) { failure ??= error; }
     }
     current.ctx.ui.setStatus('piq', undefined);
+    current.ctx.ui.setStatus('piq-turn', undefined);
     if (failure) throw failure;
   }
   async function stop(): Promise<void> {
@@ -115,13 +118,15 @@ export default function piq(pi: ExtensionAPI, options: PiQOptions = {}): void {
       if (starting !== generation) { await release(); await store.close(); return; }
       current = { id: randomUUID(), cwd: ctx.cwd, ctx, config, store, releaseConversations: release,
         members: new Set(config.conversations.map(conversationKey)), closed: false, selfId: credentials?.appId ?? config.id,
-        status: 'connecting', sendAbort: new AbortController(), resumeTurn: false, receiving: Promise.resolve(), confirmedSends: new Set<string>() } as Binding;
+        status: 'connecting', sendAbort: new AbortController(), resumeTurn: false, receiving: Promise.resolve(), confirmedSends: new Set<string>(), agentBusy: false } as Binding;
       const owner = current;
       owner.notifier = new Notifier(config, {
         pending: () => owner.store.pending(), lastNotifiedAt: () => owner.store.lastNotifiedAt,
-        isIdle: () => !owner.closed && !owner.control?.paused && !!owner.transport?.isConnected && owner.ctx.isIdle(),
+        isIdle: () => !owner.closed && !owner.agentBusy && !owner.control?.paused && !!owner.transport?.isConnected && owner.ctx.isIdle(),
         send: pending => {
           owner.resumeTurn = false;
+          owner.signalTurn = { through: pending.through, requests: 0, toolCalls: 0, hasText: false };
+          owner.ctx.ui.setStatus('piq-turn', `消息至 #${pending.through} · 等待模型`);
           pi.sendMessage({ customType: SIGNAL, display: true,
             content: `对话组 ${owner.config.name} 有 ${pending.count} 条新消息，来自 ${pending.conversations.length} 个对话（至 #${pending.through}）：\n`
               + pending.conversations.map(item => `${conversationKey(item.conversation)}：${item.count} 条，#${item.firstSeq}–#${item.lastSeq}，日志 ${item.files.join('、')}`).join('\n'),
@@ -197,21 +202,53 @@ export default function piq(pi: ExtensionAPI, options: PiQOptions = {}): void {
     }
   });
   pi.on('session_shutdown', stop);
-  pi.on('agent_start', async (_event, ctx) => { if (binding && !binding.closed) { binding.ctx = ctx; await binding.control?.markBusy(true); } });
-  pi.on('agent_settled', async (_event, ctx) => {
+  pi.on('agent_start', async (_event, ctx) => {
+    if (binding && !binding.closed) { binding.ctx = ctx; binding.agentBusy = true; await binding.control?.markBusy(true); }
+  });
+  pi.on('message_start', event => {
+    const current = binding, turn = current?.signalTurn;
+    if (!current || current.closed || !turn || event.message.role !== 'assistant') return;
+    turn.requests++;
+    current.ctx.ui.setStatus('piq-turn', `消息至 #${turn.through} · 模型处理中`);
+  });
+  pi.on('agent_settled', async (event, ctx) => {
     const current = binding;
     if (!current || current.closed) return;
     current.ctx = ctx;
+    const turn = current.signalTurn;
     await current.control?.markBusy(false);
     if (current.closed || binding !== current) return;
+    current.agentBusy = false;
+    if (turn && current.signalTurn === turn) {
+      current.signalTurn = undefined;
+      const empty = turn.requests > 0 && !turn.hasText && turn.toolCalls === 0 && turn.stopReason === 'stop' && !event.aborted;
+      const outcome = event.aborted ? '本轮已中断' : turn.stopReason === 'error' ? '本轮模型出错'
+        : empty ? '模型返回空内容' : '本轮已完成';
+      current.ctx.ui.setStatus('piq-turn', `消息至 #${turn.through} · ${outcome}`);
+      if (empty) current.ctx.ui.notify(`PiQ：消息至 #${turn.through} 已触发模型，本轮返回空内容，未调用工具。`, 'info');
+      current.notifier.settle(turn.through);
+    }
     resumeIfReady(current); current.notifier.schedule();
   });
   pi.on('message_end', async event => {
     const current = binding;
-    if (!current || current.closed || event.message.role !== 'custom' || event.message.customType !== SIGNAL) return;
+    if (!current || current.closed) return;
+    if (event.message.role === 'assistant') {
+      const turn = current.signalTurn;
+      if (turn) {
+        turn.hasText ||= event.message.content.some(part => part.type === 'text' && !!part.text.trim());
+        turn.toolCalls += event.message.content.filter(part => part.type === 'toolCall').length;
+        turn.stopReason = event.message.stopReason;
+      }
+      return;
+    }
+    if (event.message.role !== 'custom' || event.message.customType !== SIGNAL) return;
     const details = event.message.details as { bindingId?: string; groupId?: string; through?: number } | undefined;
     if (details?.bindingId !== current.id || details.groupId !== current.config.id || !Number.isSafeInteger(details.through)) return;
-    try { await current.store.acknowledge(details.through!); current.notifier.confirm(details.through!); }
+    try {
+      await current.store.acknowledge(details.through!);
+      if (!current.closed && binding === current) current.notifier.confirm(details.through!);
+    }
     catch (error) { current.notifier.fail(error); }
   });
   pi.registerCommand('piq', {
