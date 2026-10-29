@@ -7,7 +7,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   for (let i = 0; i < args.length; i++) {
     const flag = args[i];
     if (flag === '--help' || flag === '-h') {
-      console.log('PiQ WebUI\n\nnpm run web -- [--root <群目录>] [--port 3210]\n默认仅监听本机 127.0.0.1，群目录为文档/PiQ-Messages。');
+      console.log('PiQ WebUI\n\nnode src/web.ts [--root <群目录>] [--port 3210]\n默认仅监听本机 127.0.0.1，群目录为文档/PiQ-Messages。');
       return;
     }
     if (flag === '--root' && args[i + 1]) root = resolve(args[++i]!);

@@ -162,8 +162,10 @@ pi install -l npm:@buyong/pi-codex-image-gen@0.3.1
 默认根目录是系统“文档”文件夹中的 `PiQ-Messages`。可以指定新的根目录与工作台端口：
 
 ```powershell
-npm run web -- --root D:\PiQ-QQBot --port 3211
+node src/web.ts --root D:\PiQ-QQBot --port 3211
 ```
+
+在 PowerShell 中使用上面的 Node 命令传递启动参数。
 
 ```text
 PiQ-Messages/
@@ -264,7 +266,7 @@ SDK 负责平台连接与重连；PiQ 的本地持久记录用于查询已收到
 这是一次明确的配置与消息格式切换。旧数字 QQ 号、旧消息 ID、临时会话标识和 OneBot 配置不能直接替换为官方 OpenID。
 
 1. 停止旧 Pi 会话和工作台，将整个旧工作区保留为归档。
-2. 使用新的空根目录启动本版本，例如 `npm run web -- --root D:\PiQ-QQBot`。
+2. 使用新的空根目录启动本版本，例如 `node src/web.ts --root D:\PiQ-QQBot`。
 3. 建立新对话组，在 Windows 工作台“连接设置”填写并保存 AppID/AppSecret，再用“发现对话”加入目标群聊和私聊。
 4. 检查后按需复制人设、约定、记忆或媒体资料。保留旧消息和旧 Pi 会话作为归档，不将它们覆盖到新组的日志、运行状态或会话目录。
 
