@@ -34,6 +34,7 @@ export class Notifier {
     pending(): Pending | null;
     lastNotifiedAt(): number;
     isIdle(): boolean;
+    isBusy(): boolean;
     send(pending: Pending): void;
     stalled(error: unknown): void;
   };
@@ -70,11 +71,19 @@ export class Notifier {
     this.inFlight = pending.through;
     this.received = false;
     this.turnSettled = false;
-    this.receiptTimer = setTimeout(() => this.fail(new Error(
-      'Pi 未确认接收消息信号。待通知消息已保留；检查模型配置后运行 /piq retry。',
-    )), 60_000);
-    this.receiptTimer.unref?.();
+    this.waitForReceipt(pending.through);
     try { this.host.send(pending); } catch (error) { this.fail(error); }
+  }
+
+  private waitForReceipt(through: number): void {
+    this.receiptTimer = setTimeout(() => {
+      if (this.stopped || this.paused || this.inFlight !== through || this.received) return;
+      // Pi may compact a long context before it appends the starting message.
+      // Keep waiting on the same request while Pi is busy; never inject a retry.
+      if (this.host.isBusy()) { this.waitForReceipt(through); return; }
+      this.fail(new Error('Pi 未确认接收消息信号。待通知消息已保留；检查模型配置后运行 /piq retry。'));
+    }, 60_000);
+    this.receiptTimer.unref?.();
   }
 
   confirm(through: number): void {

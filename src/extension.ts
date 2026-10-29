@@ -123,6 +123,7 @@ export default function piq(pi: ExtensionAPI, options: PiQOptions = {}): void {
       owner.notifier = new Notifier(config, {
         pending: () => owner.store.pending(), lastNotifiedAt: () => owner.store.lastNotifiedAt,
         isIdle: () => !owner.closed && !owner.agentBusy && !owner.control?.paused && !!owner.transport?.isConnected && owner.ctx.isIdle(),
+        isBusy: () => !owner.closed && !owner.ctx.isIdle(),
         send: pending => {
           owner.resumeTurn = false;
           owner.signalTurn = { through: pending.through, requests: 0, toolCalls: 0, hasText: false };
