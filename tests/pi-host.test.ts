@@ -186,7 +186,7 @@ test('real Pi receives a compact signal, reads original JSONL, and sends only an
 
 test('inbound delivery waits for persistence and exposes failure without blocking later events', async t => {
   const f = await fixture(t);
-  const host = await f.host('delivery', []);
+  const host = await f.host('delivery', [fauxAssistantMessage('Delivered bot message considered.')]);
   const channel = host.channels[0]!;
   const conversation = host.conversations[0]!;
   const deliver = (record: IncomingRecord) => Promise.resolve(channel.options.onMessage({ ...record, attachments: [], raw: record.raw ?? {} }));
@@ -195,7 +195,54 @@ test('inbound delivery waits for persistence and exposes failure without blockin
   const saved = await records(host.cwd, conversation);
   assert.deepEqual(saved.map(record => record.messageId), ['persisted-next']);
   assert.ok(host.notices.some(text => text.includes('接收消息')));
-  assert.equal(signals(host.session).length, 0);
+  await eventually(() => host.faux.state.callCount === 1 && host.settledTurns === 1, 'the persisted bot message to wake Pi');
+  assert.equal(signals(host.session).length, 1);
+});
+
+test('other bots wake a shared group and private session while own messages stay silent', async t => {
+  const f = await fixture(t);
+  const conversations: Conversation[] = [{ type: 'group', id: 'bot-group' }, { type: 'private', id: 'bot-private' }];
+  const host = await f.host('bot-inbox', [fauxAssistantMessage('Other bot messages considered.')], { conversations, offline: true });
+  for (const [index, conversation] of conversations.entries()) {
+    host.channels[0]!.receive(message(conversation, `other-bot-${index}`, 'Other bot message',
+      { botAuthored: true, sender: 'Pi', userId: 'OtherBotOpenID' }));
+    host.channels[0]!.receive(message(conversation, `own-${index}`, 'Own outgoing message',
+      { botAuthored: true, outgoing: true, userId: 'synthetic-application' }));
+  }
+  await eventually(async () => (await records(host.cwd, conversations[0]!)).length === 2
+    && (await records(host.cwd, conversations[1]!)).length === 2, 'both source journals');
+  host.channels[0]!.status('connected');
+  await eventually(() => host.faux.state.callCount === 1 && host.settledTurns === 1, 'the bot-authored notification');
+  assert.equal(signals(host.session).length, 1);
+  assert.match(JSON.stringify(signals(host.session)[0]), /2 条新消息/);
+  assert.equal(host.channels[0]!.sent.length, 0);
+  assert.deepEqual(host.errors, []);
+});
+
+test('an own bot echo arriving before its send receipt cannot start a second model turn', async t => {
+  const f = await fixture(t), conversation: Conversation = { type: 'group', id: 'bot-echo-group' };
+  const host = await f.host('bot-echo', [
+    fauxAssistantMessage(fauxToolCall('qq_send', { conversation: conversationKey(conversation), text: 'Explicit reply', replyTo: 'other-bot-trigger' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage('Handled.'),
+  ], { conversations: [conversation] });
+  const channel = host.channels[0]!, send = channel.send.bind(channel);
+  channel.send = async (target, input, signal) => {
+    const result = await send(target, input, signal);
+    const echo = message(target, result.messageId, input.text ?? 'Own echo', {
+      botAuthored: true, userId: 'OwnBotMemberOpenID', eventType: 'GROUP_MESSAGE_CREATE',
+      raw: { id: result.messageId, author: { member_openid: 'OwnBotMemberOpenID', bot: true } },
+    });
+    await channel.options.onMessage({ ...echo, attachments: [], raw: echo.raw! });
+    return { ...result, raw: { id: result.messageId } };
+  };
+  channel.receive(message(conversation, 'other-bot-trigger', 'External bot message', { botAuthored: true, userId: 'OtherBotOpenID' }));
+  await eventually(() => host.faux.state.callCount === 2 && host.settledTurns === 1, 'the explicit reply and early echo to finish');
+  await delay(150);
+  assert.equal(host.signalDispatches, 1, 'a confirmed own echo must not wake Pi again');
+  assert.equal(host.faux.state.callCount, 2);
+  assert.equal(channel.sent.length, 1);
+  assert.equal((await records(host.cwd, conversation)).length, 2, 'the echoed message is retained once');
+  assert.deepEqual(host.errors, []);
 });
 
 test('one session aggregates group and private records while preserving their distinct identities', async t => {

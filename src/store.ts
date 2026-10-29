@@ -18,7 +18,7 @@ export interface IncomingRecord {
   outgoing: boolean;
   /** Set only after this PiQ instance has received an official send receipt. */
   sentByPi?: boolean;
-  /** Official author.bot flag; robot-authored events are stored without automatic wakeups. */
+  /** Official author.bot flag; source metadata, independent of local send ownership. */
   botAuthored?: boolean;
   eventType?: string;
   attachments?: Record<string, unknown>[];
@@ -292,7 +292,7 @@ export const parseStoredRecord = parseStoredMessage;
 
 function receiptFor(record: StoredMessage, file: string): Receipt {
   return { seq: record.seq, key: receiptKey(record), at: record.receivedAt,
-    incoming: !record.outgoing && !record.botAuthored && record.userId !== record.selfId, file, conversation: conversationRef(record.conversation) };
+    incoming: !record.outgoing && record.userId !== record.selfId, file, conversation: conversationRef(record.conversation) };
 }
 
 /** Durable official-bot inbox. Previous protocol journals and watermarks stay untouched. */

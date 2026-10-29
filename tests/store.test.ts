@@ -67,7 +67,7 @@ test('robot authorship is retained separately from locally confirmed outgoing me
   const f = await fixture(t);
   let store = await f.open(config, 'APP1024');
   await store.append(message('other-bot-message', { botAuthored: true, sender: 'Pi', userId: 'OtherBotOpenID' }));
-  assert.equal(store.pending(), null);
+  assert.equal(store.pending()?.count, 1);
   const robot = await store.findMessage(group, 'other-bot-message');
   assert.equal(robot?.outgoing, false);
   assert.equal(robot?.botAuthored, true);
@@ -75,12 +75,12 @@ test('robot authorship is retained separately from locally confirmed outgoing me
   await store.append(message('local-sent-message', { outgoing: true, sentByPi: true, sender: 'Pi', userId: 'APP1024',
     raw: { id: 'local-sent-message', ext_info: { ref_idx: 'REFIDX_LOCAL_RECEIPT' } } }));
   await store.append(message('human-message'));
-  assert.equal(store.pending()?.count, 1);
+  assert.equal(store.pending()?.count, 2);
   await store.close();
   store = await f.open(config, 'APP1024');
   assert.equal((await store.findMessage(group, 'local-sent-message'))?.sentByPi, true);
   assert.equal((await store.findMessage(group, 'other-bot-message'))?.outgoing, false);
-  assert.equal(store.pending()?.count, 1);
+  assert.equal(store.pending()?.count, 2);
   await assert.rejects(store.append(message('invalid-marker', { sentByPi: true })), /Invalid message content/);
 });
 
@@ -854,10 +854,11 @@ async function echoBeforeReceipt(t: TestContext, messageId = 'ROBOT.echo.before.
 
 test('late sent receipt persists source proof and reference metadata without replacing the earlier echo journal', async t => {
   const f = await echoBeforeReceipt(t);
-  assert.equal(f.store.pending(), null);
+  assert.equal(f.store.pending()?.count, 1, 'until a local send receipt arrives, bot authorship alone cannot identify an own echo');
   const beforeProof = await f.store.findMessage(group, f.messageId);
   assert.notEqual(beforeProof!.sentByPi, true); assert.equal(beforeProof!.outgoing, false);
   assert.equal(await f.store.append(f.localSend), false);
+  assert.equal(f.store.pending(), null, 'a confirmed own send removes the earlier echo from pending wakeups');
   const savedSidecar = await readFile(f.sidecar);
   const saved = JSON.parse(savedSidecar.toString());
   assert.equal(saved.version, 3); assert.equal(saved.groupId, config.id); assert.equal(saved.entries.length, 1);
@@ -874,6 +875,7 @@ test('late sent receipt persists source proof and reference metadata without rep
   await f.store.close();
   const reopened = await f.open();
   assert.deepEqual(await reopened.findMessage(group, f.messageId), proof);
+  assert.equal(reopened.pending(), null, 'own echo suppression survives restart');
   assert.equal(await reopened.append(f.localSend), false);
   assert.deepEqual(await readFile(f.sidecar), savedSidecar);
   const original = (await readFile(f.file, 'utf8')).split('\n');
@@ -889,7 +891,7 @@ test('without a local sent receipt a bot-authored message named Pi never becomes
   const record = await reopened.findMessage(group, f.messageId);
   assert.equal(record!.sender, 'Pi'); assert.equal(record!.botAuthored, true);
   assert.equal(record!.outgoing, false); assert.notEqual(record!.sentByPi, true);
-  assert.deepEqual(record!.raw, f.echo.raw); assert.equal(reopened.pending(), null);
+  assert.deepEqual(record!.raw, f.echo.raw); assert.equal(reopened.pending()?.count, 1);
   await assert.rejects(readFile(f.sidecar), { code: 'ENOENT' });
   assert.deepEqual(await readFile(f.file), f.originalJournal);
 });
@@ -967,8 +969,9 @@ test('a failed late sent receipt write leaves ownership unchanged and does not p
   const unconfirmed = await f.store.findMessage(group, f.messageId);
   assert.equal(unconfirmed!.outgoing, false); assert.notEqual(unconfirmed!.sentByPi, true);
   assert.equal(await f.store.append(message('later-incoming')), true);
-  assert.equal(f.store.pending()!.count, 1); assert.equal(f.store.pending()!.through, 2);
+  assert.equal(f.store.pending()!.count, 2); assert.equal(f.store.pending()!.through, 2);
   assert.equal(await f.store.append(f.localSend), false);
+  assert.equal(f.store.pending()!.count, 1, 'only the unrelated incoming message remains after the own echo is confirmed');
   assert.equal((await f.store.findMessage(group, f.messageId))!.sentByPi, true);
   const journal = await readFile(f.file);
   assert.deepEqual(journal.subarray(0, f.originalJournal.length), f.originalJournal);
